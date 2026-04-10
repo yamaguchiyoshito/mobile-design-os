@@ -5,7 +5,24 @@ import { Meta } from '@storybook/addon-docs/blocks';
 # 運用・配布方式
 
 > **ステータス**: `APPROVED`  
-> **対象**: CI/CD・バージョニング・リリース・OTA・監視・deprecation
+> **対象**: CI/CD・バージョニング・リリース・OTA・監視・deprecation  
+> **前提バージョン**: Storybook 8.x / Expo SDK 52+ / EAS CLI 12+
+
+---
+
+## 目次
+
+1. [CI/CD 全体フロー](#1-cicd-全体フロー)
+2. [GitLab CI 設定方針](#2-gitlab-ci-設定方針)
+3. [EAS 設定方針](#3-eas-設定方針)
+4. [OTA（EAS Update）方針](#4-otaeas-update方針)
+5. [バージョニング規約とリリースフロー](#5-バージョニング規約とリリースフロー)
+6. [環境変数管理](#6-環境変数管理)
+7. [監視・アラート方針](#7-監視アラート方針)
+8. [インシデント対応・ロールバック](#8-インシデント対応ロールバック)
+9. [Deprecation ポリシー](#9-deprecation-ポリシー)
+10. [バンドルサイズ管理](#10-バンドルサイズ管理)
+11. [変更履歴](#11-変更履歴)
 
 ---
 
@@ -21,7 +38,7 @@ GitLab CI（Static + Unit + Story tests）
 EAS Build（Dev Build / Staging）
     │
     ▼
-Maestro E2E（EAS Workflows）
+Maestro E2E（EAS Workflows）iOS + Android
     │ Pass
     ▼
 EAS Submit（App Store / Google Play）または EAS Update（OTA）
@@ -49,7 +66,7 @@ EAS Submit（App Store / Google Play）または EAS Update（OTA）
       <td>コード署名・証明書管理を EAS に委譲</td>
     </tr>
     <tr>
-      <td>E2E テスト</td>
+      <td>E2E テスト（iOS / Android 両プラットフォーム）</td>
       <td>EAS Workflows + Maestro</td>
       <td>実機 / エミュレータが必要</td>
     </tr>
@@ -93,10 +110,11 @@ unit-test:
     - pnpm test --ci --coverage
 
 storybook-test:
+  # Storybook 8.x + addon-vitest が前提。7.x 以前は test:storybook スクリプトが異なる
   stage: test
   script:
     - pnpm storybook:build:web
-    - pnpm test:storybook   # addon-vitest
+    - pnpm test:storybook   # addon-vitest（Storybook 8.x）
 
 eas-build-staging:
   stage: build
@@ -105,10 +123,17 @@ eas-build-staging:
   only:
     - main
 
-eas-e2e:
+eas-e2e-android:
   stage: e2e
   script:
     - eas workflow:run e2e --platform android
+  only:
+    - main
+
+eas-e2e-ios:
+  stage: e2e
+  script:
+    - eas workflow:run e2e --platform ios
   only:
     - main
 ```
@@ -152,6 +177,7 @@ eas-e2e:
   <thead>
     <tr>
       <th>プロファイル</th>
+      <th>EAS チャンネル</th>
       <th>用途</th>
       <th>配布先</th>
     </tr>
@@ -159,21 +185,27 @@ eas-e2e:
   <tbody>
     <tr>
       <td><code>development</code></td>
+      <td><code>development</code></td>
       <td>Dev Build。Expo Go 非依存の開発環境</td>
       <td>内部（Internal Distribution）</td>
     </tr>
     <tr>
+      <td><code>staging</code></td>
       <td><code>staging</code></td>
       <td>QA・受け入れテスト</td>
       <td>内部（TestFlight / Firebase App Distribution）</td>
     </tr>
     <tr>
       <td><code>production</code></td>
+      <td><code>production</code></td>
       <td>本番リリース</td>
       <td>App Store / Google Play</td>
     </tr>
   </tbody>
 </table>
+
+> **Note**: `eas update` でのチャンネル指定は上記プロファイルの `channel` と一致させること。  
+> `eas build --profile staging` でビルドしたバイナリは `staging` チャンネルの OTA のみ受信する。
 
 ---
 
@@ -187,7 +219,7 @@ eas-e2e:
 ### チャンネル戦略
 
 ```
-production ブランチ → production チャンネル（全ユーザー）
+main ブランチ       → production チャンネル（全ユーザー）
 staging ブランチ    → staging チャンネル（内部テスター）
 feature/* ブランチ  → development チャンネル（開発者のみ）
 ```
@@ -205,7 +237,7 @@ eas update --branch production --rollout-percentage 10
 
 ---
 
-## 5. バージョニング規約
+## 5. バージョニング規約とリリースフロー
 
 ### バージョン体系
 
@@ -231,7 +263,19 @@ patch: バグ修正・軽微な変更
 ```
 
 🔴 **MUST**: `version` と `buildNumber` / `versionCode` は必ずセットで更新する  
+🔴 **MUST**: バージョン更新は `main` へのマージ前に PR 内で完結させる  
 🟡 **SHOULD**: リリース時は Git Tag を打つ（`v2.3.1`）
+
+### リリース手順（担当・タイミング）
+
+```
+1. [担当: 開発者] PR で app.json の version / buildNumber を更新してレビュー依頼
+2. [担当: レビュアー] バージョン番号の妥当性を確認してマージ承認
+3. [担当: CI/CD] main マージ後に GitLab CI が自動でテスト → EAS Build を実行
+4. [担当: リリース担当者] EAS Build 成功後に `eas submit` を手動実行
+5. [担当: リリース担当者] Git Tag を打つ（例: git tag v2.3.1 && git push origin v2.3.1）
+6. [担当: リリース担当者] CHANGELOG.md を更新して main へ push
+```
 
 ---
 
@@ -247,11 +291,31 @@ patch: バグ修正・軽微な変更
 ```bash
 # EAS Secret への登録
 eas secret:create --scope project --name API_BASE_URL --value "https://api.example.com"
+
+# 既存シークレットの更新
+eas secret:push --scope project --env-file .env.production
+
+# シークレット一覧の確認
+eas secret:list
 ```
+
+### シークレットローテーション手順
+
+```
+1. 新しいシークレット値を発行（APIキー再生成など）
+2. eas secret:push で EAS 側を更新
+3. eas build --profile production で新しいシークレットを含む新ビルドを作成
+4. 旧シークレットを無効化（APIキーの場合は発行元サービスで失効処理）
+5. 旧ビルドが旧シークレットを使用していないことを監視ログで確認
+```
+
+**漏洩時の対応（緊急）**  
+🔴 **MUST**: 漏洩を検知したら即座に発行元サービスでキーを失効させる。EAS 更新より失効処理を優先すること。
 
 🔴 **MUST**: API キー・シークレットを Git にコミットしない  
 🔴 **MUST**: `EXPO_PUBLIC_` プレフィックスの変数は JS バンドルに含まれることを意識する  
-🟡 **SHOULD**: シークレットは EAS Secret で管理し、CI 環境変数に平文で書かない
+🟡 **SHOULD**: シークレットは EAS Secret で管理し、CI 環境変数に平文で書かない  
+🟡 **SHOULD**: シークレットのローテーションは 90 日ごとに実施する
 
 ---
 
@@ -262,7 +326,8 @@ eas secret:create --scope project --name API_BASE_URL --value "https://api.examp
     <tr>
       <th>監視項目</th>
       <th>ツール</th>
-      <th>アラート閾値（目安）</th>
+      <th>アラート閾値</th>
+      <th>前提条件・補足</th>
     </tr>
   </thead>
   <tbody>
@@ -270,33 +335,104 @@ eas secret:create --scope project --name API_BASE_URL --value "https://api.examp
       <td>クラッシュ率</td>
       <td>Sentry / Crashlytics</td>
       <td>前日比 2 倍以上</td>
+      <td>DAU 1,000 以上が前提。DAU が少ない場合は絶対値（例: 10件/日）で管理する</td>
     </tr>
     <tr>
       <td>JS エラー率</td>
       <td>Sentry</td>
       <td>セッションの 1% 以上</td>
+      <td>初期は 2% で運用し、安定後に 1% へ引き下げる</td>
     </tr>
     <tr>
       <td>API エラー率</td>
       <td>サーバ側 APM</td>
       <td>5xx が 1% 以上</td>
+      <td>エンドポイント単位で閾値を個別設定することを推奨</td>
     </tr>
     <tr>
       <td>OTA 配信成功率</td>
       <td>EAS ダッシュボード</td>
       <td>90% 未満</td>
+      <td>配信から 2h 後に評価。即時 100% は達成不可能なため時間窓を設ける</td>
     </tr>
     <tr>
       <td>脆弱性</td>
       <td>pnpm audit（週次）</td>
       <td>HIGH 以上で通知</td>
+      <td>CRITICAL は即日対応。HIGH は次スプリント内で対応</td>
     </tr>
   </tbody>
 </table>
 
 ---
 
-## 8. Deprecation ポリシー
+## 8. インシデント対応・ロールバック
+
+### OTA ロールバック手順
+
+```bash
+# 1. 現在の更新履歴を確認
+eas update:list --branch production
+
+# 2. 問題のある更新を特定し、直前の安定版 ID を確認
+eas update:view <UPDATE_ID>
+
+# 3. 安定版へのロールバック（再配信）
+eas update --branch production --message "Rollback: <問題の説明>" --republish --group <STABLE_GROUP_ID>
+```
+
+**判断基準と実行者**
+
+<table>
+  <thead>
+    <tr>
+      <th>状況</th>
+      <th>判断基準</th>
+      <th>実行者</th>
+      <th>タイムリミット</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>クラッシュ率が前日比 2 倍超</td>
+      <td>Sentry アラート受信後、原因特定より先にロールバックを優先</td>
+      <td>オンコール担当者</td>
+      <td>アラート受信から 30 分以内</td>
+    </tr>
+    <tr>
+      <td>OTA 配信成功率 90% 未満</td>
+      <td>配信から 2h 後に EAS ダッシュボードで確認</td>
+      <td>リリース担当者</td>
+      <td>配信から 4h 以内</td>
+    </tr>
+    <tr>
+      <td>重大な UI / ビジネスロジックバグ</td>
+      <td>ビジネスインパクト判断はリードエンジニアが承認</td>
+      <td>リードエンジニア承認 → オンコール実行</td>
+      <td>ビジネス判断に従う</td>
+    </tr>
+  </tbody>
+</table>
+
+### EAS Build 失敗時のフォールバック
+
+🔴 **MUST NOT**: EAS Build が失敗した状態で `main` マージを続行しない
+
+```bash
+# EAS Build が失敗した場合の緊急ローカルビルド（iOS）
+# 実行権限: コード署名証明書を保持するリリース担当者のみ
+eas credentials  # 証明書をローカルへ取得
+npx expo run:ios --configuration Release
+
+# Android
+npx expo run:android --variant release
+```
+
+🟡 **SHOULD**: EAS Build の連続失敗（3回以上）は Slack の `#release-alert` チャンネルへ自動通知する
+
+---
+
+## 9. Deprecation ポリシー
 
 ### API 変更
 
@@ -324,20 +460,21 @@ export const Deprecated: Story = {
 };
 ```
 
-🟡 **SHOULD**: Deprecation から削除まで最低 1 マイナーバージョン（≒ 1 スプリント）の猶予を設ける  
-🟡 **SHOULD**: 廃止予定の Symbol には `@deprecated` JSDoc を必ず付ける
+🔴 **MUST**: Deprecation から削除まで **最低 1 マイナーバージョン（≒ 1 ヶ月）** の猶予を設ける  
+　→ 複数チームが依存する共有コンポーネントの場合は **2 マイナーバージョン（≒ 2 ヶ月）** を目安とする  
+🔴 **MUST**: 廃止予定の Symbol には `@deprecated` JSDoc を必ず付ける  
+🟡 **SHOULD**: Deprecation 宣言時に Slack の `#dev-announce` チャンネルへ移行先と削除予定バージョンを告知する
 
 ---
 
-## 9. バンドルサイズ管理
+## 10. バンドルサイズ管理
 
 ```bash
-# Metro bundle report でサイズ増分を検知
-npx react-native bundle \
-  --platform ios \
-  --dev false \
-  --entry-file index.js \
-  --bundle-output /tmp/bundle.js
+# Expo managed workflow では expo export を使用する（react-native bundle は bare workflow 用）
+npx expo export --platform ios --dev false
+
+# バンドルサイズの確認（生成された dist/ ディレクトリを参照）
+ls -lh dist/_expo/static/js/ios/
 
 # カスタムスクリプトで前回比較
 node scripts/bundle-size-check.js --threshold 50kb
@@ -348,7 +485,7 @@ node scripts/bundle-size-check.js --threshold 50kb
 
 ---
 
-## 10. 変更履歴
+## 11. 変更履歴
 
 <table>
   <thead>
@@ -359,6 +496,11 @@ node scripts/bundle-size-check.js --threshold 50kb
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td>2026-04</td>
+      <td>ロールバック手順・シークレットローテーション・EAS Build フォールバック追加。E2E を iOS/Android 両対応に修正。expo export への修正。監視閾値に前提条件を追記。Deprecation 猶予期間を 1 ヶ月に延長。リリースフローに担当者・タイミングを明記</td>
+      <td>ymgc</td>
+    </tr>
     <tr>
       <td>2026-03</td>
       <td>初版作成</td>

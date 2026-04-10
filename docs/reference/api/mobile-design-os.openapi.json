@@ -1,0 +1,183 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Mobile Design OS Example API",
+    "version": "1.0.0",
+    "description": "Storybook 上で Swagger UI を埋め込むためのサンプル OpenAPI。実運用ではバックエンド生成物に差し替える。"
+  },
+  "servers": [
+    {
+      "url": "https://api.example.internal",
+      "description": "Production"
+    },
+    {
+      "url": "http://localhost:3000",
+      "description": "Local"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Health",
+      "description": "システム状態確認"
+    },
+    {
+      "name": "Handbook",
+      "description": "方式設計書メタデータ取得"
+    },
+    {
+      "name": "Storybook",
+      "description": "Storybook ビルド参照"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "サービス稼働確認",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "正常応答",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/handbooks": {
+      "get": {
+        "tags": ["Handbook"],
+        "summary": "公開中の handbook 一覧を取得",
+        "operationId": "listHandbooks",
+        "parameters": [
+          {
+            "name": "section",
+            "in": "query",
+            "description": "foundation / quality / operations / platform / integrations",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "取得成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/HandbookSummary"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/storybook/builds/{buildId}": {
+      "get": {
+        "tags": ["Storybook"],
+        "summary": "Storybook ビルド情報を取得",
+        "operationId": "getStorybookBuild",
+        "parameters": [
+          {
+            "name": "buildId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "2026-04-11T090000Z"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "取得成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorybookBuild"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "指定 buildId が存在しない"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status", "timestamp"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "ok"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "HandbookSummary": {
+        "type": "object",
+        "required": ["id", "title", "section", "status"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "quality/storybook-guide"
+          },
+          "title": {
+            "type": "string",
+            "example": "Storybook 追加手順ガイド"
+          },
+          "section": {
+            "type": "string",
+            "example": "quality"
+          },
+          "status": {
+            "type": "string",
+            "example": "APPROVED"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "StorybookBuild": {
+        "type": "object",
+        "required": ["buildId", "status", "artifactUrl"],
+        "properties": {
+          "buildId": {
+            "type": "string",
+            "example": "2026-04-11T090000Z"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "completed", "failed"],
+            "example": "completed"
+          },
+          "artifactUrl": {
+            "type": "string",
+            "format": "uri",
+            "example": "https://storybook.example.internal/builds/2026-04-11T090000Z"
+          }
+        }
+      }
+    }
+  }
+}

@@ -5,10 +5,18 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "jsx": "react-jsx",
+    "resolveJsonModule": true,
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": [".storybook/**/*.ts"]
+  "include": [
+    ".storybook/**/*.ts",
+    "docs/**/*.ts",
+    "docs/**/*.tsx",
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "vitest.config.ts"
+  ]
 }

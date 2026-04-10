@@ -36,7 +36,7 @@ npx @sentry/wizard@latest -i reactNative
 ```ts
 // src/lib/sentry.ts
 import * as Sentry from '@sentry/react-native';
-import { routingInstrumentation } from './sentryRouting';
+import { reactNavigationIntegration } from './sentryRouting';
 
 export function initializeSentry() {
   if (!process.env.EXPO_PUBLIC_SENTRY_DSN) return;  // DSN 未設定なら無効化
@@ -44,24 +44,26 @@ export function initializeSentry() {
   Sentry.init({
     dsn:         process.env.EXPO_PUBLIC_SENTRY_DSN,
     environment: process.env.EXPO_PUBLIC_APP_ENV ?? 'development',
-    release:     `${process.env.EXPO_PUBLIC_APP_VERSION}`,
-    dist:        process.env.EXPO_PUBLIC_BUILD_NUMBER,
+
+    // ── リリース識別子: bundleId@version+buildNumber 形式（Sentry 推奨）
+    // スタックトレースとソースマップの紐付け精度が向上する
+    release: `${process.env.EXPO_PUBLIC_BUNDLE_ID}@${process.env.EXPO_PUBLIC_APP_VERSION}+${process.env.EXPO_PUBLIC_BUILD_NUMBER}`,
+    dist:    process.env.EXPO_PUBLIC_BUILD_NUMBER,
 
     // ── サンプリングレート ──────────────────────────────────────────
-    tracesSampleRate:        __DEV__ ? 1.0 : 0.1,   // 本番は 10% でトレース
-    profilesSampleRate:      0.1,
+    tracesSampleRate:          __DEV__ ? 1.0 : 0.1,   // 本番は 10% でトレース
+    profilesSampleRate:        0.1,
     enableAutoSessionTracking: true,
 
-    // ── 統合設定 ───────────────────────────────────────────────────
+    // ── 統合設定（SDK v6 以降の推奨 API）─────────────────────────────
+    enableTracing: true,
     integrations: [
-      new Sentry.ReactNativeTracing({
-        routingInstrumentation,
-        enableUserInteractionTracing: true,
-      }),
+      reactNavigationIntegration,
+      Sentry.mobileReplayIntegration(),
     ],
 
     // ── PII フィルタリング ─────────────────────────────────────────
-    beforeSend: sanitizeEvent,
+    beforeSend:            sanitizeEvent,
     beforeSendTransaction: sanitizeTransaction,
 
     // ── 開発中は無効化 ─────────────────────────────────────────────
@@ -77,8 +79,10 @@ export function initializeSentry() {
 import * as Sentry from '@sentry/react-native';
 import { useNavigationContainerRef } from 'expo-router';
 
-export const routingInstrumentation =
-  new Sentry.ReactNavigationInstrumentation();
+// SDK v6 以降: new Sentry.ReactNativeTracing() は非推奨
+// reactNavigationIntegration() を使用する
+export const reactNavigationIntegration =
+  Sentry.reactNavigationIntegration({ enableTimeToInitialDisplay: true });
 
 // app/_layout.tsx で使用
 export function useSentryRouting() {
@@ -86,7 +90,7 @@ export function useSentryRouting() {
 
   useEffect(() => {
     if (ref.current) {
-      routingInstrumentation.registerNavigationContainer(ref);
+      reactNavigationIntegration.registerNavigationContainer(ref);
     }
   }, [ref]);
 
@@ -117,24 +121,29 @@ function maskValue(key: string, value: unknown): unknown {
   return value;
 }
 
-function sanitizeObject(obj: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(
-    Object.entries(obj).map(([k, v]) => [
-      k,
-      v && typeof v === 'object'
-        ? sanitizeObject(v as Record<string, unknown>)
-        : maskValue(k, v),
-    ]),
-  );
+function sanitizeObject(obj: unknown): unknown {
+  // 配列を再帰的にサニタイズ（例: 注文リスト内の email フィールドも除去）
+  if (Array.isArray(obj)) {
+    return obj.map((item) => sanitizeObject(item));
+  }
+  if (obj && typeof obj === 'object') {
+    return Object.fromEntries(
+      Object.entries(obj as Record<string, unknown>).map(([k, v]) => [
+        k,
+        sanitizeObject(typeof v === 'string' ? maskValue(k, v) : v),
+      ]),
+    );
+  }
+  return obj;
 }
 
 export function sanitizeEvent(event: Sentry.Event): Sentry.Event | null {
-  // request の body・headers をサニタイズ
+  // request の body をサニタイズ
   if (event.request?.data) {
-    event.request.data = sanitizeObject(
-      event.request.data as Record<string, unknown>,
-    );
+    event.request.data = sanitizeObject(event.request.data);
   }
+
+  // 認証ヘッダを削除
   if (event.request?.headers) {
     delete event.request.headers['Authorization'];
     delete event.request.headers['Cookie'];
@@ -142,7 +151,7 @@ export function sanitizeEvent(event: Sentry.Event): Sentry.Event | null {
 
   // extra / contexts をサニタイズ
   if (event.extra) {
-    event.extra = sanitizeObject(event.extra as Record<string, unknown>);
+    event.extra = sanitizeObject(event.extra) as Record<string, unknown>;
   }
 
   return event;
@@ -185,6 +194,14 @@ type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 type LogContext = Record<string, unknown>;
 
+// 5xx またはステータス不明のエラーのみ Sentry に送る
+// 4xx はアプリ側の正常系として扱い Sentry へ流さない
+function shouldCapture(ctx?: LogContext): boolean {
+  const status = ctx?.status;
+  if (typeof status === 'number' && status < 500) return false;
+  return true;
+}
+
 function log(level: LogLevel, message: string, context?: LogContext) {
   // 開発中はコンソール出力
   if (__DEV__) {
@@ -194,17 +211,17 @@ function log(level: LogLevel, message: string, context?: LogContext) {
 
   // Sentry に Breadcrumb として送信
   Sentry.addBreadcrumb({
-    level:   level as Sentry.SeverityLevel,
+    level:    level as Sentry.SeverityLevel,
     message,
-    data:    context,
+    data:     context,
     category: 'app',
   });
 
-  // error / warn は Sentry にイベントとしても送信
-  if (level === 'error') {
+  // error / warn のうち、5xx またはステータス不明のみ Sentry にイベント送信
+  if ((level === 'error' || level === 'warn') && shouldCapture(context)) {
     Sentry.captureMessage(message, {
-      level:  'error',
-      extra:  context,
+      level: level as Sentry.SeverityLevel,
+      extra: context,
     });
   }
 }
@@ -229,46 +246,38 @@ export const logger = {
 
 ```ts
 // src/lib/queryClient.ts
-import * as Sentry   from '@sentry/react-native';
-import { queryClient } from './queryClientBase';
+import * as Sentry from '@sentry/react-native';
+import { QueryCache, MutationCache, QueryClient } from '@tanstack/react-query';
 
-// グローバルエラーハンドラ
-const queryCache = queryClient.getQueryCache();
-queryCache.subscribe((event) => {
-  if (event.type === 'observerResultsUpdated') {
-    const query = event.query;
-    if (query.state.status === 'error') {
-      const err = query.state.error;
+// QueryCache の onError コールバックでエラーを捕捉する
+// ※ queryCache.subscribe() の event.type は Query 状態管理用であり
+//    エラー捕捉の用途には使用しない
+export const queryClient = new QueryClient({
+  queryCache: new QueryCache({
+    onError: (error, query) => {
+      // 認証エラー・クライアントエラーは Sentry に送らない
+      if (error instanceof HttpError && error.status < 500) return;
 
-      // 認証エラー・404 は監視不要
-      if (err instanceof HttpError && [401, 403, 404].includes(err.status)) return;
-
-      Sentry.captureException(err, {
+      Sentry.captureException(error, {
         tags: {
           query_key: JSON.stringify(query.queryKey).slice(0, 100),
         },
       });
-    }
-  }
-});
-```
+    },
+  }),
 
-### Mutation エラーの統合
+  mutationCache: new MutationCache({
+    onError: (error, _variables, _context, mutation) => {
+      // ネットワークエラー（オフライン起因）は Sentry に送らない
+      if (error instanceof NetworkError) return;
+      // 4xx はアプリ側の正常系として扱う
+      if (error instanceof HttpError && error.status < 500) return;
 
-```ts
-// useMutation の共通エラーハンドラ
-const mutationCache = queryClient.getMutationCache();
-mutationCache.subscribe((event) => {
-  if (event.type === 'updated' && event.mutation.state.status === 'error') {
-    const err = event.mutation.state.error;
-
-    if (err instanceof NetworkError) return;  // ネットワークエラーは通常監視
-    if (err instanceof HttpError && err.status < 500) return;  // 4xx は通常監視
-
-    logger.capture(err, {
-      mutation_key: JSON.stringify(event.mutation.options.mutationKey ?? []).slice(0, 100),
-    });
-  }
+      logger.capture(error, {
+        mutation_key: JSON.stringify(mutation.options.mutationKey ?? []).slice(0, 100),
+      });
+    },
+  }),
 });
 ```
 
@@ -320,7 +329,6 @@ async function request<T>(method: string, path: string, ...): Promise<T> {
 // src/components/providers/SentryErrorBoundary.tsx
 import * as Sentry from '@sentry/react-native';
 
-// Sentry が提供する ErrorBoundary をラップして通知を追加する
 export function AppErrorBoundary({ children }: { children: React.ReactNode }) {
   return (
     <Sentry.ErrorBoundary
@@ -359,8 +367,7 @@ export default function RootLayout() {
 
 ### 画面遷移のトレーシング（自動）
 
-Expo Router + Sentry.ReactNavigationInstrumentation で自動計測される。
-手動対応は不要。
+Expo Router + `reactNavigationIntegration` で自動計測される。手動対応は不要。
 
 ### カスタムトレース
 
@@ -388,13 +395,13 @@ export async function processCheckout(cartId: string) {
 
 ## 9. ソースマップの自動アップロード
 
-```bash
-# eas.json に Sentry の設定を追加
+```jsonc
+// eas.json — SENTRY_AUTH_TOKEN は EAS Secret で管理し、値を直接記述しない
 {
   "build": {
     "production": {
       "env": {
-        "SENTRY_AUTH_TOKEN": "..."  // EAS Secret で管理
+        "SENTRY_AUTH_TOKEN": "$SENTRY_AUTH_TOKEN"
       }
     }
   }
@@ -418,11 +425,25 @@ export default {
 ```
 
 🔴 **MUST**: 本番リリースではソースマップを必ずアップロードする（難読化されたスタックトレースは読めない）  
-🔴 **MUST**: `SENTRY_AUTH_TOKEN` を Git に含めない。EAS Secret で管理する
+🔴 **MUST**: `SENTRY_AUTH_TOKEN` を Git に含めない。EAS Secret で管理し `eas.json` には `"$SENTRY_AUTH_TOKEN"` と記述する
 
 ---
 
-## 10. アラート設定方針
+## 10. オフライン時の挙動
+
+React Native はオフライン状態が頻繁に発生する。Sentry SDK の挙動と運用方針を以下に定める。
+
+| 状態 | SDK の挙動 | 運用上の注意 |
+|------|-----------|------------|
+| オフライン中のイベント | SDK がローカルにキューイング（上限 30 件） | 上限超過分は破棄される。重要イベントを厳選して送ること |
+| オンライン復帰後 | 自動で再送される | 再送タイミングでアラートが遅延することがある |
+| `NetworkError` | `logger.capture` / `MutationCache.onError` で除外 | オフライン起因の偽陽性を Sentry に蓄積しない |
+
+🟡 **SHOULD**: オフライン中は `NetworkError` を Sentry に送らず、アプリ内 Toast / Banner でユーザーに通知する
+
+---
+
+## 11. アラート設定方針
 
 06_Operations の「監視・アラート方針」と対応する Sentry 設定を定義する。
 
@@ -431,24 +452,29 @@ export default {
     <tr>
       <th>条件</th>
       <th>Sentry アラートルール</th>
+      <th>備考</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td>クラッシュ率が前日比 2 倍</td>
       <td>Issue Alerts → <code>event.count()</code> 増加率</td>
+      <td></td>
     </tr>
     <tr>
       <td>新規エラーが発生</td>
-      <td>Issue Alerts → New Issue</td>
+      <td>Issue Alerts → New Issue（<code>handled: false</code> のみ）</td>
+      <td>ノイズ削減のため未処理例外に絞る</td>
     </tr>
     <tr>
       <td>特定エラー件数が閾値超過</td>
       <td>Metric Alerts → Error Count &gt; N</td>
+      <td></td>
     </tr>
     <tr>
-      <td>API エラー率が 1% 超</td>
-      <td>Performance Alerts → Transaction failure rate</td>
+      <td>5xx エラー率が 5% 超</td>
+      <td>Performance Alerts → Transaction failure rate（5xx のみフィルタ）</td>
+      <td>モバイル環境の特性上、全エラー率 1% はオフライン起因の偽陽性が多い。5xx に絞ること</td>
     </tr>
   </tbody>
 </table>
@@ -456,16 +482,17 @@ export default {
 ```
 Sentry → Alerts → Create Alert Rule
   → タイプ: Issue Alert
-  → 条件: "A new issue is created"
+  → 条件: "A new issue is created" AND "handled: false"
   → アクション: Send a notification to [Slack channel]
 ```
 
 🟡 **SHOULD**: 新規 Issue は必ず Slack または GitLab Issue に通知する  
-🟡 **SHOULD**: ノイズを減らすため `handled: false`（未処理例外）のみをアラート対象にする
+🟡 **SHOULD**: `handled: false`（未処理例外）のみをアラート対象にしてノイズを抑制する  
+🟡 **SHOULD**: エラー率アラートは全エラーではなく 5xx に絞る
 
 ---
 
-## 11. テスト実装規約
+## 12. テスト実装規約
 
 ```ts
 // src/lib/__tests__/logger.test.ts
@@ -474,14 +501,30 @@ import * as Sentry from '@sentry/react-native';
 import { logger }  from '@/lib/logger';
 
 describe('logger', () => {
-  test('error は Sentry.captureMessage を呼ぶ', () => {
-    logger.error('テストエラー', { key: 'value' });
+  test('error（5xx）は Sentry.captureMessage を呼ぶ', () => {
+    logger.error('サーバーエラー', { status: 500 });
     expect(Sentry.captureMessage).toHaveBeenCalledWith(
-      'テストエラー',
+      'サーバーエラー',
       expect.objectContaining({ level: 'error' }),
     );
   });
 
+  test('error（4xx）は Sentry.captureMessage を呼ばない', () => {
+    logger.error('バリデーションエラー', { status: 422 });
+    expect(Sentry.captureMessage).not.toHaveBeenCalled();
+  });
+
+  test('warn（5xx）は Sentry.captureMessage を呼ぶ', () => {
+    logger.warn('サービス低下', { status: 503 });
+    expect(Sentry.captureMessage).toHaveBeenCalledWith(
+      'サービス低下',
+      expect.objectContaining({ level: 'warn' }),
+    );
+  });
+});
+
+// src/lib/__tests__/sentry.test.ts
+describe('sanitizeEvent', () => {
   test('PII フィールドがマスクされる', () => {
     const event = sanitizeEvent({
       request: {
@@ -496,14 +539,48 @@ describe('logger', () => {
     });
     expect(event?.request?.headers?.Authorization).toBeUndefined();
   });
+
+  test('配列内の PII フィールドがマスクされる', () => {
+    const event = sanitizeEvent({
+      extra: {
+        items: [
+          { email: 'a@example.com', amount: 500 },
+          { email: 'b@example.com', amount: 300 },
+        ],
+      },
+    } as Sentry.Event);
+
+    expect(event?.extra?.items).toEqual([
+      { email: '[Filtered]', amount: 500 },
+      { email: '[Filtered]', amount: 300 },
+    ]);
+  });
+});
+
+describe('sanitizeTransaction', () => {
+  test('トランザクション名のメールアドレスがマスクされる', () => {
+    const tx = sanitizeTransaction({
+      transaction: '/users/user@example.com/orders',
+    } as Sentry.TransactionEvent);
+    expect(tx?.transaction).toBe('/users/[email]/orders');
+  });
+
+  test('トランザクション名のカード番号がマスクされる', () => {
+    const tx = sanitizeTransaction({
+      transaction: '/payment/4111111111111111/confirm',
+    } as Sentry.TransactionEvent);
+    expect(tx?.transaction).toBe('/payment/[card]/confirm');
+  });
 });
 ```
 
-🔴 **MUST**: `sanitizeEvent` のテストに PII フィールドが全件マスクされることを確認するテストを含める
+🔴 **MUST**: `sanitizeEvent` のテストで PII フィールドの全件マスク（ネスト・配列含む）を確認する  
+🔴 **MUST**: `sanitizeTransaction` のテストでメールアドレスとカード番号の正規表現動作を確認する  
+🔴 **MUST**: `logger` のテストで 4xx が Sentry に送られないことを確認する
 
 ---
 
-## 12. よくある実装ミスと対策
+## 13. よくある実装ミスと対策
 
 <table>
   <thead>
@@ -525,9 +602,19 @@ describe('logger', () => {
       <td><code>sanitizeEvent</code> で削除する</td>
     </tr>
     <tr>
+      <td><code>sanitizeObject</code> が配列未対応</td>
+      <td>配列要素内の PII がマスクされない</td>
+      <td><code>Array.isArray</code> で再帰処理する</td>
+    </tr>
+    <tr>
       <td><code>logger.error</code> が全エラーを送る</td>
       <td>4xx エラーまで Sentry に積まれてノイズになる</td>
-      <td>5xx / NetworkError のみ <code>capture</code> する</td>
+      <td><code>shouldCapture</code> で 5xx のみ <code>captureMessage</code> する</td>
+    </tr>
+    <tr>
+      <td><code>queryCache.subscribe</code> でエラー捕捉</td>
+      <td>エラーが一切 Sentry に届かない</td>
+      <td><code>QueryCache</code> の <code>onError</code> コールバックを使う</td>
     </tr>
     <tr>
       <td>ソースマップ未アップロード</td>
@@ -537,19 +624,34 @@ describe('logger', () => {
     <tr>
       <td><code>SENTRY_AUTH_TOKEN</code> を .env にコミット</td>
       <td>トークン漏洩</td>
-      <td>EAS Secret で管理する</td>
+      <td>EAS Secret で管理し <code>eas.json</code> には <code>"$SENTRY_AUTH_TOKEN"</code> と記述する</td>
     </tr>
     <tr>
       <td><code>tracesSampleRate: 1.0</code> を本番で使う</td>
       <td>Sentry の quota を大量消費</td>
       <td>本番は 0.1（10%）以下にする</td>
     </tr>
+    <tr>
+      <td><code>release</code> にバージョン番号のみ設定</td>
+      <td>ビルド間のスタックトレース差分が追跡できない</td>
+      <td><code>bundleId@version+buildNumber</code> 形式にする</td>
+    </tr>
+    <tr>
+      <td><code>new Sentry.ReactNativeTracing()</code> を使う</td>
+      <td>SDK v6 で非推奨、将来削除される</td>
+      <td><code>reactNavigationIntegration()</code> に移行する</td>
+    </tr>
+    <tr>
+      <td>全エラー率 1% でアラート設定</td>
+      <td>オフライン起因の偽陽性でアラート疲弊</td>
+      <td>5xx に絞った Transaction failure rate を使う</td>
+    </tr>
   </tbody>
 </table>
 
 ---
 
-## 13. 変更履歴
+## 14. 変更履歴
 
 <table>
   <thead>
@@ -563,6 +665,21 @@ describe('logger', () => {
     <tr>
       <td>2026-03</td>
       <td>初版作成</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>2026-04</td>
+      <td>
+        SDK v6 対応（reactNavigationIntegration 移行）、
+        sanitizeObject 配列対応、
+        QueryCache.onError 修正、
+        logger 4xx フィルタリング追加、
+        release フォーマット修正、
+        eas.json トークン参照修正、
+        オフライン挙動セクション追加、
+        アラート閾値を 5xx に変更、
+        テスト拡充（sanitizeTransaction・配列・warn・4xx）
+      </td>
       <td>—</td>
     </tr>
   </tbody>

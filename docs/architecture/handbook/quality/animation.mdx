@@ -5,14 +5,14 @@ import { Meta } from '@storybook/addon-docs/blocks';
 # アニメーション・ジェスチャー設計標準
 
 > **ステータス**: `APPROVED`  
-> **対象**: react-native-reanimated / react-native-gesture-handler の実装規約  
+> **対象**: react-native-reanimated v3 / react-native-gesture-handler v2 の実装規約  
 > **依存**: 01_Principles（採用技術）、16_Performance（パフォーマンス）
 
 ---
 
-## 1. 方針
+## 1. 意思決定層：技術選択と禁止事項
 
-### 技術選択の原則
+### 採用技術マトリクス
 
 <table>
   <thead>
@@ -26,50 +26,47 @@ import { Meta } from '@storybook/addon-docs/blocks';
     <tr>
       <td>すべてのアニメーション</td>
       <td><code>react-native-reanimated</code></td>
-      <td>JS スレッドをブロックせず 60fps を維持できる</td>
+      <td>UIスレッドで実行されJSスレッドをブロックしない。60fps維持に必須</td>
     </tr>
     <tr>
       <td>すべてのジェスチャー</td>
       <td><code>react-native-gesture-handler</code></td>
-      <td>ネイティブスレッドでジェスチャーを処理する</td>
+      <td>ネイティブスレッドでジェスチャーを処理し、JSスレッドの遅延に依存しない</td>
     </tr>
     <tr>
-      <td>レイアウトアニメーション</td>
+      <td>要素の出現・消去・リサイズ</td>
       <td><code>Reanimated Layout Animations</code></td>
-      <td>要素の出現・消去・リサイズを宣言的に記述できる</td>
+      <td>宣言的に記述でき、周囲要素の再配置も自動処理される</td>
     </tr>
   </tbody>
 </table>
 
-🔴 **MUST NOT**: `Animated`（React Native コア）を新規実装に使わない  
-🔴 **MUST NOT**: `PanResponder` を新規実装に使わない  
+🔴 **MUST NOT**: `Animated`（React Native コア）を新規実装に使わない — JSスレッド駆動でフレームドロップを引き起こす  
+🔴 **MUST NOT**: `PanResponder` を新規実装に使わない — 同上  
 🔴 **MUST**: `GestureHandlerRootView` を `app/_layout.tsx` の最外周に配置する（01_Principles で定義済み）
 
-### `useReducedMotion` との統合
+### `useReducedMotion` の使い方
 
-すべてのアニメーションは `useReducedMotion` を確認し、有効な場合は動きを最小化する。
+Reanimated v3 には `useReducedMotion` が組み込まれているため、**独自フックは作成しない**。
 
 ```ts
-// src/hooks/useReducedMotion.ts
-import { useEffect, useState } from 'react';
-import { AccessibilityInfo }   from 'react-native';
+// ✅ Reanimated 公式フックを直接使う
+import { useReducedMotion } from 'react-native-reanimated';
 
-export function useReducedMotion(): boolean {
-  const [reduceMotion, setReduceMotion] = useState(false);
-
-  useEffect(() => {
-    AccessibilityInfo.isReduceMotionEnabled().then(setReduceMotion);
-    const sub = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduceMotion);
-    return () => sub.remove();
-  }, []);
-
-  return reduceMotion;
+function MyComponent() {
+  const reduceMotion = useReducedMotion();
+  // ...
 }
 ```
 
+> **なぜカスタムフックを廃止するか**: Reanimated の worklet 最適化と連動しており、カスタム実装では `useAnimatedStyle` 内での参照が正しく機能しないケースがある。
+
+🔴 **MUST**: すべてのアニメーションで `useReducedMotion` を確認する  
+🟡 **SHOULD**: スライド・バウンスはモーション制限時にフェードへ置き換える。フェードは「変化の知覚」を保持しながら動きを最小化できる唯一の代替手段
+
 ---
 
-## 2. Reanimated の基本パターン
+## 2. 実装層：Reanimated の基本パターン
 
 ### shared value と animated style
 
@@ -78,12 +75,13 @@ import Animated, {
   useSharedValue, useAnimatedStyle, withSpring, withTiming,
 } from 'react-native-reanimated';
 
-// ✅ 基本パターン: useSharedValue → useAnimatedStyle → Animated.View
 export function FadeInCard({ children }: { children: React.ReactNode }) {
-  const opacity   = useSharedValue(0);
+  const opacity    = useSharedValue(0);
   const translateY = useSharedValue(16);
 
   useEffect(() => {
+    // shared value は参照が変わらないため依存配列に含めなくてよい
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     opacity.value    = withTiming(1,  { duration: 200 });
     translateY.value = withSpring(0,  { damping: 20, stiffness: 300 });
   }, []);
@@ -115,27 +113,27 @@ export function FadeInCard({ children }: { children: React.ReactNode }) {
     <tr>
       <td>フェードイン・フェードアウト</td>
       <td><code>withTiming</code></td>
-      <td>線形・イージングが自然</td>
+      <td>線形・イージングが自然。完了時間が予測できる</td>
     </tr>
     <tr>
       <td>要素の出現・位置変化</td>
       <td><code>withSpring</code></td>
-      <td>物理ベースで自然な弾力感</td>
+      <td>物理ベースで自然な弾力感。duration 指定不要</td>
     </tr>
     <tr>
       <td>進捗バー・ゲージ</td>
       <td><code>withTiming</code></td>
-      <td>指定時間で完了する必要がある</td>
+      <td>指定時間内での完了が必須要件</td>
     </tr>
     <tr>
-      <td>ドラッグ追従</td>
+      <td>ドラッグ追従・解放</td>
       <td><code>withSpring</code></td>
-      <td>指を離した後の収束が自然</td>
+      <td>指を離した後の収束が物理的に自然</td>
     </tr>
     <tr>
       <td>モーダルのスライドイン</td>
       <td><code>withTiming</code> + <code>Easing.out</code></td>
-      <td>制御された滑らかさ</td>
+      <td>制御された滑らかさ。弾まないほうが安定感がある</td>
     </tr>
   </tbody>
 </table>
@@ -143,13 +141,92 @@ export function FadeInCard({ children }: { children: React.ReactNode }) {
 ```tsx
 import { Easing } from 'react-native-reanimated';
 
-// モーダルのスライドアップ
 const translateY = useSharedValue(300);
 translateY.value = withTiming(0, {
   duration: 300,
   easing:   Easing.out(Easing.cubic),
 });
 ```
+
+### `withSequence` / `withDelay` の使い方
+
+複数アニメーションを時間軸で制御する場合に使う。
+
+```tsx
+import { withSequence, withDelay, withTiming, withSpring } from 'react-native-reanimated';
+
+// ✅ 連続実行: 押下エフェクト → 元に戻る
+scale.value = withSequence(
+  withTiming(0.9, { duration: 80 }),
+  withSpring(1,   { damping: 15 }),
+);
+
+// ✅ 遅延付き: ステガー表示（アイテムを順番に表示する）
+opacity.value = withDelay(index * 50, withTiming(1, { duration: 200 }));
+
+// ✅ 組み合わせ: 500ms 後に開始し、その後 spring で戻る
+translateY.value = withDelay(
+  500,
+  withSequence(
+    withTiming(-10, { duration: 150 }),
+    withSpring(0,   { damping: 20 }),
+  ),
+);
+```
+
+### `interpolate` と `Extrapolation` の選択基準
+
+```tsx
+import { interpolate, Extrapolation } from 'react-native-reanimated';
+
+// CLAMP: 入力範囲の外では出力を端値で固定する（最も一般的）
+// → スクロール連動でヘッダーが "それ以上縮まない" ような制限に使う
+const height = interpolate(
+  scrollOffset.value,
+  [0, 140],
+  [200, 60],
+  Extrapolation.CLAMP,  // scrollOffset < 0 でも height は 200 のまま
+);
+
+// EXTEND: 入力範囲の外でも線形に延長する
+// → ゴム紐効果（引っ張るほど動く）など意図的なオーバーシュートに使う
+const rubberBand = interpolate(
+  dragY.value,
+  [0, 100],
+  [0, 30],
+  Extrapolation.EXTEND,
+);
+
+// IDENTITY: 範囲外では出力 = 入力をそのまま返す（ほぼ使わない）
+// → 入力値と出力値の単位が同じで、変換が不要な範囲のみに留めたい特殊ケース
+```
+
+<table>
+  <thead>
+    <tr>
+      <th>Extrapolation</th>
+      <th>範囲外の挙動</th>
+      <th>主な用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>CLAMP</code></td>
+      <td>端値で固定</td>
+      <td>スクロール連動・進捗表示（デフォルト推奨）</td>
+    </tr>
+    <tr>
+      <td><code>EXTEND</code></td>
+      <td>線形に延長</td>
+      <td>ゴム紐・オーバーシュート演出</td>
+    </tr>
+    <tr>
+      <td><code>IDENTITY</code></td>
+      <td>入力値をそのまま返す</td>
+      <td>ほぼ使わない</td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 
@@ -162,6 +239,7 @@ import Animated, {
   FadeIn, FadeOut, SlideInDown, SlideOutDown,
   LinearTransition,
 } from 'react-native-reanimated';
+import { useReducedMotion } from 'react-native-reanimated';
 
 // ✅ アイテムの追加・削除アニメーション
 export function AnimatedList({ items }: { items: Item[] }) {
@@ -172,7 +250,7 @@ export function AnimatedList({ items }: { items: Item[] }) {
           key={item.id}
           entering={FadeIn.duration(200)}
           exiting={FadeOut.duration(150)}
-          layout={LinearTransition}   // 他のアイテムが滑らかに移動する
+          layout={LinearTransition}
         >
           <ItemCard item={item} />
         </Animated.View>
@@ -181,30 +259,10 @@ export function AnimatedList({ items }: { items: Item[] }) {
   );
 }
 
-// ✅ モーダル・ボトムシートの出現
-export function BottomSheet({ visible, children }: BottomSheetProps) {
-  if (!visible) return null;
-  return (
-    <Animated.View
-      entering={SlideInDown.springify().damping(20)}
-      exiting={SlideOutDown.duration(200)}
-    >
-      {children}
-    </Animated.View>
-  );
-}
-```
-
-### `useReducedMotion` との統合パターン
-
-```tsx
-import { FadeIn, FadeOut } from 'react-native-reanimated';
-import { useReducedMotion }  from '@/hooks/useReducedMotion';
-
+// ✅ モーション制限に対応したカード
 export function AnimatedCard({ children }: { children: React.ReactNode }) {
   const reduceMotion = useReducedMotion();
 
-  // モーションが制限されている場合はスライドをフェードに置き換える
   const entering = reduceMotion
     ? FadeIn.duration(100)
     : SlideInDown.springify().damping(20);
@@ -221,8 +279,6 @@ export function AnimatedCard({ children }: { children: React.ReactNode }) {
 }
 ```
 
-🟡 **SHOULD**: スライド・バウンスアニメーションは `useReducedMotion` が true のときフェードに置き換える
-
 ---
 
 ## 4. ジェスチャーハンドラ
@@ -232,17 +288,18 @@ export function AnimatedCard({ children }: { children: React.ReactNode }) {
 ```tsx
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
-  useSharedValue, useAnimatedStyle, withSpring,
+  useSharedValue, useAnimatedStyle, withSpring, runOnJS,
 } from 'react-native-reanimated';
 
 export function PressableCard({ onPress, children }: PressableCardProps) {
   const scale = useSharedValue(1);
 
   const tap = Gesture.Tap()
-    .onBegin(() => { scale.value = withSpring(0.96, { damping: 20 }); })
+    .onBegin(()   => { scale.value = withSpring(0.96, { damping: 20 }); })
     .onFinalize(() => { scale.value = withSpring(1,    { damping: 20 }); })
+    // GestureコールバックはUIスレッド（worklet）で実行されるため、
+    // JSスレッドの関数（onPress）は runOnJS でラップして呼び出す
     .onEnd(() => { runOnJS(onPress)(); });
-    // ⚠️ onPress は JS 関数なので runOnJS でラップする
 
   const animatedStyle = useAnimatedStyle(() => ({
     transform: [{ scale: scale.value }],
@@ -262,16 +319,65 @@ export function PressableCard({ onPress, children }: PressableCardProps) {
 }
 ```
 
-### Pan（ドラッグ）
+### LongPress（長押し）
+
+```tsx
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue, useAnimatedStyle, withTiming, withSpring, runOnJS,
+} from 'react-native-reanimated';
+
+const LONG_PRESS_DURATION = 500; // ms
+
+export function LongPressCard({ onLongPress, children }: LongPressCardProps) {
+  const scale   = useSharedValue(1);
+  const opacity = useSharedValue(1);
+
+  const longPress = Gesture.LongPress()
+    .minDuration(LONG_PRESS_DURATION)
+    .onBegin(() => {
+      // 押し込みエフェクト
+      scale.value   = withTiming(0.95, { duration: LONG_PRESS_DURATION });
+      opacity.value = withTiming(0.8,  { duration: LONG_PRESS_DURATION });
+    })
+    .onStart(() => {
+      runOnJS(onLongPress)();
+    })
+    .onFinalize(() => {
+      scale.value   = withSpring(1,   { damping: 20 });
+      opacity.value = withTiming(1,   { duration: 150 });
+    });
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    transform: [{ scale: scale.value }],
+    opacity:   opacity.value,
+  }));
+
+  return (
+    <GestureDetector gesture={longPress}>
+      <Animated.View
+        style={animatedStyle}
+        accessible={true}
+        accessibilityRole="button"
+        accessibilityHint="長押しでメニューを表示"
+      >
+        {children}
+      </Animated.View>
+    </GestureDetector>
+  );
+}
+```
+
+### Pan（ドラッグ・スワイプ）
 
 ```tsx
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
   useSharedValue, useAnimatedStyle,
-  withSpring, runOnJS,
+  withSpring, withTiming, runOnJS,
 } from 'react-native-reanimated';
 
-const DISMISS_THRESHOLD = 120;  // px。この距離を超えたら dismiss
+const DISMISS_THRESHOLD = 120; // px。design-tokens/animation.ts で管理
 
 export function SwipeToDismissCard({ onDismiss, children }: SwipeProps) {
   const translateX = useSharedValue(0);
@@ -285,15 +391,18 @@ export function SwipeToDismissCard({ onDismiss, children }: SwipeProps) {
     .onEnd((e) => {
       if (Math.abs(e.translationX) > DISMISS_THRESHOLD) {
         // 閾値超え → 画面外へ飛ばしてから dismiss を呼ぶ
-        translateX.value = withSpring(
-          e.translationX > 0 ? 500 : -500,
-          {},
+        // translateX と opacity を同時に開始し、完了コールバックは translateX 側のみ
+        const target = e.translationX > 0 ? 500 : -500;
+        opacity.value    = withTiming(0, { duration: 200 });
+        translateX.value = withTiming(
+          target,
+          { duration: 200 },
           (finished) => { if (finished) runOnJS(onDismiss)(); },
         );
       } else {
-        // 閾値未満 → 元の位置に戻す
-        translateX.value = withSpring(0);
-        opacity.value    = withSpring(1);
+        // 閾値未満 → 同時に元の位置へ戻す
+        translateX.value = withSpring(0, { damping: 20 });
+        opacity.value    = withSpring(1, { damping: 20 });
       }
     });
 
@@ -310,41 +419,100 @@ export function SwipeToDismissCard({ onDismiss, children }: SwipeProps) {
 }
 ```
 
-🔴 **MUST**: Reanimated worklet（`useAnimatedStyle` / `onUpdate` 等）内から JS 関数を呼ぶときは `runOnJS` を使う  
-🔴 **MUST NOT**: worklet 内でコンポーネントの state を直接変更しない（`setState` は JS スレッドの操作）
-
 ### ジェスチャーの競合解決
 
 ```tsx
 // スクロールとスワイプが競合する場合
-const pan    = Gesture.Pan().activeOffsetX([-10, 10]);   // X 方向 10px 以上でアクティブ
-const scroll = Gesture.Native();                          // ScrollView / FlatList のネイティブジェスチャー
+const pan    = Gesture.Pan().activeOffsetX([-10, 10]); // X 方向 10px 以上でアクティブ
+const scroll = Gesture.Native();                        // ScrollView / FlatList のネイティブジェスチャー
 
-// 同時認識（scroll が優先）
-const composed = Gesture.Simultaneous(scroll, pan);
+// 同時認識（どちらも生きている）
+const composed  = Gesture.Simultaneous(scroll, pan);
 
-// pan が成立したら scroll をキャンセル
+// pan が成立したら scroll をキャンセル（水平スワイプ専用のリストに使う）
 const exclusive = Gesture.Exclusive(pan, scroll);
 ```
 
-🟡 **SHOULD**: `ScrollView` / `FlatList` 内でドラッグジェスチャーを使う場合は `Gesture.Simultaneous` か `Exclusive` で競合を明示的に解決する
+🟡 **SHOULD**: `ScrollView` / `FlatList` 内でドラッグジェスチャーを使う場合は `Simultaneous` か `Exclusive` で競合を明示的に解決する
 
 ---
 
-## 5. 共通アニメーションコンポーネント
+## 5. worklet ルール
 
-繰り返し使うアニメーションパターンは Design System に共通化する。
+### 呼び出しコンテキストの分類
+
+```tsx
+// ✅ worklet 内で使えるもの
+useAnimatedStyle(() => {
+  return {
+    opacity:   opacity.value,           // shared value の読み取り
+    transform: [{ scale: scale.value }], // 四則演算・三角関数
+  };
+});
+
+// ❌ worklet 内で直接使えないもの（runOnJS / runOnUI でラップする）
+useAnimatedStyle(() => {
+  console.log(opacity.value); // ❌ UIスレッドに console はない
+  setState(opacity.value);    // ❌ setState は JSスレッドの操作
+  router.push('/next');       // ❌ ナビゲーションは JSスレッドの操作
+});
+```
+
+### `runOnJS` / `runOnUI` の使い分け
+
+```tsx
+// runOnJS: UIスレッド（worklet） → JSスレッドへの呼び出し
+pan.onEnd(() => {
+  runOnJS(router.push)('/next-screen'); // ナビゲーション
+  runOnJS(setIsOpen)(false);            // setState
+  runOnJS(onDismiss)();                 // コールバックprop
+});
+
+// runOnUI: JSスレッド → UIスレッドへの呼び出し
+// 通常は worklet 内で自動変換されるため使用頻度は低い
+// useEffect 内から shared value を操作する場合など
+runOnUI(() => {
+  'worklet';
+  opacity.value = withTiming(0);
+})();
+```
+
+---
+
+## 6. 共通アニメーションコンポーネント
+
+繰り返し使うパターンは Design System に共通化する。
+
+### アニメーション定数の管理場所
+
+```ts
+// src/constants/animation.ts に一元管理する
+export const ANIMATION = {
+  DISMISS_THRESHOLD:   120,   // スワイプ dismiss の閾値 (px)
+  SPRING_DAMPING:       20,   // 共通 spring のダンピング係数
+  SPRING_STIFFNESS:    300,   // 共通 spring の剛性
+  FADE_DURATION:       200,   // 標準フェード時間 (ms)
+  SLIDE_DURATION:      300,   // 標準スライド時間 (ms)
+  SKELETON_DURATION:   700,   // スケルトンパルス時間 (ms)
+  LONG_PRESS_DURATION: 500,   // 長押し認識時間 (ms)
+} as const;
+```
+
+### FadeView
 
 ```tsx
 // src/components/ui/Animated/FadeView.tsx
+import { useReducedMotion } from 'react-native-reanimated';
+import { ANIMATION } from '@/constants/animation';
+
 type FadeViewProps = {
-  visible:  boolean;
+  visible:   boolean;
   duration?: number;
-  children: React.ReactNode;
-  style?:   ViewStyle;
+  children:  React.ReactNode;
+  style?:    ViewStyle;
 };
 
-export function FadeView({ visible, duration = 200, children, style }: FadeViewProps) {
+export function FadeView({ visible, duration = ANIMATION.FADE_DURATION, children, style }: FadeViewProps) {
   const reduceMotion = useReducedMotion();
   const opacity      = useSharedValue(visible ? 1 : 0);
 
@@ -352,6 +520,7 @@ export function FadeView({ visible, duration = 200, children, style }: FadeViewP
     opacity.value = withTiming(visible ? 1 : 0, {
       duration: reduceMotion ? 0 : duration,
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, duration, reduceMotion]);
 
   const animatedStyle = useAnimatedStyle(() => ({
@@ -366,20 +535,33 @@ export function FadeView({ visible, duration = 200, children, style }: FadeViewP
 }
 ```
 
+### SkeletonPulse
+
 ```tsx
 // src/components/ui/Animated/SkeletonPulse.tsx
-// ローディングのスケルトンパルスアニメーション
+import { useReducedMotion } from 'react-native-reanimated';
+import { ANIMATION } from '@/constants/animation';
+
 export function SkeletonPulse({ style }: { style?: ViewStyle }) {
   const reduceMotion = useReducedMotion();
   const opacity      = useSharedValue(1);
 
   useEffect(() => {
     if (reduceMotion) return;
+
     opacity.value = withRepeat(
-      withTiming(0.3, { duration: 700, easing: Easing.inOut(Easing.ease) }),
+      withTiming(0.3, {
+        duration: ANIMATION.SKELETON_DURATION,
+        easing:   Easing.inOut(Easing.ease),
+      }),
       -1,   // 無限ループ
       true, // reverse
     );
+
+    // ⚠️ アンマウント時に必ずキャンセルする（メモリリーク防止）
+    return () => {
+      cancelAnimation(opacity);
+    };
   }, [reduceMotion]);
 
   const animatedStyle = useAnimatedStyle(() => ({
@@ -389,7 +571,9 @@ export function SkeletonPulse({ style }: { style?: ViewStyle }) {
   return (
     <Animated.View
       style={[{ backgroundColor: colors['surface-secondary'] }, animatedStyle, style]}
-      accessible={false}
+      accessible={true}
+      accessibilityLabel="読み込み中"
+      accessibilityRole="progressbar"
     />
   );
 }
@@ -397,12 +581,12 @@ export function SkeletonPulse({ style }: { style?: ViewStyle }) {
 
 ---
 
-## 6. スクロール連動アニメーション
+## 7. スクロール連動アニメーション
 
 ```tsx
-// ヘッダーがスクロールに応じて縮小するパターン
 import Animated, {
-  useScrollViewOffset, useAnimatedStyle, interpolate, Extrapolation,
+  useAnimatedRef, useScrollViewOffset,
+  useAnimatedStyle, interpolate, Extrapolation,
 } from 'react-native-reanimated';
 
 const HEADER_MAX_HEIGHT = 200;
@@ -417,7 +601,7 @@ export function AnimatedHeaderScreen() {
       scrollOffset.value,
       [0, HEADER_MAX_HEIGHT - HEADER_MIN_HEIGHT],
       [HEADER_MAX_HEIGHT, HEADER_MIN_HEIGHT],
-      Extrapolation.CLAMP,
+      Extrapolation.CLAMP, // マイナスオフセット（バウンス）でもヘッダーが広がらないようにする
     );
     return { height };
   });
@@ -438,7 +622,6 @@ export function AnimatedHeaderScreen() {
           画面タイトル
         </Animated.Text>
       </Animated.View>
-
       <Animated.ScrollView ref={scrollRef}>
         {/* コンテンツ */}
       </Animated.ScrollView>
@@ -447,80 +630,72 @@ export function AnimatedHeaderScreen() {
 }
 ```
 
-🟡 **SHOULD**: スクロール連動アニメーションは `useScrollViewOffset` を使う（`onScroll` で JS スレッドを介さない）
-
----
-
-## 7. worklet ルール
-
-```tsx
-// ✅ worklet 内で使えるもの
-useAnimatedStyle(() => {
-  'worklet';
-  return {
-    opacity:    opacity.value,          // shared value の読み取り ✅
-    transform:  [{ scale: scale.value }], // 演算 ✅
-  };
-});
-
-// ❌ worklet 内で使えないもの
-useAnimatedStyle(() => {
-  'worklet';
-  console.log('debug');      // ❌ console はワーカースレッドで使えない
-  setState(opacity.value);   // ❌ setState はJSスレッドの操作
-  someJSFunction();          // ❌ 通常のJS関数 → runOnJS(someJSFunction)() に変換
-});
-```
-
-### `runOnJS` / `runOnUI` の使い分け
-
-```tsx
-// runOnJS: UI スレッド → JS スレッドへの呼び出し
-pan.onEnd(() => {
-  runOnJS(router.push)('/next-screen');  // ✅ ナビゲーションは JS スレッド
-  runOnJS(setIsOpen)(false);             // ✅ setState は JS スレッド
-});
-
-// runOnUI: JS スレッド → UI スレッドへの呼び出し（通常は worklet 内自動変換で不要）
-runOnUI(() => {
-  'worklet';
-  opacity.value = withTiming(0);
-})();
-```
+🟡 **SHOULD**: スクロール連動アニメーションは `useScrollViewOffset` を使う（`onScroll` を使うとJSスレッドを介するためフレームドロップが発生する）
 
 ---
 
 ## 8. テスト
 
+### モック設定の方針
+
+Reanimated のモックは **`jest.config.ts` のグローバル設定のみ** で管理する。個々のテストファイルで `jest.mock('react-native-reanimated', ...)` を重複定義しない。
+
+```ts
+// jest.config.ts
+export default {
+  preset: 'react-native',
+  setupFilesAfterFramework: ['@testing-library/react-native/extend-expect'],
+  transformIgnorePatterns: [
+    'node_modules/(?!(react-native|react-native-reanimated|react-native-gesture-handler)/)',
+  ],
+  moduleNameMapper: {
+    'react-native-reanimated': 'react-native-reanimated/mock',
+  },
+};
+```
+
+### アニメーションコンポーネントのテスト方針
+
+Reanimated v3 のモックはアニメーション値を即時解決するため、**最終状態のみ検証する**。中間フレームのテストは不要かつ不安定。
+
 ```tsx
-// アニメーションのテストは Reanimated のモックを使う
-// jest.config.ts に設定済みの場合は自動でモックされる
-
 // src/components/ui/Animated/__tests__/FadeView.test.tsx
-import { render, act } from '@testing-library/react-native';
-import { FadeView }    from '../FadeView';
+import { render } from '@testing-library/react-native';
+import { FadeView } from '../FadeView';
 
-// Reanimated v3 はテスト環境でアニメーション値を即時解決する
-jest.mock('react-native-reanimated', () =>
-  require('react-native-reanimated/mock'),
-);
+// グローバルモックが効いているため jest.mock の重複記述は不要
 
-test('visible=false のとき opacity が 0 になる', async () => {
+test('visible=false のとき opacity が 0 になる', () => {
   const { getByTestId, rerender } = render(
     <FadeView visible={true} testID="fade">
       <Text>コンテンツ</Text>
     </FadeView>,
   );
 
-  rerender(<FadeView visible={false} testID="fade"><Text>コンテンツ</Text></FadeView>);
+  rerender(
+    <FadeView visible={false} testID="fade">
+      <Text>コンテンツ</Text>
+    </FadeView>,
+  );
 
-  // Reanimated mock は値を即時設定するため、withTiming の完了を待つ必要がない
-  const view = getByTestId('fade');
-  expect(view.props.style).toMatchObject({ opacity: 0 });
+  expect(getByTestId('fade').props.style).toMatchObject({ opacity: 0 });
 });
 ```
 
-🟡 **SHOULD**: アニメーションのテストは値の最終状態のみ確認する（中間フレームのテストは不要）
+### スナップショットテストの方針
+
+アニメーションコンポーネントのスナップショットは **静止状態（初期値）のみ** 記録する。アニメーション中の中間状態をスナップショットに含めると、Reanimated のバージョンアップでノイズが発生する。
+
+```tsx
+test('FadeView の初期スナップショット（visible=true）', () => {
+  const { toJSON } = render(
+    <FadeView visible={true}>
+      <Text>コンテンツ</Text>
+    </FadeView>,
+  );
+  expect(toJSON()).toMatchSnapshot();
+});
+```
 
 ---
 
@@ -537,7 +712,7 @@ test('visible=false のとき opacity が 0 になる', async () => {
   <tbody>
     <tr>
       <td><code>Animated</code>（RN コア）を使う</td>
-      <td>JS スレッドで実行され、フレームドロップが発生する</td>
+      <td>JSスレッド駆動でフレームドロップ</td>
       <td><code>react-native-reanimated</code> に移行</td>
     </tr>
     <tr>
@@ -551,8 +726,8 @@ test('visible=false のとき opacity が 0 になる', async () => {
       <td><code>app/_layout.tsx</code> の最外周に配置</td>
     </tr>
     <tr>
-      <td><code>onPress</code> を worklet 内で直接呼ぶ</td>
-      <td>実行時エラー</td>
+      <td>ジェスチャーコールバック内で <code>onPress</code> を直接呼ぶ</td>
+      <td>実行時エラー（UIスレッドからJSスレッド関数の直呼び）</td>
       <td><code>runOnJS(onPress)()</code></td>
     </tr>
     <tr>
@@ -561,9 +736,29 @@ test('visible=false のとき opacity が 0 になる', async () => {
       <td>全アニメーションで確認を入れる</td>
     </tr>
     <tr>
-      <td><code>withRepeat</code> の cleanup なし</td>
+      <td><code>withRepeat</code> の <code>cancelAnimation</code> なし</td>
       <td>アンマウント後もアニメーションが継続しメモリリーク</td>
-      <td><code>cancelAnimation(value)</code> を cleanup で呼ぶ</td>
+      <td><code>useEffect</code> の cleanup で <code>cancelAnimation(value)</code> を呼ぶ</td>
+    </tr>
+    <tr>
+      <td>カスタム <code>useReducedMotion</code> フックを作る</td>
+      <td>worklet 内で参照できず、Reanimated 最適化と競合する</td>
+      <td><code>react-native-reanimated</code> 公式フックを直接使う</td>
+    </tr>
+    <tr>
+      <td>アニメーション定数をコンポーネント内にハードコードする</td>
+      <td>値の変更が散在し、一貫性が保てない</td>
+      <td><code>src/constants/animation.ts</code> に一元管理する</td>
+    </tr>
+    <tr>
+      <td>Pan の dismiss 後に複数の shared value を <code>withSpring</code> で個別リセットする</td>
+      <td>タイミング競合で中途半端な状態が表示される</td>
+      <td><code>withTiming</code> + 同一 <code>duration</code> で同時実行する</td>
+    </tr>
+    <tr>
+      <td>個々のテストファイルで <code>jest.mock('react-native-reanimated', ...)</code> を重複記述する</td>
+      <td>グローバル設定との競合・不安定なテスト結果</td>
+      <td><code>jest.config.ts</code> のグローバル設定のみに集約する</td>
     </tr>
   </tbody>
 </table>
@@ -581,6 +776,11 @@ test('visible=false のとき opacity が 0 になる', async () => {
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td>2026-04</td>
+      <td>構造改定・LongPress追加・interpolate選択基準追加・定数管理方針追加・withSequence/withDelay追加・SkeletonPulseのcleanup修正・jest重複問題修正・useReducedMotion公式フックへ統一</td>
+      <td>—</td>
+    </tr>
     <tr>
       <td>2026-03</td>
       <td>初版作成</td>

@@ -30,7 +30,7 @@ import { Meta } from '@storybook/addon-docs/blocks';
   Static（TypeScript + ESLint）
 ```
 
-### テスト種別と担当技術
+### テスト種別・担当技術・カバレッジ目標
 
 <table>
   <thead>
@@ -38,6 +38,7 @@ import { Meta } from '@storybook/addon-docs/blocks';
       <th>テスト種別</th>
       <th>技術構成</th>
       <th>確認観点</th>
+      <th>カバレッジ目標</th>
     </tr>
   </thead>
   <tbody>
@@ -45,36 +46,43 @@ import { Meta } from '@storybook/addon-docs/blocks';
       <td><strong>E2E</strong></td>
       <td>MagicPod / Maestro + EAS Workflows</td>
       <td>ログイン・検索・登録・決済などの業務導線</td>
+      <td>クリティカルジャーニー全件</td>
     </tr>
     <tr>
       <td><strong>Screen Integration</strong></td>
       <td>Jest + jest-expo + RNTL + MSW</td>
       <td>API・状態・ナビゲーション含む画面単位の振る舞い</td>
+      <td>branch 60% 以上</td>
     </tr>
     <tr>
       <td><strong>Component Interaction</strong></td>
       <td>Storybook on-device + RNTL</td>
       <td>表示・押下・入力・バリデーション</td>
+      <td>全 Story に play() 関数必須</td>
     </tr>
     <tr>
       <td><strong>Logic</strong></td>
       <td>Jest</td>
       <td>純粋関数・変換ロジックの入出力</td>
+      <td>statement 80% 以上</td>
     </tr>
     <tr>
       <td><strong>Static</strong></td>
       <td>TypeScript + ESLint</td>
       <td>型整合性・構文・規約違反</td>
+      <td>error 0 件</td>
     </tr>
     <tr>
       <td><strong>VRT</strong></td>
       <td>React Native Web Storybook + Playwright screenshot</td>
       <td>視覚差分の自動検知</td>
+      <td>ピクセル差分閾値 0.1% 未満</td>
     </tr>
     <tr>
       <td><strong>Device A11y</strong></td>
       <td>実機確認 + E2E 補助</td>
       <td>focus 順・label・dynamic type・screen reader</td>
+      <td>チェックリスト全項目 Pass</td>
     </tr>
   </tbody>
 </table>
@@ -190,6 +198,40 @@ Storybook を **1 系統にまとめない**。理由は明確である。
 
 ## 3. native Storybook 実装方針
 
+### エントリポイント切り替え
+
+`require()` の条件分岐は Metro の static analysis と相性が悪いため、
+**`registerRootComponent` パターン** を採用する。
+
+```tsx
+// index.js
+import { registerRootComponent } from 'expo';
+
+const isStorybook = process.env.EXPO_PUBLIC_STORYBOOK_ENABLED === 'true';
+const App = isStorybook
+  ? require('./.rnstorybook').default
+  : require('./src/App').default;
+
+registerRootComponent(App);
+```
+
+> **なぜ `require()` を `app/_layout.tsx` 内で使わないか**  
+> Expo Router は `app/` ディレクトリ全体を静的解析する。  
+> `_layout.tsx` に `require()` 条件分岐を置くとファイルシステムルーティングが壊れる。  
+> エントリポイントである `index.js` で切り替えるのが安全な唯一の方法である。
+
+### Metro 設定
+
+```ts
+// metro.config.js
+const { withStorybook } = require('@storybook/react-native/metro-preset');
+module.exports = withStorybook(config, {
+  enabled: process.env.EXPO_PUBLIC_STORYBOOK_ENABLED === 'true',
+});
+```
+
+### Storybook 設定
+
 ```ts
 // .rnstorybook/main.ts
 const config: StorybookConfig = {
@@ -201,29 +243,41 @@ const config: StorybookConfig = {
 };
 ```
 
-```ts
-// metro.config.js
-const { withStorybook } = require('@storybook/react-native/metro-preset');
-module.exports = withStorybook(config, {
-  enabled: process.env.EXPO_PUBLIC_STORYBOOK_ENABLED === 'true',
-});
-```
+### on-device Storybook の起動方法
 
-```tsx
-// app/_layout.tsx または App.tsx
-import { EXPO_PUBLIC_STORYBOOK_ENABLED } from '@env';
-
-export default EXPO_PUBLIC_STORYBOOK_ENABLED === 'true'
-  ? require('.rnstorybook').default
-  : require('./App').default;
-```
+| 方法 | 条件 | 手順 |
+|------|------|------|
+| Expo Go | SDK 依存なし・開発初期 | `EXPO_PUBLIC_STORYBOOK_ENABLED=true npx expo start` |
+| dev client ビルド | ネイティブモジュールを使うコンポーネントがある場合 | `eas build --profile development` → dev client に QR でインストール |
 
 🔴 **MUST**: `EXPO_PUBLIC_STORYBOOK_ENABLED` で bundle への inclusion を切り替える  
-🔴 **MUST**: 本番ビルドには Storybook を含めない
+🔴 **MUST**: 本番ビルドには Storybook を含めない  
+🟡 **SHOULD**: ネイティブモジュール（カメラ・Bluetooth 等）を使う Story は dev client 必須と明記する
 
 ---
 
 ## 4. web Storybook 実装方針
+
+### Vite エイリアス設定（必須）
+
+RNW を Vite で動かすには `react-native` → `react-native-web` のエイリアスが必要である。
+これが欠落すると `Cannot resolve 'react-native'` エラーで全 Story が壊れる。
+
+```ts
+// vite.config.ts（web Storybook 用）
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  resolve: {
+    alias: {
+      'react-native': 'react-native-web',
+    },
+    extensions: ['.web.tsx', '.web.ts', '.web.js', '.tsx', '.ts', '.js'],
+  },
+});
+```
+
+### Storybook 設定
 
 ```ts
 // .storybook/main.ts（web 系）
@@ -238,6 +292,13 @@ const config: StorybookConfig = {
     '@storybook/addon-a11y',
     'msw-storybook-addon',
   ],
+  viteFinal: async (config) => {
+    config.resolve!.alias = {
+      ...config.resolve!.alias,
+      'react-native': 'react-native-web',
+    };
+    return config;
+  },
 };
 ```
 
@@ -256,6 +317,7 @@ export const loaders = [mswLoader];
 ```tsx
 // components/ui/Button/Button.stories.tsx
 import type { Meta, StoryObj } from '@storybook/react';
+import { userEvent, within, expect } from '@storybook/test';
 import { Button } from './Button';
 
 const meta: Meta<typeof Button> = {
@@ -278,24 +340,70 @@ type Story = StoryObj<typeof Button>;
 
 export const Primary: Story = {
   args: { label: '確認する', variant: 'primary', size: 'md' },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const button = canvas.getByRole('button', { name: '確認する' });
+    await userEvent.click(button);
+    // onClick が発火することを確認
+    await expect(button).toBeInTheDocument();
+  },
 };
 
 export const Disabled: Story = {
   args: { label: '送信', variant: 'primary', disabled: true },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const button = canvas.getByRole('button', { name: '送信' });
+    await expect(button).toBeDisabled();
+  },
 };
 
 export const Loading: Story = {
   args: { label: '送信中', variant: 'primary', loading: true },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // ローディング中はボタンが操作不能であることを確認
+    await expect(canvas.getByRole('button')).toHaveAttribute('aria-busy', 'true');
+  },
 };
 ```
 
 🔴 **MUST**: Story の `args` は Figma の variant 定義を網羅する  
+🔴 **MUST**: すべての Story に `play()` 関数を実装し、addon-vitest でテスト化する  
 🟡 **SHOULD**: `parameters.design.url` に Figma コンポーネントの URL を記載する  
 🟡 **SHOULD**: 異常系（disabled / error / loading）の Story を必ず用意する
 
 ---
 
 ## 6. テスト実装規約
+
+### MSW ハンドラ管理方針
+
+ハンドラは **成功系 / エラー系 / 空レスポンス系** を明示的に分離して定義する。
+`server.use()` で状況を切り替えることでテストの意図が明確になる。
+
+```ts
+// mocks/handlers/searchHandlers.ts
+import { http, HttpResponse } from 'msw';
+
+export const searchHandlers = {
+  success: [
+    http.get('/api/search', () =>
+      HttpResponse.json({ items: [{ id: '1', name: 'Coffee Shop A' }] })
+    ),
+  ],
+  empty: [
+    http.get('/api/search', () =>
+      HttpResponse.json({ items: [] })
+    ),
+  ],
+  serverError: [
+    http.get('/api/search', () =>
+      new HttpResponse(null, { status: 500 })
+    ),
+  ],
+};
+```
 
 ### Screen Integration Test
 
@@ -305,35 +413,66 @@ import { renderRouter } from 'expo-router/testing-library';
 import { server } from '@/mocks/server';
 import { searchHandlers } from '@/mocks/handlers/searchHandlers';
 
-beforeAll(() => server.listen());
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
 test('検索結果が表示される', async () => {
   server.use(...searchHandlers.success);
 
-  const { getByTestId, findByText } = renderRouter(
+  const { findByText } = renderRouter(
     { '(main)/search/index': require('@/app/(main)/search/index').default },
-    { initialUrl: '/search?q=coffee' },
+    { initialUrl: '/(main)/search?q=coffee' },
   );
 
   expect(await findByText('Coffee Shop A')).toBeTruthy();
 });
+
+test('検索結果が 0 件のとき空状態を表示する', async () => {
+  server.use(...searchHandlers.empty);
+
+  const { findByText } = renderRouter(
+    { '(main)/search/index': require('@/app/(main)/search/index').default },
+    { initialUrl: '/(main)/search?q=coffee' },
+  );
+
+  expect(await findByText('結果が見つかりませんでした')).toBeTruthy();
+});
+
+test('サーバーエラー時にエラーメッセージを表示する', async () => {
+  server.use(...searchHandlers.serverError);
+
+  const { findByText } = renderRouter(
+    { '(main)/search/index': require('@/app/(main)/search/index').default },
+    { initialUrl: '/(main)/search?q=coffee' },
+  );
+
+  expect(await findByText('エラーが発生しました')).toBeTruthy();
+});
 ```
 
 🔴 **MUST**: `renderRouter` で Expo Router ごとテストする（`render` 単体では不十分）  
-🔴 **MUST**: MSW は `beforeAll` / `afterAll` で正しく制御する
+🔴 **MUST**: `initialUrl` は Expo Router のパスセグメントと一致させる（クエリ単体では解決されない）  
+🔴 **MUST**: MSW は `beforeAll` / `afterAll` で正しく制御する。`onUnhandledRequest: 'error'` で未定義ハンドラへのリクエストを即検知する  
+🟡 **SHOULD**: 正常系・空レスポンス・エラー系の3パターンを各画面で網羅する
 
 ### Logic Test
 
 ```ts
 // lib/__tests__/formatPrice.test.ts
 import { formatPrice } from '@/lib/formatPrice';
-import { createClock } from '@/lib/clock';
 
 test('税込み価格を正しくフォーマットする', () => {
   expect(formatPrice(1000, 'JPY')).toBe('¥1,000');
   expect(formatPrice(9.99, 'USD')).toBe('$9.99');
+});
+
+test('0 円を正しく扱う', () => {
+  expect(formatPrice(0, 'JPY')).toBe('¥0');
+});
+
+test('負の値は例外をスローする', () => {
+  expect(() => formatPrice(-1, 'JPY')).toThrow();
 });
 ```
 
@@ -345,6 +484,36 @@ test('税込み価格を正しくフォーマットする', () => {
 
 - WCAG 2.1 AA の機械的検証をすべての Story に適用
 - `violations` が 0 になるまで PR マージ禁止
+
+#### 誤検知・例外の扱い
+
+`addon-a11y` は axe-core ベースであり誤検知が発生しうる。
+ルールを無効化する場合は **Story 単位で限定的に行い、理由をコメントで必ず明記する**。
+プロジェクト全体での無効化は禁止する。
+
+```tsx
+export const IconButton: Story = {
+  args: { icon: 'close' },
+  parameters: {
+    a11y: {
+      config: {
+        rules: [
+          {
+            // アイコンボタンは aria-label を親コンポーネントで保証するため
+            // button-name ルールはこの Story では誤検知となる
+            id: 'button-name',
+            enabled: false,
+          },
+        ],
+      },
+    },
+  },
+};
+```
+
+🔴 **MUST**: axe-core のバージョンは `package.json` に固定する（`"axe-core": "4.x.x"` の形式で patch 以外は手動更新）  
+🔴 **MUST**: ルール無効化はコメントと Jira チケット番号をセットで記載する  
+🟡 **SHOULD**: axe-core のメジャーバージョンアップ時は全 Story の a11y テストを再確認する
 
 ### 手動チェック（実機）
 
@@ -388,20 +557,79 @@ test('税込み価格を正しくフォーマットする', () => {
 
 ```
 React Native Web Storybook
-    + Playwright screenshot
+    + Playwright screenshot（Docker 固定環境）
     → 差分検出（ベースライン比較）
 ```
 
-> **重要な前提**: これは native pixel 完全一致の保証ではない。
-> RN Web は docs / test / VRT に強い一方、最終的な native 差異は device E2E で拾う前提。
+> **重要な前提**: これは native pixel 完全一致の保証ではない。  
+> RN Web は docs / test / VRT に強い一方、最終的な native 差異は device E2E で拾う前提。  
 > これは Storybook の native / web 分離方針からの設計判断である。
 
-🟡 **SHOULD**: VRT ベースラインは `main` ブランチの状態を正とする  
-🟡 **SHOULD**: 意図的なビジュアル変更時は `--update-snapshots` でベースラインを更新する
+### Docker 環境固定（必須）
+
+Playwright の screenshot はフォントレンダリングが OS 依存のため、
+**macOS 開発環境と Linux CI 環境で結果が異なる**。
+ベースライン生成・CI 検証ともに同一 Docker イメージで実行することを義務付ける。
+
+```yaml
+# .github/workflows/vrt.yml（抜粋）
+jobs:
+  vrt:
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.44.0-jammy  # バージョン固定
+    steps:
+      - run: pnpm playwright test --project=vrt
+```
+
+```bash
+# ローカルでベースライン更新する場合も Docker 経由で実行する
+docker run --rm -v $(pwd):/work -w /work \
+  mcr.microsoft.com/playwright:v1.44.0-jammy \
+  pnpm playwright test --project=vrt --update-snapshots
+```
+
+### ベースライン更新フロー
+
+意図的なビジュアル変更時のベースライン更新手順を明示する。属人化を防ぐ。
+
+1. デザイン変更 PR を作成する
+2. ローカルの Docker 環境で `--update-snapshots` を実行する
+3. 更新されたスナップショットファイルをコミットする
+4. PR に「VRT ベースライン更新あり」ラベルを付与し、デザイナーがビジュアル差分をレビューする
+5. デザイナーの Approve を必須条件とする
+
+🔴 **MUST**: ベースラインの更新は Docker 環境で行う  
+🔴 **MUST**: ベースライン更新 PR はデザイナーの Approve を必須とする  
+🟡 **SHOULD**: VRT ベースラインは `main` ブランチの状態を正とする
 
 ---
 
 ## 9. CI ゲート
+
+### ゲート一覧・実行順序・並列化方針
+
+```
+[PR 作成]
+    │
+    ├─ 並列実行 ──────────────────────────────────────────────────────┐
+    │   TypeScript（型チェック）                                       │
+    │   ESLint（静的解析）                                             │
+    │   pnpm audit（脆弱性スキャン）                                   │
+    └─────────────────────────────────────────────────────────────────┘
+    │  すべて Pass したら続行
+    ├─ 並列実行 ──────────────────────────────────────────────────────┐
+    │   Jest（Logic + Screen Integration）                             │
+    │   addon-vitest（Story テスト + addon-a11y）                     │
+    │   VRT（Playwright screenshot）                                   │
+    └─────────────────────────────────────────────────────────────────┘
+    │  すべて Pass したら main マージ可能
+    │
+[main マージ後]
+    └─ EAS Workflows（Maestro E2E）
+         ─ ビルドコストを考慮して main マージ後のみ実行
+         ─ 失敗時は Slack #ci-alert に通知してリバートを検討
+```
 
 <table>
   <thead>
@@ -409,55 +637,81 @@ React Native Web Storybook
       <th>ゲート</th>
       <th>失敗条件</th>
       <th>実行タイミング</th>
+      <th>推定所要時間</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td>TypeScript</td>
       <td>型エラーあり</td>
-      <td>PR 時</td>
+      <td>PR 時（並列フェーズ 1）</td>
+      <td>〜2 分</td>
     </tr>
     <tr>
       <td>ESLint</td>
       <td>error レベル違反あり</td>
-      <td>PR 時</td>
-    </tr>
-    <tr>
-      <td>Jest</td>
-      <td>テスト失敗 / カバレッジ閾値未達</td>
-      <td>PR 時</td>
-    </tr>
-    <tr>
-      <td>addon-vitest</td>
-      <td>Story テスト失敗</td>
-      <td>PR 時</td>
-    </tr>
-    <tr>
-      <td>addon-a11y</td>
-      <td>a11y violations あり</td>
-      <td>PR 時</td>
-    </tr>
-    <tr>
-      <td>VRT</td>
-      <td>Playwright screenshot 差分あり（閾値超過）</td>
-      <td>PR 時</td>
-    </tr>
-    <tr>
-      <td>Maestro E2E</td>
-      <td>クリティカルジャーニー失敗</td>
-      <td>EAS Workflows</td>
+      <td>PR 時（並列フェーズ 1）</td>
+      <td>〜1 分</td>
     </tr>
     <tr>
       <td>pnpm audit</td>
       <td>HIGH 以上の脆弱性あり</td>
-      <td>定期実行</td>
+      <td>PR 時（並列フェーズ 1）・週次定期実行</td>
+      <td>〜1 分</td>
+    </tr>
+    <tr>
+      <td>Jest</td>
+      <td>テスト失敗 / Logic 80% 未満 / Screen Integration 60% 未満</td>
+      <td>PR 時（並列フェーズ 2）</td>
+      <td>〜5 分</td>
+    </tr>
+    <tr>
+      <td>addon-vitest + addon-a11y</td>
+      <td>Story テスト失敗 / a11y violations あり</td>
+      <td>PR 時（並列フェーズ 2）</td>
+      <td>〜5 分</td>
+    </tr>
+    <tr>
+      <td>VRT</td>
+      <td>Playwright screenshot 差分閾値 0.1% 超過</td>
+      <td>PR 時（並列フェーズ 2）</td>
+      <td>〜8 分</td>
+    </tr>
+    <tr>
+      <td>Maestro E2E</td>
+      <td>クリティカルジャーニー失敗</td>
+      <td>main マージ後（EAS Workflows）</td>
+      <td>〜20 分</td>
     </tr>
   </tbody>
 </table>
 
+🔴 **MUST**: Maestro E2E は実機ビルドを伴うため全 PR では回さない。main マージ後に限定する  
+🔴 **MUST**: E2E 失敗時は Slack #ci-alert に自動通知し、当該コミットのリバートを判断する  
+🟡 **SHOULD**: フェーズ 1 が失敗した場合はフェーズ 2 をスキップしてCI コストを節約する
+
 ---
 
-## 10. 変更履歴
+## 10. テスト負債管理
+
+放置されたテスト負債はカバレッジを形骸化させる。以下の方針で定量管理する。
+
+### skip・TODO の許容ポリシー
+
+| 種別 | 許容条件 | 期限 |
+|------|----------|------|
+| `test.skip` | Jira チケット番号のコメントが必須 | チケット解決と同時に削除 |
+| `// TODO: test` | 同上 | Sprint 内に解消（翌 Sprint 持ち越し禁止） |
+| `a11y rule disabled` | コメント + チケット番号 | 原則 3 Sprint 以内に解消 |
+
+### 棚卸しタイミング
+
+- 四半期レビュー時に skip 件数・TODO 件数・無効化 a11y ルール数を集計し、DPC 内で共有する
+- skip 件数が 10 件を超えた場合は翌 Sprint にテスト負債解消 Story を必ず積む
+
+---
+
+## 11. 変更履歴
 
 <table>
   <thead>
@@ -471,6 +725,11 @@ React Native Web Storybook
     <tr>
       <td>2026-03</td>
       <td>初版作成</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>2026-04</td>
+      <td>カバレッジ目標追加・play() 規約追加・MSWハンドラ設計追加・VRT Docker 固定・CI並列化設計・テスト負債管理追加・on-device起動方法追加・エントリポイント切り替えパターン修正・axe-core バージョン固定方針追加</td>
       <td>—</td>
     </tr>
   </tbody>

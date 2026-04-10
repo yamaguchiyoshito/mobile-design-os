@@ -5,7 +5,8 @@ import { Meta } from '@storybook/addon-docs/blocks';
 # アクセシビリティコーディング規約
 
 > **ステータス**: `APPROVED`  
-> **対象**: React Native mobile（Expo）アプリの全コンポーネント・画面実装
+> **対象**: React Native mobile（Expo）アプリの全コンポーネント・画面実装  
+> **準拠バージョン**: WCAG 2.2 AA（最低ライン: WCAG 2.1 AA）
 
 ---
 
@@ -25,27 +26,49 @@ iOS VoiceOver と Android TalkBack で挙動差がある。
     <tr>
       <th>基準</th>
       <th>適用範囲</th>
+      <th>備考</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td><strong>WCAG 2.1 AA</strong></td>
+      <td><strong>WCAG 2.2 AA</strong></td>
       <td>コントラスト比・操作性・テキスト代替の判定基準</td>
+      <td>2023-10 勧告。2.1 AAを最低基準とし、2.2追加達成基準は順次対応</td>
     </tr>
     <tr>
       <td><strong>iOS HIG Accessibility</strong></td>
       <td>VoiceOver・Dynamic Type・Switch Control</td>
+      <td>—</td>
     </tr>
     <tr>
       <td><strong>Android Accessibility Guidelines</strong></td>
       <td>TalkBack・Font Size・Switch Access</td>
+      <td>—</td>
     </tr>
     <tr>
       <td><strong>APPT Foundation checklists</strong></td>
       <td>実機テスト項目のベースライン</td>
+      <td>—</td>
     </tr>
   </tbody>
 </table>
+
+### WCAG 2.2 新達成基準（モバイル関連抜粋）
+
+| 達成基準 | 内容 | 対応優先度 |
+|---|---|---|
+| 2.4.11 Focus Appearance (AA) | フォーカスインジケータの最小サイズ・コントラスト | 新規コンポーネントから順次対応 |
+| 2.5.7 Dragging Movements (AA) | ドラッグ操作に代替手段を提供する | ドラッグUIを持つ画面に適用 |
+| 2.5.8 Target Size Minimum (AA) | タッチターゲット最小 24×24 CSS px | 本規約の 44pt 基準で自動クリア |
+| 3.2.6 Consistent Help (A) | ヘルプ機能の位置を画面間で統一する | グローバルナビに適用 |
+
+### `aria-*` props（RN 0.73+）の扱い
+
+RN 0.73 以降は `aria-label` / `aria-disabled` / `aria-live` 等のWeb互換propsが利用可能。
+**本規約では `accessibilityXxx` 系で統一する**。
+Web経験者が `aria-*` を使いたい場合はレビュー時に差し戻す。
+
+> 理由: 両系を混在させるとプラットフォーム別挙動の調査コストが増大するため。
 
 ---
 
@@ -59,6 +82,7 @@ iOS VoiceOver と Android TalkBack で挙動差がある。
   ├─ accessibilityRole     ← 要素の種別（MUST）
   ├─ accessibilityHint     ← 操作結果の説明（SHOULD）
   ├─ accessibilityState    ← disabled / checked / selected 等（MUST if applicable）
+  ├─ accessibilityValue    ← min / max / now / text（MUST if range/progress）
   └─ testID                ← E2E / RNTL セレクタ（MUST）
 
 表示専用・意味のある要素
@@ -66,7 +90,8 @@ iOS VoiceOver と Android TalkBack で挙動差がある。
   └─ accessible={false}    ← 装飾要素は除外（MUST）
 
 コンテナ
-  └─ accessibilityViewIsModal  ← モーダル時（MUST if modal）
+  ├─ accessibilityViewIsModal   ← モーダル時（MUST if modal / iOS+Android）
+  └─ importantForAccessibility  ← "no-hide-descendants"（MUST if modal / Android補完）
 ```
 
 ---
@@ -174,6 +199,16 @@ iOS VoiceOver と Android TalkBack で挙動差がある。
       <td>「画像」</td>
     </tr>
     <tr>
+      <td><code>&quot;progressbar&quot;</code></td>
+      <td>進捗・ローディング</td>
+      <td>「進行状況インジケータ」</td>
+    </tr>
+    <tr>
+      <td><code>&quot;adjustable&quot;</code></td>
+      <td>スライダー等の連続値入力</td>
+      <td>「調整可能」</td>
+    </tr>
+    <tr>
       <td><code>&quot;text&quot;</code></td>
       <td>通常テキスト（デフォルト）</td>
       <td>—</td>
@@ -254,7 +289,49 @@ iOS VoiceOver と Android TalkBack で挙動差がある。
 
 ---
 
-## 6. accessibilityHint
+## 6. accessibilityValue
+
+`accessibilityState` では表現できない**範囲値・進捗値**を伝えるために使う。
+
+🔴 **MUST**: `accessibilityRole="progressbar"` または `"adjustable"` の要素には必ず設定する
+
+```tsx
+// ✅ プログレスバー（0〜100の進捗）
+<View
+  accessibilityRole="progressbar"
+  accessibilityLabel="アップロード進捗"
+  accessibilityState={{ busy: progress < 100 }}
+  accessibilityValue={{ min: 0, max: 100, now: progress }}
+>
+  <ProgressBar value={progress} />
+</View>
+
+// ✅ スライダー（音量など）
+<Slider
+  accessibilityRole="adjustable"
+  accessibilityLabel="音量"
+  accessibilityValue={{ min: 0, max: 10, now: volume, text: `${volume}` }}
+  onValueChange={setVolume}
+/>
+
+// ✅ ステップ形式（テキストで段階を伝える）
+<View
+  accessibilityRole="progressbar"
+  accessibilityLabel="申し込みステップ"
+  accessibilityValue={{ text: `${currentStep} / ${totalSteps} ステップ` }}
+>
+```
+
+| フィールド | 型 | 用途 |
+|---|---|---|
+| `min` | number | 最小値 |
+| `max` | number | 最大値 |
+| `now` | number | 現在値 |
+| `text` | string | 値の自然言語表現（`now` より優先して読まれる） |
+
+---
+
+## 7. accessibilityHint
 
 🟡 **SHOULD**: label だけでは操作結果が不明な場合に付与する  
 🟡 **SHOULD**: 「〜します」「〜されます」という体言止め＋助詞の形で書く
@@ -277,7 +354,7 @@ iOS VoiceOver と Android TalkBack で挙動差がある。
 
 ---
 
-## 7. グループ化（accessible grouping）
+## 8. グループ化（accessible grouping）
 
 複数要素をひとつのフォーカス単位にまとめることで操作ステップを減らす。
 
@@ -331,30 +408,37 @@ export function OrderCard({ order }: { order: Order }) {
 
 ---
 
-## 8. フォーカス管理
+## 9. フォーカス管理
 
 ### モーダル・ボトムシート
 
+`findNodeHandle` は RN 0.73 以降 deprecated。`ref` を直接 `setAccessibilityFocus` に渡す新パターンを使う。
+
 ```tsx
-import { AccessibilityInfo, findNodeHandle } from 'react-native';
+import { AccessibilityInfo } from 'react-native';
 
 export function Modal({ visible, onClose, children }: ModalProps) {
   const firstFocusableRef = useRef<View>(null);
 
   useEffect(() => {
-    if (visible) {
-      // モーダル表示時に最初の要素へフォーカスを移動
-      const node = findNodeHandle(firstFocusableRef.current);
-      if (node) AccessibilityInfo.setAccessibilityFocus(node);
+    if (visible && firstFocusableRef.current) {
+      // RN 0.73+ : ref を直接渡す（findNodeHandle 不要）
+      AccessibilityInfo.setAccessibilityFocus(
+        firstFocusableRef.current as unknown as number,
+      );
     }
   }, [visible]);
 
   return (
     <RNModal
       visible={visible}
-      accessibilityViewIsModal={true}   // 背景をフォーカス対象外にする
+      accessibilityViewIsModal={true}   // iOS + Android: 背景をフォーカス対象外にする
     >
-      <View ref={firstFocusableRef}>
+      <View
+        ref={firstFocusableRef}
+        // Android 補完: importantForAccessibility でも背景を遮断
+        importantForAccessibility={visible ? 'yes' : 'no'}
+      >
         {children}
       </View>
       <Pressable
@@ -368,19 +452,22 @@ export function Modal({ visible, onClose, children }: ModalProps) {
 ```
 
 🔴 **MUST**: モーダル表示時に `accessibilityViewIsModal={true}` を設定する  
+🔴 **MUST**: Android では `importantForAccessibility="no-hide-descendants"` を背景 View に設定して補完する  
 🔴 **MUST**: モーダル表示時にフォーカスをモーダル内の最初の要素へ移動する  
 🟡 **SHOULD**: モーダルを閉じた後は、モーダルを開いたトリガー要素にフォーカスを戻す
 
 ### ページ遷移後のフォーカス
 
 ```tsx
-// 新しい Screen の最上部にある見出しへフォーカスを移動する
 export default function SearchResultScreen() {
   const headingRef = useRef<Text>(null);
 
   useFocusEffect(() => {
-    const node = findNodeHandle(headingRef.current);
-    if (node) AccessibilityInfo.setAccessibilityFocus(node);
+    if (headingRef.current) {
+      AccessibilityInfo.setAccessibilityFocus(
+        headingRef.current as unknown as number,
+      );
+    }
   });
 
   return (
@@ -399,7 +486,7 @@ export default function SearchResultScreen() {
 
 ---
 
-## 9. ライブリージョン（動的コンテンツ）
+## 10. ライブリージョン（動的コンテンツ）
 
 画面上でコンテンツが動的に変化する場合、支援技術に通知する。
 
@@ -414,7 +501,7 @@ export default function SearchResultScreen() {
 
 // ✅ エラーメッセージの表示
 <View
-  accessibilityLiveRegion="assertive"   // 緊急度が高い場合
+  accessibilityLiveRegion="assertive"
   accessibilityLabel={errorMessage ?? undefined}
 >
   {errorMessage && <Text>{errorMessage}</Text>}
@@ -458,10 +545,12 @@ export default function SearchResultScreen() {
 
 ---
 
-## 10. タッチターゲットサイズ
+## 11. タッチターゲットサイズ
 
 🔴 **MUST**: タッチターゲットは最小 **44×44pt**（iOS HIG 基準）を確保する  
 🟡 **SHOULD**: 重要なボタンは 48×48pt 以上を目標にする
+
+> **根拠**: iOS HIG（44pt）＋ WCAG 2.2 SC 2.5.8 Target Size Minimum（24×24 CSS px 相当）を両方クリアする設定。
 
 ```tsx
 // ❌ アイコンがそのままだと小さすぎる（例: 24×24pt）
@@ -511,7 +600,7 @@ export const IconButton: React.FC<IconButtonProps> = ({ icon, onPress, label }) 
 
 ---
 
-## 11. Dynamic Type（文字サイズ対応）
+## 12. Dynamic Type（文字サイズ対応）
 
 🔴 **MUST**: システムフォントサイズ設定に追従する（`allowFontScaling` を `false` にしない）  
 🔴 **MUST**: 最大フォントサイズ（Accessibility Extra Extra Extra Large）でレイアウトが崩れないことを確認する
@@ -568,7 +657,7 @@ export const IconButton: React.FC<IconButtonProps> = ({ icon, onPress, label }) 
 
 ---
 
-## 12. カラーコントラスト
+## 13. カラーコントラスト
 
 🔴 **MUST**: テキストと背景のコントラスト比は **WCAG 2.1 AA** 以上を満たす
 
@@ -596,9 +685,6 @@ export const IconButton: React.FC<IconButtonProps> = ({ icon, onPress, label }) 
 </table>
 
 ```tsx
-// Figma Variables でコントラスト比をトークン設計時に保証する
-// token.json 内のカラーペアを Figma Accessibility Plugin で検証すること
-
 // ✅ トークンで保証されたペア
 <Text className="text-content-primary">    // #1A1A1A on #FFFFFF → 19.0:1 ✅
 <Text className="text-content-secondary">  // #6B6B6B on #FFFFFF →  5.9:1 ✅
@@ -629,17 +715,18 @@ export const IconButton: React.FC<IconButtonProps> = ({ icon, onPress, label }) 
 
 ---
 
-## 13. フォーム・入力のアクセシビリティ
+## 14. フォーム・入力のアクセシビリティ
 
 ```tsx
+import { useId } from 'react';  // React 18+
+
 export function EmailField({ control, error }: FieldProps) {
-  const errorId = useId();
+  const fieldId = useId();
 
   return (
     <View>
-      {/* Label と Input の関連付け */}
       <Text
-        nativeID={`label-${errorId}`}
+        nativeID={`label-${fieldId}`}
         className="text-body-sm text-content-primary mb-1"
       >
         メールアドレス
@@ -647,7 +734,7 @@ export function EmailField({ control, error }: FieldProps) {
 
       <TextInput
         accessibilityLabel="メールアドレス"
-        accessibilityLabelledBy={`label-${errorId}`}
+        accessibilityLabelledBy={`label-${fieldId}`}
         accessibilityErrorMessage={error}
         accessibilityState={{ invalid: !!error }}
         keyboardType="email-address"
@@ -659,7 +746,6 @@ export function EmailField({ control, error }: FieldProps) {
         }`}
       />
 
-      {/* エラーはライブリージョンで通知 */}
       <View accessibilityLiveRegion="assertive">
         {error && (
           <Text
@@ -677,24 +763,23 @@ export function EmailField({ control, error }: FieldProps) {
 
 🔴 **MUST**: TextInput に `accessibilityLabel` を付与する（placeholder だけでは不十分）  
 🔴 **MUST**: エラーメッセージを `accessibilityLiveRegion="assertive"` で通知する  
+🔴 **MUST**: `import { useId } from 'react'` を忘れずに追加する  
 🟡 **SHOULD**: `keyboardType` / `autoComplete` / `returnKeyType` を正しく設定する（スクリーンリーダーが読み上げる）
 
 ---
 
-## 14. プラットフォーム差分の吸収
+## 15. プラットフォーム差分の吸収
 
 iOS と Android でアクセシビリティ挙動が異なるケースを Design System 内で統一する。
 
 ```tsx
 import { Platform } from 'react-native';
 
-// ✅ プラットフォーム差分を Component 内に閉じ込める
 export const Switch: React.FC<SwitchProps> = ({ value, label, onChange }) => (
   <Pressable
     accessibilityRole="switch"
     accessibilityLabel={label}
     accessibilityState={{ checked: value }}
-    // Android は accessibilityActions で toggle を明示する
     accessibilityActions={
       Platform.OS === 'android'
         ? [{ name: 'activate', label: 'オン/オフを切り替える' }]
@@ -737,8 +822,13 @@ export const Switch: React.FC<SwitchProps> = ({ value, label, onChange }) => (
       <td>✅ 動作する</td>
     </tr>
     <tr>
+      <td><code>importantForAccessibility</code></td>
+      <td>❌ 無効（iOS専用: <code>accessibilityElementsHidden</code>）</td>
+      <td>✅ <code>"no-hide-descendants"</code> でモーダル背景を遮断</td>
+    </tr>
+    <tr>
       <td>フォーカスの自動移動</td>
-      <td><code>setAccessibilityFocus</code> で制御</td>
+      <td><code>setAccessibilityFocus(ref)</code> で制御</td>
       <td>同左</td>
     </tr>
     <tr>
@@ -749,11 +839,13 @@ export const Switch: React.FC<SwitchProps> = ({ value, label, onChange }) => (
   </tbody>
 </table>
 
+> **iOS補足**: モーダル背景の遮断には `accessibilityViewIsModal={true}` のみで十分。Android では `importantForAccessibility="no-hide-descendants"` を背景 View に追加して補完する。
+
 ---
 
-## 15. スクリーンリーダー検知
+## 16. スクリーンリーダー検知・モーション制御
 
-スクリーンリーダーが有効かどうかで UX を分岐させる必要がある場合。
+スクリーンリーダーや動作軽減設定に応じて UX を分岐させる。
 
 ```tsx
 import { AccessibilityInfo } from 'react-native';
@@ -763,7 +855,6 @@ export function useScreenReader() {
 
   useEffect(() => {
     AccessibilityInfo.isScreenReaderEnabled().then(setIsEnabled);
-
     const subscription = AccessibilityInfo.addEventListener(
       'screenReaderChanged',
       setIsEnabled,
@@ -774,23 +865,6 @@ export function useScreenReader() {
   return isEnabled;
 }
 
-// 使用例：アニメーションを無効化する
-export function AnimatedBanner() {
-  const isScreenReaderEnabled = useScreenReader();
-
-  return (
-    <Animated.View
-      style={isScreenReaderEnabled ? undefined : animatedStyle}
-    >
-      {/* ... */}
-    </Animated.View>
-  );
-}
-```
-
-🟡 **SHOULD**: `useReducedMotion`（`AccessibilityInfo.isReduceMotionEnabled`）で動きを抑制する
-
-```tsx
 export function useReducedMotion() {
   const [reduceMotion, setReduceMotion] = useState(false);
 
@@ -802,11 +876,73 @@ export function useReducedMotion() {
 
   return reduceMotion;
 }
+
+// 使用例：スクリーンリーダー時はアニメーションを停止し、
+//         動作軽減設定時はトランジションを即時完了にする
+export function AnimatedBanner() {
+  const isScreenReaderEnabled = useScreenReader();
+  const reduceMotion = useReducedMotion();
+
+  // アニメーション値の定義（自立したスニペットとして完結させる）
+  const opacity = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (isScreenReaderEnabled || reduceMotion) {
+      opacity.setValue(1);  // アニメーションなしで即表示
+      return;
+    }
+    Animated.timing(opacity, {
+      toValue: 1,
+      duration: 400,
+      useNativeDriver: true,
+    }).start();
+  }, [isScreenReaderEnabled, reduceMotion]);
+
+  return (
+    <Animated.View style={{ opacity }}>
+      {/* ... */}
+    </Animated.View>
+  );
+}
 ```
+
+🟡 **SHOULD**: `useReducedMotion` で動きを抑制する（WCAG 2.3.3 Animation from Interactions）  
+🟡 **SHOULD**: `useScreenReader` と `useReducedMotion` は `hooks/accessibility.ts` に集約し、全画面で再利用する
 
 ---
 
-## 16. テスト実装規約
+## 17. テスト実装規約
+
+### 自動検出: eslint-plugin-react-native-a11y
+
+静的解析でコードレビュー前に機械的に検出する。セクション21の違反パターンの大半はこれで防げる。
+
+```jsonc
+// .eslintrc.json
+{
+  "plugins": ["react-native-a11y"],
+  "extends": ["plugin:react-native-a11y/all"],
+  "rules": {
+    // アイコンボタンのラベル欠落を検出
+    "react-native-a11y/has-accessibility-props": "error",
+    // accessibilityRole のタイポを検出
+    "react-native-a11y/has-valid-accessibility-role": "error",
+    // allowFontScaling={false} を禁止
+    "react-native-a11y/no-nested-touchables": "warn"
+  }
+}
+```
+
+### 自動検出: react-native-axe-core（開発ビルドのみ）
+
+```tsx
+// app/_layout.tsx（開発ビルドのみ有効化）
+if (__DEV__) {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { default: axe, LogLevel } = require('@axe-core/react-native');
+  axe(React, ReactDOM, 1000, { logLevel: LogLevel.Error });
+}
+```
 
 ### addon-a11y（web Storybook）
 
@@ -816,7 +952,6 @@ export const Primary: Story = {
   args: { label: '確認する', variant: 'primary' },
   parameters: {
     a11y: {
-      // 特定ルールを Story 単位で調整する（乱用禁止）
       config: {
         rules: [
           { id: 'color-contrast', enabled: true },
@@ -835,9 +970,7 @@ export const Primary: Story = {
 // ✅ アクセシビリティツリーの検証
 test('送信ボタンが disabled 時に正しい状態を持つ', () => {
   const { getByRole } = render(<SubmitButton disabled />);
-
   const button = getByRole('button', { name: '送信する' });
-
   expect(button).toHaveAccessibilityState({ disabled: true });
   expect(button).not.toHaveAccessibilityState({ busy: true });
 });
@@ -845,14 +978,45 @@ test('送信ボタンが disabled 時に正しい状態を持つ', () => {
 // ✅ エラーメッセージの読み上げ検証
 test('バリデーションエラーが accessibilityLiveRegion で通知される', async () => {
   const { getByRole, findByRole } = render(<EmailField />);
-
   fireEvent.changeText(getByRole('textbox', { name: 'メールアドレス' }), 'invalid');
   fireEvent(getByRole('button', { name: '送信する' }), 'press');
-
   const alert = await findByRole('alert');
   expect(alert).toBeTruthy();
 });
+
+// ✅ accessibilityValue の検証（プログレスバー）
+test('プログレスバーが正しい value を持つ', () => {
+  const { getByRole } = render(<UploadProgress value={60} />);
+  const bar = getByRole('progressbar', { name: 'アップロード進捗' });
+  expect(bar).toHaveAccessibilityValue({ min: 0, max: 100, now: 60 });
+});
 ```
+
+### Detox E2E での a11y アサーション
+
+```ts
+// e2e/accessibility.test.ts
+describe('注文確定フロー — アクセシビリティ', () => {
+  it('送信ボタンが disabled 時に読み上げ不可状態になる', async () => {
+    await element(by.id('submit-button')).tap();
+    await expect(element(by.id('submit-button'))).toHaveAccessibilityValue({
+      value: 'disabled',
+    });
+  });
+});
+```
+
+### テスト分類: 自動化可能 vs 手動必須
+
+| テスト項目 | 自動化手段 | 手動必須 |
+|---|---|---|
+| Props 欠落・タイポ | ESLint | — |
+| コントラスト比 | addon-a11y / axe-core | — |
+| accessibilityState の正確性 | RNTL | — |
+| フォーカス順序の論理的一致 | — | ✅ 実機 |
+| モーダル背景のフォーカス遮断 | — | ✅ 実機 |
+| 最大フォントサイズでのレイアウト | — | ✅ 実機 |
+| 実機 VoiceOver / TalkBack の読み上げ品質 | — | ✅ 実機 |
 
 ### 実機 A11y テストチェックリスト
 
@@ -921,7 +1085,48 @@ PR レビュー前に下記を実機で確認する。
 
 ---
 
-## 17. よくある違反パターン集
+## 18. ガバナンス・違反対応
+
+### CI ゲート構成
+
+```
+PR作成
+  └─ ESLint (react-native-a11y)          → violations あれば CI FAIL
+  └─ Storybook addon-a11y                → violations あれば マージ不可
+  └─ RNTL a11y テスト                    → 失敗すれば CI FAIL
+  └─ 実機チェックリスト（レビュアーが実施）→ 未確認なら レビュー通過不可
+```
+
+### 既存コードの技術的負債の扱い
+
+新規コードへの即時適用を原則とし、既存コードは以下の方針で対応する。
+
+| 優先度 | 対象 | 期限 |
+|---|---|---|
+| P0（即時修正） | `accessibilityViewIsModal` 未設定のモーダル、エラーを色のみで伝える箇所 | 発見次第 |
+| P1（次スプリント） | アイコンボタンの label 欠落、`accessibilityState` の未設定 | 次スプリント内 |
+| P2（計画対応） | `allowFontScaling={false}` の残存、グループ化の未整備 | 四半期計画に組み込む |
+
+### exemption（適用除外）の申請
+
+やむを得ず規約に適合できない場合は、以下の情報を PR に記載してレビュアーの承認を得る。
+
+```md
+<!-- a11y-exemption -->
+- **対象コンポーネント**: XXX
+- **違反している規約**: セクション X
+- **理由**: （技術的制約 or 期限の根拠）
+- **代替手段**: （代替的なアクセシビリティ確保策）
+- **解消予定**: YYYY-MM
+```
+
+### レビューサイクル
+
+本規約は **半年ごと**（4月・10月）にオーナーがレビューし、WCAG アップデート・RN メジャーバージョン・iOS/Android OSアップデートに追従する。
+
+---
+
+## 19. よくある違反パターン集
 
 <table>
   <thead>
@@ -929,6 +1134,7 @@ PR レビュー前に下記を実機で確認する。
       <th>パターン</th>
       <th>問題</th>
       <th>修正方法</th>
+      <th>自動検出</th>
     </tr>
   </thead>
   <tbody>
@@ -936,48 +1142,68 @@ PR レビュー前に下記を実機で確認する。
       <td><code>&lt;Text onPress=&#123;...&#125;&gt;</code></td>
       <td><code>accessibilityRole</code> なし。スクリーンリーダーにボタンと認識されない</td>
       <td><code>&lt;Pressable accessibilityRole=&quot;button&quot;&gt;</code> に変更</td>
+      <td>ESLint ✅</td>
     </tr>
     <tr>
       <td><code>&lt;Image source=&#123;...&#125; /&gt;</code> のみ</td>
       <td>代替テキストなし</td>
       <td><code>accessible=&#123;true&#125;</code> + <code>accessibilityLabel</code> を付与</td>
+      <td>ESLint ✅</td>
     </tr>
     <tr>
       <td><code>allowFontScaling=&#123;false&#125;</code></td>
       <td>文字サイズ設定に追従しない</td>
       <td>削除。どうしても必要なら <code>maxFontSizeMultiplier</code></td>
+      <td>ESLint ✅</td>
     </tr>
     <tr>
       <td>アイコンボタンに label なし</td>
       <td>「ボタン」としか読み上げられない</td>
       <td><code>accessibilityLabel</code> でアイコンの意味を説明</td>
+      <td>ESLint ✅</td>
     </tr>
     <tr>
       <td>モーダルに <code>accessibilityViewIsModal</code> なし</td>
       <td>背景コンテンツも読み上げられる</td>
       <td><code>accessibilityViewIsModal=&#123;true&#125;</code> を設定</td>
+      <td>手動</td>
     </tr>
     <tr>
       <td>エラーを色のみで表示</td>
       <td>色覚異常者に伝わらない</td>
       <td>テキスト + アイコンを併用</td>
+      <td>addon-a11y ✅</td>
     </tr>
     <tr>
       <td><code>disabled</code> prop のみ設定</td>
       <td><code>accessibilityState=&#123;&#123; disabled &#125;&#125;</code> が抜けると状態が読まれない</td>
       <td>必ずセットで設定</td>
+      <td>ESLint ✅</td>
     </tr>
     <tr>
       <td>カード内子要素に <code>accessible</code> 設定なし</td>
       <td>各子要素が個別にフォーカスされてノイズになる</td>
       <td>子要素に <code>accessible=&#123;false&#125;</code> を設定</td>
+      <td>手動</td>
+    </tr>
+    <tr>
+      <td><code>progressbar</code> に <code>accessibilityValue</code> なし</td>
+      <td>現在の進捗が読まれない</td>
+      <td><code>accessibilityValue=&#123;&#123; min, max, now &#125;&#125;</code> を設定</td>
+      <td>RNTL ✅</td>
+    </tr>
+    <tr>
+      <td><code>findNodeHandle</code> の使用</td>
+      <td>RN 0.73+ で deprecated</td>
+      <td><code>ref</code> を直接 <code>setAccessibilityFocus</code> に渡す</td>
+      <td>ESLint（deprecation） ✅</td>
     </tr>
   </tbody>
 </table>
 
 ---
 
-## 18. 変更履歴
+## 20. 変更履歴
 
 <table>
   <thead>
@@ -988,6 +1214,22 @@ PR レビュー前に下記を実機で確認する。
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td>2026-04</td>
+      <td>
+        accessibilityValue セクション追加（セクション6）、
+        importantForAccessibility をプラットフォーム差分表に追加、
+        aria-* props の扱いを方針1に明記、
+        findNodeHandle を deprecated パターンとして差し替え、
+        useId import 漏れを修正、
+        AnimatedBanner を自立したスニペットに修正、
+        WCAG 2.2 対応表を追加、
+        eslint-plugin-react-native-a11y / axe-core / Detox 例を追加、
+        ガバナンスセクション（セクション18）を新設、
+        違反パターン表に自動検出列を追加
+      </td>
+      <td>—</td>
+    </tr>
     <tr>
       <td>2026-03</td>
       <td>初版作成</td>

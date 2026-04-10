@@ -6,7 +6,8 @@ import { Meta } from '@storybook/addon-docs/blocks';
 
 > **ステータス**: `APPROVED`  
 > **対象**: 多言語対応・日付/数値/通貨フォーマット・RTL・翻訳キー管理  
-> **依存**: 01_Principles（expo-localization + i18next）、09_Message_Display（翻訳キー命名）
+> **依存**: 01_Principles（expo-localization + i18next）、09_Message_Display（翻訳キー命名）  
+> **i18next 対応バージョン**: `>= 23.0.0`（型補完機能は v23 以降が必須）
 
 ---
 
@@ -26,11 +27,15 @@ import { Meta } from '@storybook/addon-docs/blocks';
     </tr>
     <tr>
       <td>翻訳管理</td>
-      <td><code>i18next</code></td>
+      <td><code>i18next &gt;= 23.0.0</code></td>
     </tr>
     <tr>
       <td>React 統合</td>
       <td><code>react-i18next</code></td>
+    </tr>
+    <tr>
+      <td>ロケール永続化</td>
+      <td><code>expo-secure-store</code></td>
     </tr>
     <tr>
       <td>日付フォーマット</td>
@@ -40,39 +45,48 @@ import { Meta } from '@storybook/addon-docs/blocks';
       <td>数値・通貨フォーマット</td>
       <td><code>Intl.NumberFormat</code>（JS 標準）</td>
     </tr>
+    <tr>
+      <td>アプリ再起動（RTL 切替時）</td>
+      <td><code>expo-updates</code>（<code>reloadAsync</code>）</td>
+    </tr>
   </tbody>
 </table>
 
-`next-intl` は Next.js 専用のため不採用（01_Principles 参照）。
+`next-intl` は Next.js 専用のため不採用（01_Principles 参照）。  
+`moment` / `date-fns` のフォーマット関数は使わない（バンドルサイズ +70KB・ロケール対応が重複するため）。
 
 ---
 
 ## 2. 初期化
 
+### 2-1. 初期化関数
+
 ```ts
 // src/lib/i18n.ts
-import i18n              from 'i18next';
-import { initReactI18next } from 'react-i18next';
-import * as Localization from 'expo-localization';
+import i18n                  from 'i18next';
+import { initReactI18next }  from 'react-i18next';
+import * as Localization     from 'expo-localization';
+import * as SecureStore      from 'expo-secure-store';  // ← 追加: ロケール永続化に必須
 
-// ─── 翻訳リソース ─────────────────────────────────────────────────────────
 import ja from '@/locales/ja';
 import en from '@/locales/en';
 
 const SUPPORTED_LOCALES = ['ja', 'en'] as const;
 export type SupportedLocale = (typeof SUPPORTED_LOCALES)[number];
 
-// ─── 初期化 ──────────────────────────────────────────────────────────────
+// 同期初期化（initImmediate: false）で呼ぶ。
+// 非同期にすると初回レンダリング前に i18n が未準備になり、
+// Splash Screen が非表示になった瞬間に文字化けが発生する。
 export function initializeI18n() {
-  // 端末のロケールを取得し、サポート言語に丸める
   const deviceLocale  = Localization.getLocales()[0]?.languageCode ?? 'ja';
   const matchedLocale = SUPPORTED_LOCALES.find((l) => deviceLocale.startsWith(l)) ?? 'ja';
 
   i18n
     .use(initReactI18next)
     .init({
-      lng:      matchedLocale,
-      fallbackLng: 'ja',
+      lng:             matchedLocale,
+      fallbackLng:     'ja',
+      initImmediate:   false,  // ← 同期初期化（Splash Screen と組み合わせて flickering を防ぐ）
       resources: {
         ja: { translation: ja },
         en: { translation: en },
@@ -80,40 +94,63 @@ export function initializeI18n() {
       interpolation: {
         escapeValue: false,  // React は XSS を自動エスケープするため不要
       },
-      returnNull:    false,
+      returnNull:        false,
       returnEmptyString: false,
     });
 }
 
-// ─── ロケール切替（アプリ内設定変更）────────────────────────────────────
 export async function changeLocale(locale: SupportedLocale) {
   await i18n.changeLanguage(locale);
   await SecureStore.setItemAsync('app_locale', locale);
 }
 
-// ─── アプリ設定から保存済みロケールを復元 ────────────────────────────────
 export async function restoreLocale() {
-  const saved = await SecureStore.getItemAsync('app_locale') as SupportedLocale | null;
+  const saved = (await SecureStore.getItemAsync('app_locale')) as SupportedLocale | null;
   if (saved && SUPPORTED_LOCALES.includes(saved)) {
     await i18n.changeLanguage(saved);
   }
 }
 ```
 
+### 2-2. レイアウトへの組み込みと Flickering 対策
+
+`initializeI18n()` は同期実行されるが、`restoreLocale()` は非同期である。  
+保存済みロケールが端末デフォルトと異なる場合、**Splash Screen を非表示にする前に `restoreLocale()` を完了させる**こと。
+
 ```tsx
 // app/_layout.tsx
+import * as SplashScreen from 'expo-splash-screen';
 import { initializeI18n, restoreLocale } from '@/lib/i18n';
+
+// アプリ起動直後に同期初期化。Splash Screen はまだ表示中。
+SplashScreen.preventAutoHideAsync();
 initializeI18n();
 
 export default function RootLayout() {
-  useEffect(() => { restoreLocale(); }, []);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    restoreLocale()
+      .catch(console.error)
+      .finally(() => {
+        setReady(true);
+        SplashScreen.hideAsync();  // ロケール確定後に Splash を非表示にする
+      });
+  }, []);
+
+  if (!ready) return null;
   // ...
 }
 ```
 
+> ⚠️ `restoreLocale()` の完了前に `SplashScreen.hideAsync()` を呼ぶと、
+> デバイスロケールで一瞬レンダリングされてから保存済みロケールに切り替わる flickering が発生する。
+
 ---
 
 ## 3. 翻訳ファイルの構造
+
+🟡 **SHOULD**: キーファイルは `src/locales/[lang]/[domain].ts` にドメインごとに分割し、`index.ts` で統合する。
 
 ```ts
 // src/locales/ja/index.ts
@@ -131,11 +168,11 @@ export default {
 
   // ─── バリデーション ─────────────────────────────────────────────
   validation: {
-    required:       '必須項目です',
-    emailFormat:    '正しいメールアドレスを入力してください',
-    minLength:      '{{min}}文字以上入力してください',
-    maxLength:      '{{max}}文字以内で入力してください',
-    passwordMatch:  'パスワードが一致しません',
+    required:      '必須項目です',
+    emailFormat:   '正しいメールアドレスを入力してください',
+    minLength:     '{{min}}文字以上入力してください',
+    maxLength:     '{{max}}文字以内で入力してください',
+    passwordMatch: 'パスワードが一致しません',
   },
 
   // ─── 注文 ───────────────────────────────────────────────────────
@@ -158,6 +195,7 @@ export default {
   },
 
   // ─── 複数形（i18next の plural 機能）──────────────────────────
+  // 呼び出し: t('items.count', { count: 3 }) → i18next が自動で _one / _other を選択する
   items: {
     count_one:   '{{count}}件',
     count_other: '{{count}}件',
@@ -178,8 +216,24 @@ export default {
 ```
 
 🔴 **MUST**: キーは全てカテゴリを持つ（ルートキー直書き禁止）  
-🟡 **SHOULD**: キーファイルは `src/locales/[lang]/[domain].ts` にドメインごとに分割し、`index.ts` で統合する  
-🔴 **MUST**: コンポーネント内に文言をハードコードしない（09_Message_Display と同じ規約）
+🔴 **MUST**: コンポーネント内に文言をハードコードしない（09_Message_Display と同じ規約）  
+🔴 **MUST NOT**: 動的キー生成（テンプレートリテラル）を使用しない
+
+```ts
+// ❌ 動的キー生成: 型安全が失われ、Tree Shaking も効かない
+t(`order.status.${status}`)
+
+// ✅ switch / Record で静的に解決する
+const STATUS_KEYS = {
+  pending:   'order.status.pending',
+  confirmed: 'order.status.confirmed',
+  shipped:   'order.status.shipped',
+  delivered: 'order.status.delivered',
+  cancelled: 'order.status.cancelled',
+} as const satisfies Record<OrderStatus, string>;
+
+t(STATUS_KEYS[status])
+```
 
 ---
 
@@ -194,7 +248,7 @@ const { t } = useTranslation();
 <Text>{t('validation.minLength', { min: 8 })}</Text>
 // → "8文字以上入力してください"
 
-// ✅ 複数形
+// ✅ 複数形（i18next が _one / _other サフィックスを自動選択する）
 <Text>{t('items.count', { count: 3 })}</Text>
 // → "3件"
 
@@ -209,39 +263,40 @@ import { Trans } from 'react-i18next';
 />
 ```
 
-🔴 **MUST NOT**: `t()` の戻り値を `dangerouslySetInnerHTML` / `innerHTML` に渡さない（RN では不要だが習慣として）
+🔴 **MUST NOT**: `t()` の戻り値を `dangerouslySetInnerHTML` / `innerHTML` に渡さない
 
 ---
 
 ## 5. 日付・時刻フォーマット
 
-`Intl.DateTimeFormat` を使う。`moment` / `date-fns` のフォーマット関数は使わない
-（ロケール対応が自動で行われるため）。
+`Intl.DateTimeFormat` を使う。`moment` / `date-fns` のフォーマット関数は使わない。
+
+> ⚠️ **タイムゾーン注意**: サーバーから受け取る日時文字列は UTC である場合が多い。
+> `new Date(isoString)` は UTC をローカル時刻に変換するため、
+> `Date.now()` との差分計算（相対時刻）は意図通りに動作する。
+> ただし、サーバーが「オフセットなし ISO 8601（`2026-03-15T09:00:00`）」を返す場合は
+> ローカル解釈とUTC解釈が混在し、差分がずれる。  
+> **必ず UTC オフセット付き（`2026-03-15T09:00:00+09:00` / `Z` 末尾）の文字列を使うこと。**
 
 ```ts
 // src/lib/formatDate.ts
 import i18n from 'i18next';
 
-// ─── 日付フォーマット ─────────────────────────────────────────────────────
 export function formatDate(
   date: Date | string,
   style: 'short' | 'medium' | 'long' | 'full' = 'medium',
 ): string {
   const d      = typeof date === 'string' ? new Date(date) : date;
   const locale = i18n.language;
-
   return new Intl.DateTimeFormat(locale, { dateStyle: style }).format(d);
 }
 
-// ─── 時刻フォーマット ─────────────────────────────────────────────────────
 export function formatTime(date: Date | string): string {
   const d      = typeof date === 'string' ? new Date(date) : date;
   const locale = i18n.language;
-
   return new Intl.DateTimeFormat(locale, { timeStyle: 'short' }).format(d);
 }
 
-// ─── 相対時刻（「3 分前」等）─────────────────────────────────────────────
 export function formatRelativeTime(date: Date | string): string {
   const d         = typeof date === 'string' ? new Date(date) : date;
   const locale    = i18n.language;
@@ -261,7 +316,7 @@ export function formatRelativeTime(date: Date | string): string {
 
 ```tsx
 // 使用例
-<Text>{formatDate('2026-03-15', 'long')}</Text>
+<Text>{formatDate('2026-03-15T00:00:00Z', 'long')}</Text>
 // ja: "2026年3月15日"
 // en: "March 15, 2026"
 
@@ -274,30 +329,30 @@ export function formatRelativeTime(date: Date | string): string {
 
 ## 6. 数値・通貨フォーマット
 
+> ⚠️ **ロケールと通貨の組み合わせ**: `ja` ロケール + `USD` のように、
+> ロケールと通貨が一致しない場合、`$9.99` ではなく `US$9.99` が返る環境がある（Hermes エンジン等）。
+> テストの期待値は実行環境ごとに差異が生じうるため、
+> `toMatch(/^\$\d/)` のような正規表現マッチで検証するか、
+> `Intl.NumberFormat` のサポート状況を確認したうえで期待値を定義すること。
+
 ```ts
 // src/lib/formatNumber.ts
 import i18n from 'i18next';
 
-// ─── 通貨フォーマット ─────────────────────────────────────────────────────
-export function formatPrice(
-  amount:   number,
-  currency: string,
-): string {
+export function formatPrice(amount: number, currency: string): string {
   const locale = i18n.language;
   return new Intl.NumberFormat(locale, {
-    style:    'currency',
+    style:                 'currency',
     currency,
     minimumFractionDigits: currency === 'JPY' ? 0 : 2,
     maximumFractionDigits: currency === 'JPY' ? 0 : 2,
   }).format(amount);
 }
 
-// ─── 数値フォーマット（カンマ区切り等）──────────────────────────────────
 export function formatNumber(value: number, options?: Intl.NumberFormatOptions): string {
   return new Intl.NumberFormat(i18n.language, options).format(value);
 }
 
-// ─── 単位付きフォーマット ─────────────────────────────────────────────────
 export function formatFileSize(bytes: number): string {
   if (bytes < 1024)       return `${bytes} B`;
   if (bytes < 1024 ** 2)  return `${(bytes / 1024).toFixed(1)} KB`;
@@ -316,6 +371,7 @@ export function formatFileSize(bytes: number): string {
 // src/hooks/useLayoutDirection.ts
 import * as Localization from 'expo-localization';
 import { I18nManager }   from 'react-native';
+import * as Updates      from 'expo-updates';  // ← RNRestart の代替
 
 export function useLayoutDirection() {
   const isRTL = Localization.getLocales()[0]?.textDirection === 'rtl';
@@ -324,8 +380,8 @@ export function useLayoutDirection() {
     if (I18nManager.isRTL !== isRTL) {
       I18nManager.allowRTL(isRTL);
       I18nManager.forceRTL(isRTL);
-      // RTL 変更後はアプリを再起動する必要がある
-      // RNRestart.Restart(); // expo-updates の reloadAsync で代替可
+      // RTL フラグ変更を反映するためアプリを再起動する
+      Updates.reloadAsync().catch(console.error);
     }
   }, [isRTL]);
 
@@ -349,8 +405,11 @@ export function useLayoutDirection() {
 
 ## 8. 型安全な翻訳キー
 
+> ⚠️ **バージョン前提**: `CustomTypeOptions` による型補完は **i18next >= 23.0.0** でのみ有効。
+> それ以前のバージョンでは型エラーが出るか、補完が機能しない。
+
 ```ts
-// src/types/i18n.d.ts — 翻訳キーの型補完を有効化
+// src/types/i18n.d.ts — 翻訳キーの型補完を有効化（i18next >= 23 が必須）
 import 'i18next';
 import ja from '@/locales/ja';
 
@@ -365,7 +424,6 @@ declare module 'i18next' {
 ```
 
 ```tsx
-// t() の引数が型補完される状態になる
 const { t } = useTranslation();
 t('order.status.pending');    // ✅ 補完される
 t('order.status.invalid');    // ❌ TypeScript エラー
@@ -377,18 +435,24 @@ t('order.status.invalid');    // ❌ TypeScript エラー
 
 ## 9. テスト実装規約
 
+### 9-1. テスト用 i18n ラッパー
+
 ```tsx
-// src/test/utils/i18nWrapper.tsx — テスト用の i18n ラッパー
-import { I18nextProvider } from 'react-i18next';
-import i18n                from 'i18next';
+// src/test/utils/i18nWrapper.tsx
+import { I18nextProvider }  from 'react-i18next';
+import i18n                 from 'i18next';
 import { initReactI18next } from 'react-i18next';
-import ja                  from '@/locales/ja';
+import ja                   from '@/locales/ja';
 
 const testI18n = i18n.createInstance();
+
+// initImmediate: false が必須。
+// デフォルト（true）では初期化が非同期になるため、
+// テスト実行時点で i18n が未準備となり翻訳キーがそのまま描画される。
 testI18n.use(initReactI18next).init({
-  lng:       'ja',
-  resources: { ja: { translation: ja } },
+  lng:           'ja',
   initImmediate: false,
+  resources:     { ja: { translation: ja } },
 });
 
 export function I18nWrapper({ children }: { children: React.ReactNode }) {
@@ -396,22 +460,82 @@ export function I18nWrapper({ children }: { children: React.ReactNode }) {
 }
 ```
 
+### 9-2. フォーマット関数の検証
+
+通貨テストはロケール×通貨の組み合わせで実行環境依存の差異が出るため、正規表現でマッチングする。
+
 ```ts
-// テストでのフォーマット関数の検証
 describe('formatPrice', () => {
   test.each([
-    [1500,  'JPY', '¥1,500'],
-    [9.99,  'USD', '$9.99'],
-    [1000,  'EUR', '€1,000.00'],
-  ])('%d %s → %s', (amount, currency, expected) => {
-    expect(formatPrice(amount, currency)).toBe(expected);
+    [1500, 'JPY', /^¥1,500$/],
+    [9.99, 'USD', /^\$9\.99$|^US\$9\.99$/],  // 環境差異を許容
+    [1000, 'EUR', /^€1,000\.00$|^EUR\s?1,000\.00$/],
+  ])('%d %s → %s', (amount, currency, pattern) => {
+    expect(formatPrice(amount, currency)).toMatch(pattern);
+  });
+});
+```
+
+### 9-3. RTL レンダリング検証
+
+```tsx
+// RTL ロケール（ar）での方向クラス適用を検証する
+describe('RTL layout', () => {
+  it('コンテナが RTL で ms-4 クラスを持つ', () => {
+    const { getByTestId } = render(
+      <I18nWrapper locale="ar">
+        <MyComponent />
+      </I18nWrapper>
+    );
+    expect(getByTestId('container')).toHaveClassName('ms-4');
   });
 });
 ```
 
 ---
 
-## 10. よくある実装ミスと対策
+## 10. 翻訳キー欠落の CI 検出
+
+`ja` に存在して `en` に存在しないキーは、fallbackLng へ silentフォールバックするため
+本番環境で気づきにくい。CI でキー欠落を検出する仕組みを設ける。
+
+```ts
+// scripts/check-i18n-keys.ts — CI で実行するキー整合性チェック
+import ja from '../src/locales/ja';
+import en from '../src/locales/en';
+
+function flattenKeys(obj: object, prefix = ''): string[] {
+  return Object.entries(obj).flatMap(([k, v]) => {
+    const key = prefix ? `${prefix}.${k}` : k;
+    return typeof v === 'object' && v !== null ? flattenKeys(v, key) : [key];
+  });
+}
+
+const jaKeys = new Set(flattenKeys(ja));
+const enKeys = new Set(flattenKeys(en));
+
+const missing = [...jaKeys].filter((k) => !enKeys.has(k));
+
+if (missing.length > 0) {
+  console.error('Missing keys in en:\n', missing.join('\n'));
+  process.exit(1);
+}
+```
+
+```jsonc
+// package.json
+{
+  "scripts": {
+    "check:i18n": "ts-node scripts/check-i18n-keys.ts"
+  }
+}
+```
+
+CI パイプラインに `check:i18n` を追加し、PR マージ時に自動チェックする。
+
+---
+
+## 11. よくある実装ミスと対策
 
 <table>
   <thead>
@@ -428,9 +552,14 @@ describe('formatPrice', () => {
       <td>必ず <code>t()</code> を使う</td>
     </tr>
     <tr>
-      <td>キーのルート直置き（<code>t(&#39;cancelButton&#39;)</code>）</td>
+      <td>キーのルート直置き（<code>t('cancelButton')</code>）</td>
       <td>スケールしない</td>
       <td>ドメインプレフィックスを必ずつける</td>
+    </tr>
+    <tr>
+      <td>動的キー生成（<code>t(`order.status.${s}`)</code>）</td>
+      <td>型安全が失われ Tree Shaking も効かない</td>
+      <td><code>Record</code> で静的マッピングして解決する</td>
     </tr>
     <tr>
       <td><code>new Date().toLocaleString()</code> を直接使う</td>
@@ -438,9 +567,9 @@ describe('formatPrice', () => {
       <td><code>formatDate</code> wrapper 経由</td>
     </tr>
     <tr>
-      <td><code>moment</code> で日付フォーマット</td>
-      <td>バンドルサイズが +70KB 増える</td>
-      <td><code>Intl.DateTimeFormat</code> を使う</td>
+      <td>オフセットなし ISO 8601 をサーバーから受け取る</td>
+      <td>タイムゾーン混在で相対時刻がずれる</td>
+      <td>UTC オフセット付き文字列（<code>Z</code> / <code>+09:00</code>）を必須とする</td>
     </tr>
     <tr>
       <td>RTL で <code>ml-</code> / <code>mr-</code> クラスを使う</td>
@@ -450,14 +579,29 @@ describe('formatPrice', () => {
     <tr>
       <td>型宣言なしで <code>t()</code> を使う</td>
       <td>キーのタイポが実行時まで検知されない</td>
-      <td><code>i18n.d.ts</code> の型設定を行う</td>
+      <td><code>i18n.d.ts</code> の型設定を行う（i18next &gt;= 23 必須）</td>
+    </tr>
+    <tr>
+      <td><code>restoreLocale()</code> 完了前に Splash Screen を非表示にする</td>
+      <td>デバイスロケールで一瞬レンダリングされ flickering が発生する</td>
+      <td><code>restoreLocale().finally(() =&gt; SplashScreen.hideAsync())</code> の順序を守る</td>
+    </tr>
+    <tr>
+      <td>翻訳キーの欠落を検出しない</td>
+      <td>本番で silent fallback が発生し気づけない</td>
+      <td>CI に <code>check:i18n</code> スクリプトを組み込む</td>
+    </tr>
+    <tr>
+      <td>SecureStore の import を省略</td>
+      <td>実行時エラー（<code>SecureStore is not defined</code>）</td>
+      <td><code>expo-secure-store</code> を明示的に import する</td>
     </tr>
   </tbody>
 </table>
 
 ---
 
-## 11. 変更履歴
+## 12. 変更履歴
 
 <table>
   <thead>
@@ -465,12 +609,20 @@ describe('formatPrice', () => {
       <th>日付</th>
       <th>変更内容</th>
       <th>担当</th>
+      <th>参照</th>
     </tr>
   </thead>
   <tbody>
     <tr>
+      <td>2026-04</td>
+      <td>SecureStore import 追加・Flickering 対策・動的キー禁止・CI チェック・RTL テスト・タイムゾーン注意事項・通貨テスト正規表現対応・変更履歴に参照列追加</td>
+      <td>—</td>
+      <td>—</td>
+    </tr>
+    <tr>
       <td>2026-03</td>
       <td>初版作成</td>
+      <td>—</td>
       <td>—</td>
     </tr>
   </tbody>

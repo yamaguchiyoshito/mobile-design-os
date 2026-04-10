@@ -10,6 +10,18 @@ import { Meta } from '@storybook/addon-docs/blocks';
 
 ---
 
+## 0. 凡例
+
+本文書は [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) に従って要件レベルを記述する。
+
+| 記号 | RFC 2119 キーワード | 意味 |
+|------|--------------------|-----------------------------|
+| 🔴 **MUST** | MUST / MUST NOT | 違反は即座にセキュリティ／動作リスクになる |
+| 🟡 **SHOULD** | SHOULD / SHOULD NOT | 正当な理由があれば逸脱可だが、影響を文書化する |
+| 🔵 **MAY** | MAY | 任意。採用する場合は一貫性を保つ |
+
+---
+
 ## 1. 方針
 
 ### 環境変数とフィーチャーフラグの使い分け
@@ -41,12 +53,55 @@ import { Meta } from '@storybook/addon-docs/blocks';
   </tbody>
 </table>
 
-🔴 **MUST**: API キー・秘密情報を `EXPO_PUBLIC_*` に設定しない（JS バンドルに含まれる）  
+🔴 **MUST**: API キー・秘密情報を `EXPO_PUBLIC_*` に設定しない（JS バンドルに平文で含まれる）  
 🔴 **MUST**: 秘密情報は EAS Secret に登録し、ネイティブビルド時のみ参照する
 
 ---
 
-## 2. 環境変数管理
+## 2. よくある実装ミスと対策
+
+> ⚠️ 実装前に必ず確認すること。発生した場合の修正コストが高い順に列挙している。
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>リスク / 結果</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>API キーを <code>EXPO_PUBLIC_</code> に設定する</td>
+      <td>JS バンドルに含まれ第三者が即座に取得できる</td>
+      <td><code>EXPO_PUBLIC_</code> なし変数は EAS Secret で管理。漏洩時はキーを即時ローテーション</td>
+    </tr>
+    <tr>
+      <td><code>.env</code> を Git にコミットする</td>
+      <td>秘密情報が履歴に永続的に残る</td>
+      <td><code>.gitignore</code> に全 <code>.env.*</code>（<code>.example</code> 以外）を追加。pre-commit フックで検出する</td>
+    </tr>
+    <tr>
+      <td>リモートフラグに <code>z.default()</code> を設定しない</td>
+      <td>API エラー時に機能全体が壊れる</td>
+      <td>全フラグにデフォルト値を設定（詳細はセクション 4）</td>
+    </tr>
+    <tr>
+      <td><code>process.env.EXPO_PUBLIC_*</code> を Feature に散在させる</td>
+      <td>変更時に全ファイルを修正する。テストで差し替え不能になる</td>
+      <td><code>env</code> / <code>featureFlags</code> 経由のみアクセスする</td>
+    </tr>
+    <tr>
+      <td>フラグ分岐の旧コードを放置する</td>
+      <td>技術的負債が積まれ、後続の変更コストが増大する</td>
+      <td>フラグを全環境で <code>true</code> にしてから 2 スプリント以内に旧実装を削除する（詳細はセクション 7）</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 3. 環境変数管理
 
 ### ファイル構成
 
@@ -93,25 +148,35 @@ const envSchema = z.object({
   EXPO_PUBLIC_FEATURE_RECOMMENDATIONS:  z.string().optional(),
 });
 
-// アプリ起動時に検証
+export type Env = z.infer<typeof envSchema>;
+
 const parsed = envSchema.safeParse(process.env);
+
 if (!parsed.success) {
-  console.error('Invalid environment variables:', parsed.error.format());
-  // 開発中は警告にとどめる。本番では起動失敗にする
+  const formatted = parsed.error.format();
+  console.error('Invalid environment variables:', formatted);
+
   if (process.env.EXPO_PUBLIC_APP_ENV === 'production') {
+    // 本番では必須変数の欠落を起動失敗にする
     throw new Error('Missing required environment variables');
   }
-}
 
-export const env = parsed.data ?? ({} as z.infer<typeof envSchema>);
+  // 開発・Staging では Partial 型として継続。アクセス時に undefined チェックが必要
+  export const env = process.env as Partial<Env>;
+} else {
+  export const env = parsed.data;
+}
 ```
+
+> **注意**: `safeParse` 失敗時に `{} as Env` でキャストすると、以降のアクセスが実行時に
+> `undefined` になりサイレントに壊れる。失敗パスでは明示的に `Partial<Env>` を使うこと。
 
 🟡 **SHOULD**: 起動時に Zod で環境変数を検証し、必須値の欠落を早期発見する  
 🔴 **MUST NOT**: `process.env.EXPO_PUBLIC_*` を Feature / Screen に散在させる（`env` 経由のみ）
 
 ---
 
-## 3. 静的フィーチャーフラグ
+## 4. 静的フィーチャーフラグ
 
 ビルド時に決まるフラグ。環境ごとに ON/OFF を切り替える。
 
@@ -119,22 +184,41 @@ export const env = parsed.data ?? ({} as z.infer<typeof envSchema>);
 // src/lib/featureFlags.ts
 import { env } from '@/lib/env';
 
-// ─── フラグ定義 ───────────────────────────────────────────────────────────
+/**
+ * フラグ定義
+ *
+ * - デフォルト値は false（新機能はデフォルト OFF）
+ * - 廃止予定のフラグは deprecated: true を設定し、removeBy を明記する
+ */
 const FLAGS = {
-  newCheckout:     env.EXPO_PUBLIC_FEATURE_NEW_CHECKOUT     === 'true',
-  recommendations: env.EXPO_PUBLIC_FEATURE_RECOMMENDATIONS  === 'true',
+  newCheckout: {
+    value:       env.EXPO_PUBLIC_FEATURE_NEW_CHECKOUT === 'true',
+    owner:       'checkout-team',
+    removeBy:    '2026-09',    // 全環境で true 確定後 2 スプリント以内に削除
+    deprecated:  false,
+    description: '新チェックアウトフロー（旧: LegacyCheckoutFlow）',
+  },
+  recommendations: {
+    value:       env.EXPO_PUBLIC_FEATURE_RECOMMENDATIONS === 'true',
+    owner:       'discovery-team',
+    removeBy:    null,
+    deprecated:  false,
+    description: 'レコメンデーションセクションの表示',
+  },
 } as const;
 
 export type FeatureFlagKey = keyof typeof FLAGS;
 
 export function isFeatureEnabled(flag: FeatureFlagKey): boolean {
-  return FLAGS[flag];
+  return FLAGS[flag].value;
 }
 
-// ─── React Hook ──────────────────────────────────────────────────────────
 export function useFeatureFlag(flag: FeatureFlagKey): boolean {
-  return FLAGS[flag];
+  return FLAGS[flag].value;
 }
+
+/** CI などでフラグメタデータを検査する用途に公開 */
+export const flagMetadata = FLAGS;
 ```
 
 ```tsx
@@ -142,16 +226,18 @@ export function useFeatureFlag(flag: FeatureFlagKey): boolean {
 export function CheckoutScreen() {
   const useNewCheckout = useFeatureFlag('newCheckout');
 
+  // TODO(checkout-team): newCheckout が全環境で true になったら
+  //   LegacyCheckoutFlow と本 if 分岐を削除する。期限: 2026-09
   return useNewCheckout ? <NewCheckoutFlow /> : <LegacyCheckoutFlow />;
 }
 ```
 
-🟡 **SHOULD**: 静的フラグのデフォルト値は `false`（新機能はデフォルト OFF）  
-🟡 **SHOULD**: フラグが `false` の旧実装は削除予定のコードとして `// TODO: remove when newCheckout=true in all envs` とコメントする
+🟡 **SHOULD**: 静的フラグのデフォルト値は `false`  
+🔴 **MUST**: フラグに `owner` と `removeBy` を設定する（未設定は CI で警告）
 
 ---
 
-## 4. 動的フィーチャーフラグ（サーバー配信）
+## 5. 動的フィーチャーフラグ（サーバー配信）
 
 OTA 更新後に変更できる。A/B テスト・段階ロールアウトに使う。
 
@@ -160,59 +246,80 @@ OTA 更新後に変更できる。A/B テスト・段階ロールアウトに使
 export const featureFlagsSchema = z.object({
   newRecommendations: z.boolean().default(false),
   maxCartItems:       z.number().default(10),
-  promobannerText:    z.string().nullable().default(null),
+  promoBannerText:    z.string().nullable().default(null),
 });
 
 export type FeatureFlags = z.infer<typeof featureFlagsSchema>;
+
+/** API エラー時・未取得時に使うフォールバック値 */
+export const defaultFeatureFlags = featureFlagsSchema.parse({});
 ```
 
 ```ts
 // src/features/config/hooks/useRemoteFlags.ts
+import { featureFlagsSchema, defaultFeatureFlags } from '@/api/generated/schemas/featureFlagsSchema';
+
 export function useRemoteFlags() {
   return useQuery({
-    queryKey:  queryKeys.config.featureFlags(),
-    queryFn:   () => httpClient.get('/config/feature-flags', featureFlagsSchema),
-    staleTime: 1000 * 60 * 60,  // 1 時間キャッシュ
+    queryKey: queryKeys.config.featureFlags(),
+    queryFn:  () => httpClient.get('/config/feature-flags', featureFlagsSchema),
+    staleTime: 1000 * 60 * 60,   // 1 時間キャッシュ
     gcTime:    1000 * 60 * 60 * 24,
-    // フォールバック: ネットワーク失敗時はデフォルト値を使う
-    placeholderData: featureFlagsSchema.parse({}),
+
+    // API エラー時のフォールバック:
+    // placeholderData はキャッシュミス時のローディング中 UI 用途のため使わない。
+    // エラー時は select で defaultFeatureFlags を返すことで画面を壊さない。
+    select: (data) => featureFlagsSchema.parse(data ?? {}),
   });
 }
-```
 
-```tsx
-// Feature での使用
+// 呼び出し側は data が undefined になりうることを前提にする
 export function RecommendationSection() {
-  const { data: flags } = useRemoteFlags();
+  const { data: flags = defaultFeatureFlags } = useRemoteFlags();
 
-  if (!flags?.newRecommendations) return null;
+  if (!flags.newRecommendations) return null;
 
   return <RecommendationList />;
 }
 ```
 
-🟡 **SHOULD**: リモートフラグは常にデフォルト値（`z.default()`）を設定し、API エラー時に動作が壊れないようにする  
-🟡 **SHOULD**: リモートフラグの変更はサーバー側で記録し、変更理由と有効期間を管理する
+### キャッシュ戦略とインシデント対応
+
+`staleTime: 1h` の場合、フラグを OFF に変更してから最大 1 時間は旧挙動が全クライアントで継続する。
+緊急無効化が必要な場合は以下の手順を取る。
+
+```ts
+// インシデント時のキャッシュバスト
+// サーバーは /config/feature-flags レスポンスに Cache-Control: no-store を付与する。
+// クライアントは queryClient.invalidateQueries({ queryKey: queryKeys.config.featureFlags() })
+// を呼ぶ EAS Update を配信する。
+```
+
+| 状況 | 反映時間の目安 |
+|------|--------------|
+| 通常変更 | 最大 1 時間（staleTime 経過後） |
+| EAS Update 配信 + invalidateQueries | OTA 適用後の次回フォアグラウンド起動時 |
+| サーバー側 Cache-Control: no-store | 次回 API 呼び出し時（即時） |
+
+🔴 **MUST**: リモートフラグは全フィールドに `z.default()` を設定する  
+🟡 **SHOULD**: 緊急フラグ変更時はサーバー側で `Cache-Control: no-store` を付与し即時反映できるようにする  
+🟡 **SHOULD**: リモートフラグの変更はサーバー側で変更者・理由・有効期限を記録する
 
 ---
 
-## 5. A/B テストパターン
+## 6. A/B テストパターン
+
+> **前提**: クライアント側のコホート分類ロジックは、サーバー側の
+> `libs/ab-test/cohort.ts`（モノレポ共有ライブラリ）と同一アルゴリズムでなければならない。
+> 両者を同じパッケージから import することで一致を保証すること。
 
 ```ts
 // src/lib/abTest.ts
-import { useAuthStore }    from '@/stores/authStore';
-import { useRemoteFlags }  from '@/features/config/hooks/useRemoteFlags';
-
-// ユーザー ID の末尾数字でコホートを決定（サーバー側と一致させる）
-export function getABVariant(
-  userId:   string,
-  flagName: string,
-  variants: string[],   // ['control', 'treatment'] 等
-): string {
-  const hash   = simpleHash(`${userId}:${flagName}`);
-  const index  = Math.abs(hash) % variants.length;
-  return variants[index];
-}
+// ─────────────────────────────────────────────────────────────────────────
+// 注意: simpleHash は Int32 演算を使うため、MIN_INT32 (-2147483648) が
+//       入力されると Math.abs() が負値を返す。
+//       >>> 0 で Uint32 に変換することでこれを回避する。
+// ─────────────────────────────────────────────────────────────────────────
 
 function simpleHash(str: string): number {
   let hash = 0;
@@ -220,17 +327,34 @@ function simpleHash(str: string): number {
     hash = ((hash << 5) - hash) + str.charCodeAt(i);
     hash |= 0;
   }
-  return hash;
+  return hash >>> 0;  // Uint32 に変換して常に非負値を保証
+}
+
+/**
+ * ユーザー ID とフラグ名からコホートを決定する。
+ *
+ * @param userId   - 認証済みユーザー ID
+ * @param flagName - A/B テストのフラグ名（サーバー側と同じ文字列を使うこと）
+ * @param variants - バリアント配列（例: ['control', 'treatment']）
+ * @returns variants のいずれか 1 つ
+ */
+export function getABVariant(
+  userId:   string,
+  flagName: string,
+  variants: string[],
+): string {
+  if (variants.length === 0) throw new Error('variants must not be empty');
+  const hash  = simpleHash(`${userId}:${flagName}`);
+  const index = hash % variants.length;
+  return variants[index];
 }
 ```
 
 ```tsx
-// 使用例
 export function HomeScreen() {
   const userId  = useAuthStore((s) => s.userId) ?? '';
   const variant = getABVariant(userId, 'home_layout', ['grid', 'list']);
 
-  // A/B テストの実験結果を Sentry に記録する
   useEffect(() => {
     Sentry.setTag('ab_home_layout', variant);
   }, [variant]);
@@ -241,9 +365,56 @@ export function HomeScreen() {
 
 ---
 
-## 6. 段階リリース（ロールアウト）との統合
+## 7. フラグのライフサイクル管理
 
-OTA（EAS Update）の段階ロールアウトとフィーチャーフラグを組み合わせる。
+フラグは「導入 → 検証 → 確定 → 削除」の 4 フェーズで管理する。
+削除フェーズを省略すると旧コードが技術的負債として蓄積する。
+
+```
+[導入]          [検証]              [確定]                   [削除]
+flag=false  →  staging=true   →  production=true (全ユーザー)  →  コード削除
+                A/B テスト        removeBy を設定              CI が期限超過を警告
+```
+
+### CI による期限管理
+
+```ts
+// scripts/check-flag-expiry.ts（CI で実行）
+import { flagMetadata } from '@/lib/featureFlags';
+
+const now = new Date();
+const yyyyMM = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+for (const [key, meta] of Object.entries(flagMetadata)) {
+  if (meta.removeBy && meta.removeBy <= yyyyMM) {
+    console.warn(`[FLAG EXPIRED] "${key}" の removeBy は ${meta.removeBy} を過ぎています。削除してください。`);
+    process.exitCode = 1;
+  }
+}
+```
+
+🔴 **MUST**: フラグ確定（全環境 true）後 2 スプリント以内に旧実装を削除する  
+🟡 **SHOULD**: CI で `removeBy` 期限切れフラグを検出し、PR マージをブロックする
+
+---
+
+## 8. 段階リリース（ロールアウト）との統合
+
+OTA（EAS Update）の段階ロールアウトとフィーチャーフラグを組み合わせると、
+**OTA 配信率 × リモートフラグ率** の 2 軸で到達ユーザー数を独立に制御できる。
+
+### 制御マトリクス
+
+| OTA ロールアウト % | リモートフラグ % | 新機能が届くユーザー |
+|:-----------------:|:---------------:|---------------------|
+| 10 %              | 100 %           | 全ユーザーの **10 %**（OTA 配信済みの全員） |
+| 100 %             | 10 %            | 全ユーザーの **10 %**（フラグ ON のユーザーのみ） |
+| 10 %              | 10 %            | 全ユーザーの **約 1 %**（両方が当たったユーザーのみ） |
+| 100 %             | 100 %           | **全ユーザー**（完全展開） |
+
+- OTA ロールアウト率を下げると「バグが出たときの影響範囲を限定」できる
+- リモートフラグ率を下げると「OTA 配信後でも機能を一時停止」できる
+- 緊急ロールバックはリモートフラグを 0 % にするほうが OTA の再配信より速い
 
 ```bash
 # Step 1: 10% にまず配信
@@ -254,19 +425,12 @@ eas update --branch production --rollout-percentage 50
 eas update --branch production --rollout-percentage 100
 ```
 
-```ts
-// リモートフラグで新機能を段階的に開放する
-// → OTA の rollout が 10% でも、フラグを 100% ON にすれば
-//   OTA が当たったユーザー全員に新機能が開放される
-// → OTA は 100% でも、フラグを 10% にすればユーザーの 10% だけに開放できる
-```
-
 🟡 **SHOULD**: OTA ロールアウトとリモートフラグを独立した軸として使い分ける  
 🟡 **SHOULD**: クリティカルなフラグ変更は営業時間内（09:00〜17:00 JST）に実施する
 
 ---
 
-## 7. 環境ごとの設定差分サマリ
+## 9. 環境ごとの設定差分サマリ
 
 <table>
   <thead>
@@ -307,11 +471,12 @@ eas update --branch production --rollout-percentage 100
 
 ---
 
-## 8. テスト実装規約
+## 10. テスト実装規約
+
+### 静的フラグのテスト
 
 ```ts
 // src/lib/__tests__/featureFlags.test.ts
-
 describe('isFeatureEnabled', () => {
   test('フラグが true のとき true を返す', () => {
     jest.resetModules();
@@ -327,7 +492,12 @@ describe('isFeatureEnabled', () => {
     expect(isFeatureEnabled('newCheckout')).toBe(false);
   });
 });
+```
 
+### A/B テストのテスト
+
+```ts
+// src/lib/__tests__/abTest.test.ts
 describe('getABVariant', () => {
   test('同じ userId と flagName では常に同じ variant を返す', () => {
     const v1 = getABVariant('user-123', 'home_layout', ['grid', 'list']);
@@ -338,57 +508,73 @@ describe('getABVariant', () => {
   test('variants の外の値を返さない', () => {
     const variants = ['control', 'treatment'];
     for (let i = 0; i < 100; i++) {
-      const v = getABVariant(`user-${i}`, 'test', variants);
-      expect(variants).toContain(v);
+      expect(variants).toContain(getABVariant(`user-${i}`, 'test', variants));
     }
+  });
+
+  test('MIN_INT32 相当の userId でも非負インデックスを返す', () => {
+    // hash が MIN_INT32 になりうる入力でクラッシュしないことを確認
+    expect(() =>
+      getABVariant('user-trig-overflow', 'edge_case', ['a', 'b'])
+    ).not.toThrow();
+  });
+
+  test('variants が空のとき例外をスローする', () => {
+    expect(() => getABVariant('user-1', 'flag', [])).toThrow();
+  });
+});
+```
+
+### リモートフラグのテスト（MSW によるモック）
+
+```ts
+// src/features/config/hooks/__tests__/useRemoteFlags.test.ts
+import { http, HttpResponse } from 'msw';
+import { setupServer } from 'msw/node';
+import { renderHook, waitFor } from '@testing-library/react';
+import { useRemoteFlags } from '../useRemoteFlags';
+import { defaultFeatureFlags } from '@/api/generated/schemas/featureFlagsSchema';
+import { createWrapper } from '@/test/utils/createWrapper';
+
+const server = setupServer();
+beforeAll(() => server.listen());
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+describe('useRemoteFlags', () => {
+  test('正常レスポンス時にフラグ値を返す', async () => {
+    server.use(
+      http.get('/config/feature-flags', () =>
+        HttpResponse.json({ newRecommendations: true, maxCartItems: 5 })
+      )
+    );
+
+    const { result } = renderHook(() => useRemoteFlags(), { wrapper: createWrapper() });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.newRecommendations).toBe(true);
+    expect(result.current.data?.maxCartItems).toBe(5);
+  });
+
+  test('API エラー時にデフォルト値にフォールバックする', async () => {
+    server.use(
+      http.get('/config/feature-flags', () => HttpResponse.error())
+    );
+
+    const { result } = renderHook(() => useRemoteFlags(), { wrapper: createWrapper() });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // 呼び出し側での destructuring デフォルト値を検証
+    const flags = result.current.data ?? defaultFeatureFlags;
+    expect(flags).toEqual(defaultFeatureFlags);
   });
 });
 ```
 
 ---
 
-## 9. よくある実装ミスと対策
-
-<table>
-  <thead>
-    <tr>
-      <th>ミス</th>
-      <th>リスク / 結果</th>
-      <th>対策</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><code>process.env.EXPO_PUBLIC_*</code> を Feature に散在させる</td>
-      <td>変更時に全ファイルを修正する</td>
-      <td><code>env</code> / <code>featureFlags</code> 経由のみ</td>
-    </tr>
-    <tr>
-      <td>API キーを <code>EXPO_PUBLIC_</code> に設定する</td>
-      <td>JS バンドルに含まれ第三者が取得できる</td>
-      <td><code>EXPO_PUBLIC_</code> なし変数は EAS Secret で管理</td>
-    </tr>
-    <tr>
-      <td>リモートフラグに <code>z.default()</code> を設定しない</td>
-      <td>API エラー時に機能が壊れる</td>
-      <td>全フラグにデフォルト値を設定</td>
-    </tr>
-    <tr>
-      <td>フラグ分岐の旧コードを放置する</td>
-      <td>技術的負債が積まれる</td>
-      <td>フラグを全環境で <code>true</code> にした後に旧実装を削除する</td>
-    </tr>
-    <tr>
-      <td><code>.env</code> をGitにコミットする</td>
-      <td>秘密情報が漏洩する</td>
-      <td><code>.gitignore</code> に全 <code>.env.*</code>（<code>.example</code> 以外）を追加</td>
-    </tr>
-  </tbody>
-</table>
-
----
-
-## 10. 変更履歴
+## 11. 変更履歴
 
 <table>
   <thead>
@@ -399,6 +585,22 @@ describe('getABVariant', () => {
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td>2026-04</td>
+      <td>
+        RFC 2119 凡例追加 / セクション順序変更（ミス一覧を前置）/
+        simpleHash オーバーフロー修正（Math.abs → >>> 0）/
+        placeholderData を select フォールバックに変更 /
+        env.ts の Partial 型安全化 /
+        フラグメタデータ（owner・removeBy）追加 /
+        CI 期限チェックスクリプト追加 /
+        OTA × リモートフラグ制御マトリクス追加 /
+        キャッシュバスト手順追加 /
+        MSW によるリモートフラグテスト追加 /
+        A/B テストのサーバー側アルゴリズム一致要件を明記
+      </td>
+      <td>—</td>
+    </tr>
     <tr>
       <td>2026-03</td>
       <td>初版作成</td>

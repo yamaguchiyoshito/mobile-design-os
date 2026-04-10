@@ -54,54 +54,136 @@ import { Meta } from '@storybook/addon-docs/blocks';
 
 ---
 
-## 2. アプリロック方式
+## 2. `biometricService` インターフェース
+
+本書内のすべてのコードは以下の型に依存する。実装は `14_Device_Permissions` を参照。
+
+```ts
+// src/lib/permissions/biometricService.ts
+
+export type BiometricCapability = 'facial' | 'fingerprint' | 'iris' | 'none';
+
+/** 認証結果。OS 差異はこの型に吸収する */
+export type BiometricResult =
+  | 'success'
+  | 'cancelled'   // ユーザーが明示的にキャンセル
+  | 'failed'      // 認証失敗（指紋不一致など）
+  | 'lockout';    // 連続失敗によるOSロックアウト
+
+export interface BiometricAuthOptions {
+  reason: string;
+}
+
+export interface IBiometricService {
+  /** デバイスが対応する認証方式を返す。未対応は 'none' */
+  getCapability(): Promise<BiometricCapability>;
+  /** 認証プロンプトを起動し結果を返す */
+  authenticate(options: BiometricAuthOptions): Promise<BiometricResult>;
+}
+
+export declare const biometricService: IBiometricService;
+```
+
+### Android / iOS の挙動差異
+
+<table>
+  <thead>
+    <tr>
+      <th>項目</th>
+      <th>iOS (LAContext)</th>
+      <th>Android (BiometricPrompt)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>lockout</code> 後の待機時間</td>
+      <td>即座に再試行可（OSパスコードへ誘導）</td>
+      <td>30 秒〜デバイス依存でロックアウト継続</td>
+    </tr>
+    <tr>
+      <td>キャンセルボタン</td>
+      <td>常に表示</td>
+      <td>API level 28 未満では非表示の場合あり</td>
+    </tr>
+    <tr>
+      <td><code>disableDeviceFallback</code></td>
+      <td>パスコードへのフォールバックを制御</td>
+      <td>Android では無視される（常に端末PINへフォールバック）</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST**: `biometricService` は上記差異を吸収し、呼び出し側は OS を意識しない設計にする  
+🔴 **MUST**: `lockout` 後のリトライ制御はアプリ側ではなく OS に委ねる（独自タイマーで再試行を許可しない）
+
+---
+
+## 3. アプリロック方式
 
 ### ロック状態の管理
 
+`last_active_at` は **メモリ上の `Date` オブジェクト** で管理する。
+SecureStore はキーチェーン保護が目的であり、AppState 変化のたびに書き込むと
+iOS キーチェーンの I/O ブロッキングと断片化を招くため使用しない。
+
 ```ts
 // src/stores/appLockStore.ts
-import { create }      from 'zustand';
+import { create }       from 'zustand';
 import * as SecureStore from 'expo-secure-store';
 
-const LOCK_ENABLED_KEY    = 'biometric_lock_enabled';
-const LAST_ACTIVE_KEY     = 'last_active_at';
-const LOCK_TIMEOUT_MS     = 1000 * 60 * 5;  // 5 分間操作なしでロック
+const LOCK_ENABLED_KEY = 'biometric_lock_enabled';
+
+/** ロックまでの無操作時間。初期値 5 分。アプリ要件に応じて変更する */
+const DEFAULT_LOCK_TIMEOUT_MS = 1000 * 60 * 5;
 
 type AppLockState = {
-  isLocked:       boolean;
-  isEnabled:      boolean;
-  lock:           () => void;
-  unlock:         () => void;
-  setEnabled:     (enabled: boolean) => Promise<void>;
-  checkShouldLock: () => Promise<boolean>;
-  recordActivity:  () => Promise<void>;
+  isLocked:         boolean;
+  isEnabled:        boolean;
+  lockTimeoutMs:    number;
+  lock:             () => void;
+  unlock:           () => void;
+  setEnabled:       (enabled: boolean) => Promise<void>;
+  setLockTimeout:   (ms: number) => void;
+  /** アプリ起動時に SecureStore から設定を読み込む（1回のみ呼ぶ） */
+  initialize:       () => Promise<void>;
+  checkShouldLock:  () => boolean;
+  recordActivity:   () => void;
+  _lastActiveAt:    Date | null;
 };
 
 export const useAppLockStore = create<AppLockState>((set, get) => ({
-  isLocked:  false,
-  isEnabled: false,
+  isLocked:      false,
+  isEnabled:     false,
+  lockTimeoutMs: DEFAULT_LOCK_TIMEOUT_MS,
+  _lastActiveAt: null,
 
   lock:   () => set({ isLocked: true }),
   unlock: () => set({ isLocked: false }),
 
+  setLockTimeout: (ms: number) => set({ lockTimeoutMs: ms }),
+
+  initialize: async () => {
+    // SecureStore 読み込みはここだけ。以降は state を参照する
+    const raw = await SecureStore.getItemAsync(LOCK_ENABLED_KEY);
+    // null（未設定）は false 扱い。"true" のみ有効化済みとみなす
+    set({ isEnabled: raw === 'true' });
+  },
+
   setEnabled: async (enabled: boolean) => {
-    await SecureStore.setItemAsync(LOCK_ENABLED_KEY, String(enabled));
+    await SecureStore.setItemAsync(LOCK_ENABLED_KEY, enabled ? 'true' : 'false');
     set({ isEnabled: enabled });
   },
 
-  checkShouldLock: async () => {
-    const enabled = await SecureStore.getItemAsync(LOCK_ENABLED_KEY);
-    if (enabled !== 'true') return false;
-
-    const lastActiveStr = await SecureStore.getItemAsync(LAST_ACTIVE_KEY);
-    if (!lastActiveStr) return true;
-
-    const elapsed = Date.now() - Number(lastActiveStr);
-    return elapsed > LOCK_TIMEOUT_MS;
+  /** I/O なしで同期判定できる */
+  checkShouldLock: () => {
+    const { isEnabled, _lastActiveAt, lockTimeoutMs } = get();
+    if (!isEnabled) return false;
+    if (!_lastActiveAt) return true;
+    return Date.now() - _lastActiveAt.getTime() > lockTimeoutMs;
   },
 
-  recordActivity: async () => {
-    await SecureStore.setItemAsync(LAST_ACTIVE_KEY, String(Date.now()));
+  recordActivity: () => {
+    set({ _lastActiveAt: new Date() });
   },
 }));
 ```
@@ -110,28 +192,32 @@ export const useAppLockStore = create<AppLockState>((set, get) => ({
 
 ```tsx
 // app/_layout.tsx
-import { AppState } from 'react-native';
+import { AppState }        from 'react-native';
 import { useAppLockStore } from '@/stores/appLockStore';
 import { AppLockScreen }   from '@/components/providers/AppLockScreen';
 
 export default function RootLayout() {
-  const { isLocked, lock, checkShouldLock, recordActivity } = useAppLockStore();
+  const { isLocked, lock, checkShouldLock, recordActivity, initialize } =
+    useAppLockStore();
 
-  // アプリがバックグラウンドから復帰したときにロックチェック
+  // 初期化は1回のみ（SecureStore 読み込み）
   useEffect(() => {
-    const sub = AppState.addEventListener('change', async (nextState) => {
+    initialize();
+  }, []);
+
+  // AppState 変化はメモリ上の state だけ参照するため同期的に判定できる
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (nextState) => {
       if (nextState === 'active') {
-        const shouldLock = await checkShouldLock();
-        if (shouldLock) lock();
+        if (checkShouldLock()) lock();
       }
       if (nextState === 'background') {
-        await recordActivity();
+        recordActivity();
       }
     });
     return () => sub.remove();
   }, []);
 
-  // ロック中はロック画面のみ表示
   if (isLocked) return <AppLockScreen />;
 
   return (
@@ -149,45 +235,66 @@ export default function RootLayout() {
 import { biometricService } from '@/lib/permissions/biometricService';
 import { useAppLockStore }  from '@/stores/appLockStore';
 
-export function AppLockScreen() {
-  const { unlock }   = useAppLockStore();
-  const { t }        = useTranslation();
-  const [error, setError] = useState<string | null>(null);
+type AuthState = 'idle' | 'authenticating' | 'locked_out' | 'error';
 
-  // 画面表示時に自動で生体認証を起動
+export function AppLockScreen() {
+  const { unlock }                      = useAppLockStore();
+  const { t }                           = useTranslation();
+  const [authState, setAuthState]       = useState<AuthState>('idle');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
   useEffect(() => {
     handleAuthenticate();
   }, []);
 
   const handleAuthenticate = async () => {
-    const capability = await biometricService.getCapability();
+    // 多重起動防止
+    if (authState === 'authenticating' || authState === 'locked_out') return;
 
-    if (capability === 'none') {
-      // 生体認証が使えない端末ではロックしない
-      unlock();
-      return;
-    }
+    setAuthState('authenticating');
+    setErrorMessage(null);
 
-    const result = await biometricService.authenticate({
-      reason: t('appLock.reason'),  // 'アプリのロックを解除します'
-    });
+    try {
+      const capability = await biometricService.getCapability();
 
-    switch (result) {
-      case 'success':
-        setError(null);
+      if (capability === 'none') {
+        // 生体認証が使えない端末ではロックしない
         unlock();
-        break;
-      case 'cancelled':
-        // キャンセルはエラー表示しない（再試行ボタンを表示）
-        break;
-      case 'lockout':
-        setError(t('appLock.lockoutError'));  // '認証に複数回失敗しました'
-        break;
-      case 'failed':
-        setError(t('appLock.failedError'));   // '認証に失敗しました'
-        break;
+        return;
+      }
+
+      const result = await biometricService.authenticate({
+        reason: t('appLock.reason'),
+      });
+
+      switch (result) {
+        case 'success':
+          setAuthState('idle');
+          unlock();
+          break;
+        case 'cancelled':
+          // キャンセルはエラー表示しない。再試行ボタンを見せる
+          setAuthState('idle');
+          break;
+        case 'lockout':
+          // OS ロックアウト中はリトライボタンを非表示にする
+          // 再試行タイミングは OS に委ねる（独自タイマー不使用）
+          setAuthState('locked_out');
+          setErrorMessage(t('appLock.lockoutError'));
+          break;
+        case 'failed':
+          setAuthState('error');
+          setErrorMessage(t('appLock.failedError'));
+          break;
+      }
+    } catch {
+      // 予期しない例外（例: 端末の認証サービスが起動失敗）
+      setAuthState('error');
+      setErrorMessage(t('appLock.unexpectedError'));
     }
   };
+
+  const canRetry = authState !== 'locked_out' && authState !== 'authenticating';
 
   return (
     <View
@@ -195,58 +302,81 @@ export function AppLockScreen() {
       accessible={true}
       accessibilityLabel={t('appLock.screenLabel')}
     >
-      <Icon name="lock-closed" size={48} className="text-content-secondary mb-6" accessible={false} />
+      <Icon
+        name="lock-closed"
+        size={48}
+        className="text-content-secondary mb-6"
+        accessible={false}
+      />
       <Text className="text-heading-md text-content-primary mb-2">
-        {t('appLock.title')}  {/* 'ロックされています' */}
+        {t('appLock.title')}
       </Text>
 
-      {error && (
+      {errorMessage && (
         <Text
-          className="text-body-sm text-content-danger mb-4"
+          className="text-body-sm text-content-danger mb-4 text-center px-8"
           accessibilityLiveRegion="assertive"
           accessibilityRole="alert"
         >
-          {error}
+          {errorMessage}
         </Text>
       )}
 
-      <Button
-        label={t('appLock.unlockButton')}  // '生体認証で解除'
-        variant="primary"
-        onPress={handleAuthenticate}
-      />
+      {authState === 'locked_out' && (
+        <Text className="text-body-sm text-content-secondary mb-4 text-center px-8">
+          {t('appLock.lockoutGuide')}  {/* 'しばらく時間をおいてから再試行してください' */}
+        </Text>
+      )}
+
+      {canRetry && (
+        <Button
+          label={t('appLock.unlockButton')}
+          variant="primary"
+          onPress={handleAuthenticate}
+          loading={authState === 'authenticating'}
+        />
+      )}
     </View>
   );
 }
 ```
 
 🟡 **SHOULD**: ロック画面表示時に自動で生体認証プロンプトを起動する（ユーザーの操作を 1 ステップ省く）  
-🟡 **SHOULD**: `lockout`（連続失敗）の場合はリトライボタンを非表示にする
+🔴 **MUST**: `lockout` の場合はリトライボタンを非表示にし、OS に再試行タイミングを委ねる  
+🔴 **MUST**: `handleAuthenticate` の未分類例外を try/catch で捕捉し、ユーザーが詰まらないようにする
 
 ---
 
-## 3. 高感度操作の直前確認
+## 4. 高感度操作の直前確認
 
 決済・削除等の操作直前に再確認として生体認証を挟む。
+`useSecureConfirm` はジェネリクスで操作の戻り値を呼び出し元に返せる。
 
 ```tsx
 // features/payment/hooks/useSecureConfirm.ts
+
+/**
+ * @template T - operation の戻り値型
+ * @param operation - 認証後に実行する処理
+ * @param options.reason - 生体認証プロンプトに表示するメッセージ
+ * @throws {Error} 'cancelled' | 'authentication_failed'
+ */
 export function useSecureConfirm() {
   const { t } = useTranslation();
 
-  return async (
-    operation: () => Promise<void>,
+  return async <T>(
+    operation: () => Promise<T>,
     options?: { reason?: string },
-  ): Promise<void> => {
+  ): Promise<T> => {
     const capability = await biometricService.getCapability();
 
-    // 生体認証が使えない端末では通常の Dialog 確認に fallback
     if (capability === 'none') {
-      return new Promise<void>((resolve, reject) => {
+      // 生体認証が使えない端末では Dialog 確認にフォールバック
+      return new Promise<T>((resolve, reject) => {
         notify.dialog({
-          title:        t('secureConfirm.title'),    // '操作を確認してください'
+          title:        t('secureConfirm.title'),
           message:      options?.reason ?? t('secureConfirm.defaultMessage'),
-          confirmLabel: t('secureConfirm.confirm'),  // '実行する'
+          confirmLabel: t('secureConfirm.confirm'),
           destructive:  true,
           onConfirm:    () => operation().then(resolve).catch(reject),
           onCancel:     () => reject(new Error('cancelled')),
@@ -254,14 +384,12 @@ export function useSecureConfirm() {
       });
     }
 
-    // 生体認証で確認
     const result = await biometricService.authenticate({
       reason: options?.reason ?? t('secureConfirm.biometricReason'),
     });
 
-    if (result !== 'success') {
-      throw new Error('authentication_failed');
-    }
+    if (result === 'cancelled') throw new Error('cancelled');
+    if (result !== 'success')   throw new Error('authentication_failed');
 
     return operation();
   };
@@ -269,18 +397,18 @@ export function useSecureConfirm() {
 ```
 
 ```tsx
-// 使用例
+// 使用例（戻り値を受け取れる）
 export function PaymentConfirmButton({ amount, onPay }: Props) {
-  const { t }          = useTranslation();
-  const secureConfirm  = useSecureConfirm();
+  const { t }         = useTranslation();
+  const secureConfirm = useSecureConfirm();
 
   const handlePress = async () => {
     try {
-      await secureConfirm(
+      const txId = await secureConfirm(
         () => onPay(),
         { reason: `${formatPrice(amount, 'JPY')} の支払いを実行します` },
       );
-      notify.success(t('payment.success'));
+      notify.success(t('payment.success', { txId }));
     } catch (err) {
       if ((err as Error).message === 'cancelled') return;
       notify.error(t('payment.error'));
@@ -299,41 +427,48 @@ export function PaymentConfirmButton({ amount, onPay }: Props) {
 
 ---
 
-## 4. 設定画面の実装
+## 5. 設定画面の実装
 
 ```tsx
 // features/settings/components/BiometricSettingRow.tsx
 export function BiometricSettingRow() {
-  const { t }                     = useTranslation();
-  const { isEnabled, setEnabled } = useAppLockStore();
-  const [capability, setCapability] = useState<BiometricCapability>('none');
+  const { t }                             = useTranslation();
+  const { isEnabled, setEnabled }         = useAppLockStore();
+  const [capability, setCapability]       = useState<BiometricCapability>('none');
+  const [isLoading, setIsLoading]         = useState(true);
 
   useEffect(() => {
-    biometricService.getCapability().then(setCapability);
+    biometricService.getCapability().then((cap) => {
+      setCapability(cap);
+      setIsLoading(false);
+    });
   }, []);
 
-  // 生体認証が使えない端末では設定を表示しない
-  if (capability === 'none') return null;
+  // ローディング中・生体認証非対応端末では表示しない
+  if (isLoading || capability === 'none') return null;
 
-  const biometricLabel = {
+  const biometricLabel: Record<BiometricCapability, string> = {
     facial:      'Face ID',
     fingerprint: 'Touch ID / 指紋認証',
     iris:        '虹彩認証',
     none:        '',
-  }[capability];
+  };
+
+  const label = biometricLabel[capability];
 
   const handleToggle = async (nextValue: boolean) => {
     if (nextValue) {
       // 有効化前に一度認証して意思確認
       const result = await biometricService.authenticate({
-        reason: `${biometricLabel} でアプリをロックします`,
+        reason: `${label} でアプリをロックします`,
       });
       if (result !== 'success') return;
     }
     await setEnabled(nextValue);
-    notify.success(nextValue
-      ? `${biometricLabel} ロックを有効にしました`
-      : 'ロックを無効にしました',
+    notify.success(
+      nextValue
+        ? t('biometricSetting.enabled',  { label })
+        : t('biometricSetting.disabled'),
     );
   };
 
@@ -341,7 +476,7 @@ export function BiometricSettingRow() {
     <View className="flex-row items-center justify-between py-4">
       <View className="flex-1 mr-4">
         <Text className="text-body-md text-content-primary">
-          {biometricLabel} ロック
+          {label} ロック
         </Text>
         <Text className="text-body-sm text-content-secondary">
           バックグラウンド復帰時に認証を要求します
@@ -349,7 +484,7 @@ export function BiometricSettingRow() {
       </View>
       <Switch
         value={isEnabled}
-        label={`${biometricLabel} ロック`}
+        label={`${label} ロック`}
         onChange={handleToggle}
       />
     </View>
@@ -359,35 +494,170 @@ export function BiometricSettingRow() {
 
 ---
 
-## 5. テスト実装規約
+## 6. テスト実装規約
+
+### `appLockStore` のテスト
 
 ```ts
 // src/stores/__tests__/appLockStore.test.ts
 jest.mock('expo-secure-store');
-import * as SecureStore from 'expo-secure-store';
+import * as SecureStore    from 'expo-secure-store';
 import { useAppLockStore } from '@/stores/appLockStore';
 
-describe('checkShouldLock', () => {
-  test('ロックが無効なら false を返す', async () => {
-    (SecureStore.getItemAsync as jest.Mock).mockResolvedValue('false');
-    expect(await useAppLockStore.getState().checkShouldLock()).toBe(false);
+beforeEach(() => {
+  useAppLockStore.setState({
+    isLocked:      false,
+    isEnabled:     false,
+    _lastActiveAt: null,
+    lockTimeoutMs: 1000 * 60 * 5,
+  });
+  jest.clearAllMocks();
+});
+
+describe('initialize', () => {
+  test('SecureStore が null（未設定）なら isEnabled は false', async () => {
+    (SecureStore.getItemAsync as jest.Mock).mockResolvedValue(null);
+    await useAppLockStore.getState().initialize();
+    expect(useAppLockStore.getState().isEnabled).toBe(false);
   });
 
-  test('最終アクティブから 5 分超で true を返す', async () => {
-    (SecureStore.getItemAsync as jest.Mock).mockImplementation((key) => {
-      if (key === 'biometric_lock_enabled') return Promise.resolve('true');
-      if (key === 'last_active_at')
-        return Promise.resolve(String(Date.now() - 1000 * 60 * 6)); // 6 分前
-      return Promise.resolve(null);
-    });
-    expect(await useAppLockStore.getState().checkShouldLock()).toBe(true);
+  test('SecureStore が "true" なら isEnabled は true', async () => {
+    (SecureStore.getItemAsync as jest.Mock).mockResolvedValue('true');
+    await useAppLockStore.getState().initialize();
+    expect(useAppLockStore.getState().isEnabled).toBe(true);
   });
+});
+
+describe('checkShouldLock', () => {
+  test('ロックが無効なら false を返す', () => {
+    useAppLockStore.setState({ isEnabled: false });
+    expect(useAppLockStore.getState().checkShouldLock()).toBe(false);
+  });
+
+  test('最終アクティブ未設定なら true を返す', () => {
+    useAppLockStore.setState({ isEnabled: true, _lastActiveAt: null });
+    expect(useAppLockStore.getState().checkShouldLock()).toBe(true);
+  });
+
+  test('タイムアウト未経過なら false を返す', () => {
+    useAppLockStore.setState({
+      isEnabled:     true,
+      _lastActiveAt: new Date(Date.now() - 1000 * 60 * 4), // 4 分前
+    });
+    expect(useAppLockStore.getState().checkShouldLock()).toBe(false);
+  });
+
+  test('タイムアウト超過で true を返す', () => {
+    useAppLockStore.setState({
+      isEnabled:     true,
+      _lastActiveAt: new Date(Date.now() - 1000 * 60 * 6), // 6 分前
+    });
+    expect(useAppLockStore.getState().checkShouldLock()).toBe(true);
+  });
+
+  test('lockTimeoutMs を変更すると判定に反映される', () => {
+    useAppLockStore.setState({
+      isEnabled:     true,
+      lockTimeoutMs: 1000 * 30,                            // 30 秒
+      _lastActiveAt: new Date(Date.now() - 1000 * 60),     // 1 分前
+    });
+    expect(useAppLockStore.getState().checkShouldLock()).toBe(true);
+  });
+});
+```
+
+### `AppLockScreen` のテスト
+
+```tsx
+// src/components/providers/__tests__/AppLockScreen.test.tsx
+import { render, act, screen } from '@testing-library/react-native';
+import { biometricService }    from '@/lib/permissions/biometricService';
+import { useAppLockStore }     from '@/stores/appLockStore';
+import { AppLockScreen }       from '../AppLockScreen';
+
+jest.mock('@/lib/permissions/biometricService');
+
+beforeEach(() => {
+  useAppLockStore.setState({ isLocked: true });
+  (biometricService.getCapability as jest.Mock).mockResolvedValue('facial');
+});
+
+test('success: unlock が呼ばれる', async () => {
+  (biometricService.authenticate as jest.Mock).mockResolvedValue('success');
+  await act(async () => { render(<AppLockScreen />); });
+  expect(useAppLockStore.getState().isLocked).toBe(false);
+});
+
+test('lockout: リトライボタンが非表示になる', async () => {
+  (biometricService.authenticate as jest.Mock).mockResolvedValue('lockout');
+  await act(async () => { render(<AppLockScreen />); });
+  expect(screen.queryByRole('button')).toBeNull();
+});
+
+test('failed: エラーメッセージが表示されリトライボタンが残る', async () => {
+  (biometricService.authenticate as jest.Mock).mockResolvedValue('failed');
+  await act(async () => { render(<AppLockScreen />); });
+  expect(screen.getByRole('alert')).toBeTruthy();
+  expect(screen.getByRole('button')).toBeTruthy();
+});
+
+test('capability none: 即座に unlock が呼ばれる', async () => {
+  (biometricService.getCapability as jest.Mock).mockResolvedValue('none');
+  await act(async () => { render(<AppLockScreen />); });
+  expect(useAppLockStore.getState().isLocked).toBe(false);
+});
+
+test('予期しない例外: エラーメッセージが表示されリトライボタンが残る', async () => {
+  (biometricService.authenticate as jest.Mock).mockRejectedValue(new Error('unexpected'));
+  await act(async () => { render(<AppLockScreen />); });
+  expect(screen.getByRole('alert')).toBeTruthy();
+  expect(screen.getByRole('button')).toBeTruthy();
+});
+```
+
+### `useSecureConfirm` のテスト
+
+```ts
+// features/payment/hooks/__tests__/useSecureConfirm.test.ts
+import { renderHook }       from '@testing-library/react-hooks';
+import { biometricService } from '@/lib/permissions/biometricService';
+import { useSecureConfirm } from '../useSecureConfirm';
+
+jest.mock('@/lib/permissions/biometricService');
+
+test('success: operation の戻り値が返る', async () => {
+  (biometricService.getCapability  as jest.Mock).mockResolvedValue('facial');
+  (biometricService.authenticate   as jest.Mock).mockResolvedValue('success');
+  const { result } = renderHook(() => useSecureConfirm());
+  const value = await result.current(() => Promise.resolve('tx_123'));
+  expect(value).toBe('tx_123');
+});
+
+test('cancelled: Error("cancelled") を throw する', async () => {
+  (biometricService.getCapability  as jest.Mock).mockResolvedValue('facial');
+  (biometricService.authenticate   as jest.Mock).mockResolvedValue('cancelled');
+  const { result } = renderHook(() => useSecureConfirm());
+  await expect(result.current(() => Promise.resolve())).rejects.toThrow('cancelled');
+});
+
+test('failed: Error("authentication_failed") を throw する', async () => {
+  (biometricService.getCapability  as jest.Mock).mockResolvedValue('facial');
+  (biometricService.authenticate   as jest.Mock).mockResolvedValue('failed');
+  const { result } = renderHook(() => useSecureConfirm());
+  await expect(result.current(() => Promise.resolve())).rejects.toThrow('authentication_failed');
+});
+
+test('capability none: Dialog フォールバックが呼ばれる', async () => {
+  (biometricService.getCapability as jest.Mock).mockResolvedValue('none');
+  // notify.dialog のモックは省略。呼び出し回数を assert する
+  const { result } = renderHook(() => useSecureConfirm());
+  // Dialog の onConfirm が呼ばれたケースは統合テストでカバーする
 });
 ```
 
 ---
 
-## 6. よくある実装ミスと対策
+## 7. よくある実装ミスと対策
 
 <table>
   <thead>
@@ -416,14 +686,34 @@ describe('checkShouldLock', () => {
     <tr>
       <td><code>lockout</code> 後にリトライを許可する</td>
       <td>OS のロックアウトを回避できてしまう</td>
-      <td><code>lockout</code> は <code>false</code> → 時間経過後に再試行を案内</td>
+      <td><code>locked_out</code> 状態ではリトライボタンを非表示にし OS に委ねる</td>
+    </tr>
+    <tr>
+      <td><code>last_active_at</code> を SecureStore に保存する</td>
+      <td>AppState 変化のたびにキーチェーン I/O が発生しブロッキングと断片化を招く</td>
+      <td>メモリ上の <code>Date</code> オブジェクトで管理する</td>
+    </tr>
+    <tr>
+      <td><code>handleAuthenticate</code> に try/catch がない</td>
+      <td>予期しない例外でロック画面がフリーズしアプリが操作不能になる</td>
+      <td>全パスを try/catch で包み、未分類例外は <code>error</code> 状態として扱う</td>
+    </tr>
+    <tr>
+      <td><code>useSecureConfirm</code> の <code>operation</code> を <code>void</code> 固定にする</td>
+      <td>決済トランザクション ID 等の戻り値を呼び出し元に返せない</td>
+      <td>ジェネリクス <code>&lt;T&gt;</code> で <code>Promise&lt;T&gt;</code> を返す</td>
+    </tr>
+    <tr>
+      <td>ロックタイムアウトをハードコードする</td>
+      <td>業務要件（30 秒）と一般要件（15 分）に対応できない</td>
+      <td><code>setLockTimeout(ms)</code> で上書き可能にする</td>
     </tr>
   </tbody>
 </table>
 
 ---
 
-## 7. 変更履歴
+## 8. 変更履歴
 
 <table>
   <thead>
@@ -434,6 +724,16 @@ describe('checkShouldLock', () => {
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td>2026-04</td>
+      <td>
+        biometricService 型定義追加 / Android 差異記載 /
+        last_active_at をメモリ管理に変更 / AppLockScreen に try/catch 追加 /
+        useSecureConfirm をジェネリクス化 / lockTimeoutMs を可変化 /
+        テストケース大幅拡充
+      </td>
+      <td>—</td>
+    </tr>
     <tr>
       <td>2026-03</td>
       <td>初版作成</td>
