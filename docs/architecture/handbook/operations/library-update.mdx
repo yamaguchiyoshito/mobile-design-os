@@ -1,0 +1,1230 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Operations/Library Update" />
+
+# ライブラリ更新運用ガイド（GitLab CE 版）
+
+> **ステータス**: `APPROVED`  
+> **対象**: React Native / Expo プロジェクトのライブラリ更新全般  
+> **前提**: GitLab Community Edition（商用機能・Ultimate/Premium 機能を使わない）
+
+---
+
+## 0. 用語定義
+
+本ドキュメントでは [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) に準拠した要件レベルを使用する。
+
+| 表記 | 意味 |
+|------|------|
+| 🔴 **MUST** | 必須。違反はプロセス違反として扱う |
+| 🟡 **SHOULD** | 推奨。合理的な理由がある場合のみ省略可 |
+| 🟢 **MAY** | 任意。チームの判断に委ねる |
+
+追記・変更時はこの基準に従うこと。
+
+---
+
+## 1. 方針
+
+### なぜ更新を運用化するか
+
+放置されたライブラリは 3 つのリスクを生む。
+
+<table>
+  <thead>
+    <tr>
+      <th>リスク</th>
+      <th>具体例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>セキュリティ脆弱性</strong></td>
+      <td>既知の CVE が未修正のまま本番稼働する</td>
+    </tr>
+    <tr>
+      <td><strong>Expo SDK 非互換</strong></td>
+      <td>SDK メジャーアップデート時に依存が一括で壊れる</td>
+    </tr>
+    <tr>
+      <td><strong>更新コストの増大</strong></td>
+      <td>バージョン差が広がるほど移行コストが指数的に増える</td>
+    </tr>
+  </tbody>
+</table>
+
+### 商用機能を使わない前提での代替手段
+
+<table>
+  <thead>
+    <tr>
+      <th>GitLab Ultimate 機能</th>
+      <th>CE での代替</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Dependency Scanning（SAST）</td>
+      <td><code>pnpm audit</code> + <code>trivy</code></td>
+    </tr>
+    <tr>
+      <td>Auto DevOps</td>
+      <td>手動 <code>.gitlab-ci.yml</code></td>
+    </tr>
+    <tr>
+      <td>Security Dashboards</td>
+      <td>MR コメント + 定期 Issue</td>
+    </tr>
+    <tr>
+      <td>Dependency List</td>
+      <td><code>pnpm list --json</code> + カスタムスクリプト</td>
+    </tr>
+  </tbody>
+</table>
+
+### 更新の 3 分類
+
+```
+更新種別
+  ├─ 🟢 Patch（x.y.Z）   → 自動化対象。CI が通れば即マージ
+  ├─ 🟡 Minor（x.Y.z）   → 半自動化。CI + 手動動作確認でマージ
+  └─ 🔴 Major（X.y.z）   → 手動対応。専用ブランチ・段階的検証
+```
+
+> **注意**: `@types/*` パッケージは semver 上 Patch に見えても型定義の破壊的変更を含む場合がある。  
+> 🔴 **MUST**: `@types/*` は semver に関わらず常に **Minor 更新フロー** で扱う。
+
+---
+
+## 2. 更新フロー全体像
+
+```
+┌──────────────────────────────────────────────────────┐
+│  週次スケジュールパイプライン（毎週月曜 09:00）        │
+│  [Section 14: weekly-scan ジョブ]                    │
+│                                                      │
+│  1. pnpm outdated → 更新候補リスト生成               │
+│  2. pnpm audit   → 脆弱性スキャン                    │
+│  3. Expo SDK 互換チェック                             │
+│  4. 結果を GitLab Issue に自動作成                   │
+└──────────────────────────────────────────────────────┘
+         ↓ Issue を確認・優先度付け
+┌──────────────────────────────────────────────────────┐
+│  更新ブランチ作成（種別ごと）                          │
+│                                                      │
+│  deps/patch-YYYY-MM-DD   ← patch をまとめて更新     │
+│  deps/minor-[pkg-name]   ← minor を 1 パッケージずつ │
+│  deps/major-[pkg-name]   ← major は個別ブランチ      │
+└──────────────────────────────────────────────────────┘
+         ↓ MR 作成 → CI パイプライン実行
+┌──────────────────────────────────────────────────────┐
+│  CI 検証ゲート                                        │
+│  [Section 14: MR 時ジョブ群]                         │
+│                                                      │
+│  typecheck → lint → unit test → storybook test      │
+│  → bundle size check → pnpm audit（再スキャン）      │
+└──────────────────────────────────────────────────────┘
+         ↓ 全ゲート Pass
+┌──────────────────────────────────────────────────────┐
+│  マージ判断                                           │
+│  patch → CI Pass のみでマージ可                      │
+│  minor → CI Pass + 担当者による動作確認              │
+│  major → CI Pass + チームレビュー + 段階的 rollout   │
+└──────────────────────────────────────────────────────┘
+```
+
+> CI ジョブの詳細定義は **Section 14** に集約している。本フローと Section 14 の  
+> `stages` 定義は一対一で対応する。変更時は両方を同時に更新すること。
+
+---
+
+## 3. 週次スキャンパイプライン
+
+### GitLab CI スケジュール設定
+
+GitLab CE の **Scheduled Pipelines**（CI/CD → Schedules）で設定する。
+コスト不要・追加ツール不要で週次実行を実現できる。
+
+```
+Cron: 0 9 * * 1   （毎週月曜 09:00 UTC）
+Branch: main
+Variable: PIPELINE_TYPE=weekly_scan
+```
+
+### スキャンジョブ定義
+
+スキャンジョブの完全な yaml 定義は **Section 14 の `weekly-scan`** を参照。  
+以下はスキャンスクリプトのロジック説明。
+
+```yaml
+# スキャン処理の概要（完全版は Section 14）
+script:
+  - pnpm outdated --format json > /tmp/outdated.json 2>/dev/null || true
+    # pnpm outdated は更新候補がある場合に exit 1 を返すため || true が必須
+
+  - pnpm audit --json > /tmp/audit.json 2>/dev/null || true
+    # pnpm audit は脆弱性検出時に exit 1 を返すため || true が必須
+    # HIGH/CRITICAL の判定はスクリプト内で行う
+
+  - npx expo-doctor >> /tmp/expo-doctor.txt 2>&1 || true
+  - node scripts/ci/generate-update-report.js
+  - node scripts/ci/create-gitlab-issue.js
+
+  # HIGH/CRITICAL が 1 件以上あればパイプラインを fail させる
+  - |
+    HIGH_COUNT=$(node -e "
+      const d = JSON.parse(require('fs').readFileSync('/tmp/audit.json','utf8'));
+      const n = Object.values(d.vulnerabilities || {})
+        .filter(v => ['high','critical'].includes(v.severity)).length;
+      process.stdout.write(String(n));
+    ")
+    [ "$HIGH_COUNT" -gt 0 ] && exit 1 || true
+```
+
+---
+
+## 4. 共通 GitLab API モジュール
+
+Section 5・12 のスクリプトが共通で使う API クライアント。  
+🔴 **MUST**: `gitlab.com` にハードコードせず `CI_SERVER_URL` から取得する。  
+オンプレ GitLab CE 環境ではドメインが異なるため、環境変数に依存しない実装は即死する。
+
+```js
+// scripts/ci/gitlab-api.js
+const https = require('https');
+const http  = require('http');
+const { URL } = require('url');
+
+const {
+  GITLAB_TOKEN,
+  CI_SERVER_URL = 'https://gitlab.com',  // GitLab が自動注入。オンプレでも動作する
+  CI_PROJECT_ID,
+} = process.env;
+
+/**
+ * GitLab REST API v4 リクエスト
+ * @param {'GET'|'POST'|'DELETE'} method
+ * @param {string} path   - /projects/:id/issues 等
+ * @param {object|null} body
+ * @returns {Promise<any>}
+ */
+function apiRequest(method, path, body = null) {
+  return new Promise((resolve, reject) => {
+    const base    = new URL(CI_SERVER_URL);
+    const isHttps = base.protocol === 'https:';
+    const adapter = isHttps ? https : http;
+    const data    = body ? JSON.stringify(body) : null;
+
+    const req = adapter.request(
+      {
+        hostname: base.hostname,
+        port:     base.port || (isHttps ? 443 : 80),
+        path:     `/api/v4${path}`,
+        method,
+        headers: {
+          'PRIVATE-TOKEN': GITLAB_TOKEN,
+          'Content-Type':  'application/json',
+          ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}),
+        },
+      },
+      (res) => {
+        let raw = '';
+        res.on('data', (chunk) => (raw += chunk));
+        res.on('end', () => {
+          try { resolve(JSON.parse(raw)); }
+          catch { resolve(raw); }
+        });
+      },
+    );
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+module.exports = { apiRequest, CI_PROJECT_ID };
+```
+
+---
+
+## 5. スキャンレポート生成スクリプト
+
+```js
+// scripts/ci/generate-update-report.js
+const fs   = require('fs');
+
+const outdated = JSON.parse(fs.readFileSync('/tmp/outdated.json', 'utf8'));
+const audit    = JSON.parse(fs.readFileSync('/tmp/audit.json',    'utf8'));
+
+// ─── 更新候補を 3 分類 ───────────────────────────────────────────────────
+
+const patches = [];
+const minors  = [];
+const majors  = [];
+
+for (const [pkg, info] of Object.entries(outdated)) {
+  const current = info.current ?? '';
+  const latest  = info.latest  ?? '';
+  if (!current || !latest || current === latest) continue;
+
+  const [curMajor, curMinor] = current.replace(/^[^0-9]/, '').split('.').map(Number);
+  const [latMajor, latMinor] = latest.replace(/^[^0-9]/, '').split('.').map(Number);
+
+  // @types/* は常に Minor フロー（Section 1 参照）
+  if (pkg.startsWith('@types/')) {
+    minors.push({ pkg, current, latest, note: '@types/* → Minor 必須' });
+  } else if (latMajor > curMajor) {
+    majors.push({ pkg, current, latest });
+  } else if (latMinor > curMinor) {
+    minors.push({ pkg, current, latest });
+  } else {
+    patches.push({ pkg, current, latest });
+  }
+}
+
+// ─── 脆弱性リスト ─────────────────────────────────────────────────────────
+
+const vulns = Object.entries(audit.vulnerabilities ?? {}).map(([pkg, v]) => ({
+  pkg,
+  severity: v.severity,
+  title:    v.via?.[0]?.title ?? v.via?.[0] ?? '—',
+  url:      v.via?.[0]?.url   ?? '',
+  fixAvailable: !!v.fixAvailable,
+}));
+
+// ─── Markdown レポート生成 ────────────────────────────────────────────────
+
+const date = new Date().toISOString().slice(0, 10);
+
+const report = `# ライブラリ更新レポート ${date}
+
+## サマリ
+
+| 種別 | 件数 |
+|------|------|
+| 🔴 Major | ${majors.length} |
+| 🟡 Minor | ${minors.length} |
+| 🟢 Patch | ${patches.length} |
+| ⚠️ 脆弱性（HIGH/CRITICAL）| ${vulns.filter(v => ['high','critical'].includes(v.severity)).length} |
+
+---
+
+## 🔴 Major 更新（要チームレビュー）
+
+${majors.length === 0 ? 'なし' : majors.map(p =>
+  `- \`${p.pkg}\`: ${p.current} → **${p.latest}**`
+).join('\n')}
+
+## 🟡 Minor 更新（要動作確認）
+
+${minors.length === 0 ? 'なし' : minors.map(p =>
+  `- \`${p.pkg}\`: ${p.current} → ${p.latest}${p.note ? `  _(${p.note})_` : ''}`
+).join('\n')}
+
+## 🟢 Patch 更新（CI Pass で自動マージ可）
+
+${patches.length === 0 ? 'なし' : patches.map(p =>
+  `- \`${p.pkg}\`: ${p.current} → ${p.latest}`
+).join('\n')}
+
+---
+
+## ⚠️ 脆弱性
+
+${vulns.length === 0 ? 'なし' : vulns.map(v =>
+  `- **[${v.severity.toUpperCase()}]** \`${v.pkg}\` — ${v.title}` +
+  `${v.url ? ` ([詳細](${v.url}))` : ''}` +
+  `${v.fixAvailable ? '' : ' ⚠️ **修正バージョンなし**'}`
+).join('\n')}
+
+---
+
+> 生成: ${new Date().toISOString()}  
+> 対応手順: \`Architecture/Handbook/10_Library_Update\` を参照
+`;
+
+fs.mkdirSync('reports', { recursive: true });
+fs.writeFileSync('reports/update-report.md', report);
+fs.writeFileSync('reports/outdated.json', JSON.stringify({ patches, minors, majors }, null, 2));
+console.log('Report generated: reports/update-report.md');
+```
+
+---
+
+## 6. GitLab Issue 自動作成スクリプト
+
+GitLab CE の REST API（v4）を使用する。追加ライセンス不要。
+
+```js
+// scripts/ci/create-gitlab-issue.js
+const fs = require('fs');
+const { apiRequest, CI_PROJECT_ID } = require('./gitlab-api');  // 共通モジュール
+
+const { GITLAB_TOKEN } = process.env;
+
+if (!GITLAB_TOKEN) {
+  console.log('GITLAB_TOKEN not set. Skipping issue creation.');
+  process.exit(0);
+}
+
+const report   = fs.readFileSync('reports/update-report.md', 'utf8');
+const outdated = JSON.parse(fs.readFileSync('reports/outdated.json', 'utf8'));
+const audit    = JSON.parse(fs.readFileSync('/tmp/audit.json', 'utf8'));
+
+const highVulns = Object.values(audit.vulnerabilities ?? {})
+  .filter(v => ['high', 'critical'].includes(v.severity));
+
+const date    = new Date().toISOString().slice(0, 10);
+const hasHigh = highVulns.length > 0;
+
+const labels = ['dependencies'];
+if (hasHigh)                         labels.push('priority::high', 'security');
+else if (outdated.majors.length > 0) labels.push('priority::medium');
+else                                 labels.push('priority::low');
+
+const title = hasHigh
+  ? `🔴 [緊急] 脆弱性検出 ${date} — ${highVulns.length} 件の HIGH/CRITICAL`
+  : `📦 ライブラリ更新候補 ${date}`;
+
+async function main() {
+  // 当日の依存関係 Issue が既にあれば skip
+  const existing = await apiRequest(
+    'GET',
+    `/projects/${CI_PROJECT_ID}/issues?labels=dependencies&created_after=${date}T00:00:00Z&state=opened`,
+  );
+  if (Array.isArray(existing) && existing.length > 0) {
+    console.log(`Issue already exists for ${date}. Skipping.`);
+    return;
+  }
+
+  const issue = await apiRequest(
+    'POST',
+    `/projects/${CI_PROJECT_ID}/issues`,
+    {
+      title,
+      description: report,
+      labels:      labels.join(','),
+      due_date:    hasHigh ? date : undefined,
+    },
+  );
+
+  console.log(`Issue created: ${issue.web_url}`);
+}
+
+main().catch((err) => {
+  console.error('Failed to create issue:', err);
+  // Issue 作成失敗はパイプライン全体を止めない
+  process.exit(0);
+});
+```
+
+### CI/CD Variables 設定
+
+GitLab CE の「Settings → CI/CD → Variables」で登録する。
+
+<table>
+  <thead>
+    <tr>
+      <th>変数名</th>
+      <th>値</th>
+      <th>Masked</th>
+      <th>Protected</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>GITLAB_TOKEN</code></td>
+      <td>Personal Access Token（<code>api</code> スコープ）</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST**: `GITLAB_TOKEN` は Personal Access Token（PAT）を使う。パスワード直書き禁止  
+🟡 **SHOULD**: PAT の有効期限は 90 日以内に設定する  
+🟡 **SHOULD**: PAT の期限切れを週次スキャンで検知する（下記）
+
+```js
+// scripts/ci/check-pat-expiry.js — 週次スキャンに追加
+// PAT の残日数を取得し、14 日以内なら Issue を起票する
+
+const { apiRequest } = require('./gitlab-api');
+
+async function main() {
+  const token = await apiRequest('GET', '/personal_access_tokens/self');
+  if (!token.expires_at) return;  // 無期限トークンはスキップ
+
+  const daysLeft = Math.ceil(
+    (new Date(token.expires_at) - Date.now()) / (1000 * 60 * 60 * 24)
+  );
+
+  if (daysLeft <= 14) {
+    console.warn(`[WARNING] GITLAB_TOKEN expires in ${daysLeft} days (${token.expires_at})`);
+    // 週次レポートの Issue に注記を追記する（create-gitlab-issue.js 側で参照）
+    process.env.PAT_EXPIRY_WARNING = `GITLAB_TOKEN が ${daysLeft} 日後に期限切れになります。ローテーションしてください。`;
+  }
+}
+
+main().catch(console.error);
+```
+
+---
+
+## 7. Patch 更新の手順
+
+CI が通れば即マージ可能な最低リスクの更新。週次で一括処理する。
+
+### 更新ブランチ作成
+
+```bash
+# scripts/update-patches.sh
+#!/bin/bash
+set -euo pipefail
+
+DATE=$(date +%Y-%m-%d)
+BRANCH="deps/patch-${DATE}"
+
+git checkout -b "$BRANCH"
+
+pnpm update --include-workspace-root 2>/dev/null || true
+
+git diff --stat
+
+git add pnpm-lock.yaml package.json
+git commit -m "chore(deps): patch updates ${DATE}
+
+$(pnpm outdated 2>/dev/null | head -30 || echo 'See MR for details')"
+
+git push origin "$BRANCH"
+```
+
+### MR テンプレート（patch 用）
+
+```markdown
+<!-- .gitlab/merge_request_templates/deps-patch.md -->
+
+## 概要
+週次 Patch 更新（自動生成）
+
+## 更新内容
+<!-- pnpm outdated の出力を貼り付け -->
+
+## チェックリスト
+- [ ] CI 全ゲート Pass
+- [ ] bundle size が +50KB 以内
+- [ ] `pnpm audit` で HIGH/CRITICAL なし
+- [ ] `@types/*` パッケージが含まれていないことを確認（含まれる場合は Minor フローへ切り出す）
+
+## マージ条件
+CI Pass のみ。追加レビュー不要。
+```
+
+🟢 **MAY**: Patch 更新は週 1 回まとめて MR を作成する（1 パッケージずつ MR を作らない）  
+🟡 **SHOULD**: Patch の MR は CI Pass 後 24h 以内にマージする
+
+---
+
+## 8. Minor 更新の手順
+
+API の追加・変更を含む可能性があるため、1 パッケージずつ個別に更新する。  
+`@types/*` パッケージは semver 問わずここで扱う（Section 1 参照）。
+
+### 更新ブランチ作成
+
+```bash
+# 例: @tanstack/react-query を minor 更新
+PACKAGE="@tanstack/react-query"
+SAFE_NAME=$(echo "$PACKAGE" | sed 's/[@/]/-/g' | sed 's/^-//')
+BRANCH="deps/minor-${SAFE_NAME}"
+
+git checkout -b "$BRANCH"
+
+pnpm update "$PACKAGE" --include-workspace-root
+
+git add pnpm-lock.yaml package.json
+git commit -m "chore(deps): update ${PACKAGE} to $(node -e "
+  const pkg = require('./package.json');
+  const dep = pkg.dependencies?.['${PACKAGE}'] || pkg.devDependencies?.['${PACKAGE}'];
+  console.log(dep);
+")"
+
+git push origin "$BRANCH"
+```
+
+### Minor 更新のチェックリスト
+
+```markdown
+<!-- .gitlab/merge_request_templates/deps-minor.md -->
+
+## パッケージ
+- パッケージ名:
+- 更新前バージョン:
+- 更新後バージョン:
+- Changelog URL:
+
+## 破壊的変更の確認
+- [ ] Changelog / Release Notes を確認した
+- [ ] 型定義の変更がないことを確認した（または変更に対応した）
+- [ ] Deprecated API を使用していないことを確認した
+
+## テスト結果
+- [ ] CI 全ゲート Pass
+- [ ] 関連する Feature の動作確認（実機 or Simulator）
+- [ ] Storybook で関連コンポーネントの表示確認
+
+## 影響範囲
+<!-- 更新したパッケージを使っている Feature / Component を列挙 -->
+```
+
+🟡 **SHOULD**: Minor 更新は 1 MR 1 パッケージを原則にする  
+🟡 **SHOULD**: Changelog を必ず読み、影響箇所を MR の説明に記載する
+
+---
+
+## 9. Major 更新の手順
+
+Major 更新は計画的に実施する。特に Expo SDK と React Native の Major 更新は
+依存関係への波及が大きいため、専用の段階的プロセスを踏む。
+
+### Major 更新の全体ステップ
+
+```
+Step 1: 調査フェーズ（1〜2 日）
+  ├─ Migration Guide の精読
+  ├─ 影響を受けるファイルの洗い出し
+  └─ 更新コスト見積もり → チームで判断
+
+Step 2: 専用ブランチで実施（deps/major-* で管理）
+  ├─ パッケージ更新
+  ├─ Breaking Changes への対応
+  └─ 型エラー・lint エラーの解消
+
+Step 3: CI 検証
+  ├─ 全テスト Pass
+  ├─ bundle size チェック
+  └─ Storybook ビルド確認
+
+Step 4: 実機検証
+  ├─ EAS Dev Build を作成して実機で確認
+  ├─ クリティカルジャーニーの手動確認
+  └─ A11y 確認
+
+Step 5: マージ・段階的 rollout
+  ├─ チームレビュー（最低 1 名）
+  ├─ EAS Update で internal チャンネルに先行配信
+  ├─ 問題なければ staging → production チャンネルへ昇格
+  └─ 重大な問題が発生した場合は EAS Update で即時ロールバック
+```
+
+> **段階的 rollout の実現手段**: EAS Update のチャンネル機能を使う。  
+> `internal → staging → production` の順にチャンネルを昇格させる。  
+> Feature Flag による制御が必要な場合は別途 Feature Flag ドキュメントを参照。
+
+### Expo SDK Major 更新専用手順
+
+```bash
+# ✅ 正解 — expo upgrade で依存関係を一括更新
+npx expo upgrade
+
+# ❌ 禁止 — 個別 pnpm update で Expo SDK だけ更新する
+pnpm update expo
+```
+
+```bash
+# Expo SDK 更新後の必須確認コマンド
+npx expo-doctor          # 互換性チェック
+npx expo install --check # ネイティブモジュールのバージョン整合確認
+npx expo install --fix   # 自動修正可能な不整合を修正
+```
+
+🔴 **MUST**: Expo SDK の Major 更新は `expo upgrade` で行い、個別 pnpm update を混在させない  
+🔴 **MUST**: 更新後は必ず `expo-doctor` を実行し、警告を 0 にしてからマージする  
+🟡 **SHOULD**: Expo SDK の Major 更新は EAS Dev Build を作成して実機で検証する
+
+### React Native のバージョン管理方針
+
+React Native のバージョンは **Expo SDK が指定するバージョンに従う**。
+独自のバージョン固定は行わない。
+
+```json
+// ❌ 禁止 — RN バージョンを package.json で独自固定しない
+{
+  "dependencies": {
+    "react-native": "0.75.0"
+  }
+}
+
+// ✅ 正解 — expo install が解決するままにする（package.json に直書きしない）
+```
+
+---
+
+## 10. 脆弱性対応手順
+
+### 優先度と対応期限
+
+<table>
+  <thead>
+    <tr>
+      <th>深刻度</th>
+      <th>対応期限</th>
+      <th>対応方針</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>CRITICAL</strong></td>
+      <td>即日（当日業務内）</td>
+      <td>緊急 MR 作成 → CI Pass → 即マージ</td>
+    </tr>
+    <tr>
+      <td><strong>HIGH</strong></td>
+      <td>3 営業日以内</td>
+      <td>通常 MR フロー + 優先レビュー</td>
+    </tr>
+    <tr>
+      <td><strong>MODERATE</strong></td>
+      <td>次の週次更新サイクル</td>
+      <td>週次 Patch MR に含める</td>
+    </tr>
+    <tr>
+      <td><strong>LOW</strong></td>
+      <td>月次レビューで対応判断</td>
+      <td>バックログに積む</td>
+    </tr>
+  </tbody>
+</table>
+
+### 脆弱性対応フロー
+
+```bash
+# 1. 脆弱性の詳細を確認
+pnpm audit --json | node -e "
+  const d = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+  Object.entries(d.vulnerabilities).forEach(([pkg, v]) => {
+    if (['high','critical'].includes(v.severity)) {
+      console.log(pkg, v.severity, v.fixAvailable);
+    }
+  });
+"
+
+# 2. 自動修正可能か確認
+pnpm audit --fix --dry-run
+
+# 3a. 自動修正可能な場合
+pnpm audit --fix
+git add pnpm-lock.yaml package.json
+git commit -m "fix(security): fix ${severity} vulnerability in ${pkg}"
+
+# 3b. 手動対応が必要な場合（breaking change を伴う修正バージョンへの更新）
+# → Major 更新フロー（Section 9）に従う
+
+# 4. 修正後に再スキャン
+pnpm audit
+```
+
+### 修正不可能な脆弱性への対処
+
+脆弱性は検知されているが修正バージョンが存在しない場合がある。
+
+```json
+// package.json
+{
+  "pnpm": {
+    "overrides": {
+      "vulnerable-transitive-dep": ">=2.0.0"
+    }
+  }
+}
+```
+
+🔴 **MUST**: 脆弱性の抑制（overrides / ignore）は GitLab Issue に以下を記録する  
+- 抑制対象パッケージ名と CVE 番号  
+- 抑制理由（修正バージョン未リリース 等）  
+- 監視期限（最大 90 日）  
+- Issue には `vuln-suppressed` ラベルを付与する
+
+🔴 **MUST**: 週次スキャンは `vuln-suppressed` ラベルの Issue を自動取得し、  
+レポートの「既知・対応待ち」セクションに列挙する（放置の可視化）
+
+```js
+// scripts/ci/generate-update-report.js に追記
+// 抑制済み脆弱性の Issue 一覧を取得してレポートに含める
+const suppressedIssues = await apiRequest(
+  'GET',
+  `/projects/${CI_PROJECT_ID}/issues?labels=vuln-suppressed&state=opened`,
+);
+// レポートに「既知・対応待ち」セクションとして追記する
+```
+
+---
+
+## 11. Expo ネイティブモジュールの更新
+
+Expo SDK に含まれるネイティブモジュール（`expo-camera`, `expo-location` 等）は
+通常の pnpm update ではなく `expo install` で管理する。
+
+```bash
+# ❌ 禁止 — pnpm update で Expo ネイティブモジュールを個別更新
+pnpm update expo-camera
+
+# ✅ 正解 — expo install で Expo SDK 互換バージョンに固定
+npx expo install expo-camera
+
+# 全ネイティブモジュールを Expo SDK 互換バージョンに揃える
+npx expo install --fix
+```
+
+### バージョン整合確認を CI に組み込む
+
+```yaml
+# .gitlab-ci.yml（Section 14 に統合済み）
+expo-doctor:
+  stage: scan
+  script:
+    - npx expo-doctor --non-interactive
+    - npx expo install --check && echo "All versions compatible" || {
+        echo "Version mismatch detected. Run: npx expo install --fix"
+        exit 1
+      }
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+```
+
+🔴 **MUST**: Expo ネイティブモジュールは必ず `expo install` で管理する  
+🔴 **MUST**: `expo-doctor` を MR の CI ゲートに含め、不整合を検知する
+
+---
+
+## 12. bundle size 監視
+
+ライブラリ更新による bundle size の肥大化を CI で検知する。
+
+> **計測対象**: iOS bundle のみ計測する。iOS と Android の bundle size は  
+> tree-shaking 挙動の差異で乖離することがある。重大な懸念がある場合は  
+> `--platform android` でも手動確認すること。
+
+### bundle size チェックスクリプト
+
+```js
+// scripts/ci/check-bundle-size.js
+const { execSync } = require('child_process');
+const fs           = require('fs');
+
+const THRESHOLD_KB = 50;
+
+execSync(`
+  npx react-native bundle \
+    --platform ios \
+    --dev false \
+    --entry-file index.js \
+    --bundle-output /tmp/bundle.js \
+    --assets-dest /tmp/assets
+`, { stdio: 'inherit' });
+
+const currentSizeKB = Math.round(fs.statSync('/tmp/bundle.js').size / 1024);
+
+let previousSizeKB = 0;
+try {
+  previousSizeKB = Number(
+    fs.readFileSync('reports/bundle-size.txt', 'utf8').trim()
+  );
+} catch (_) { /* 初回は存在しない */ }
+
+const diffKB = currentSizeKB - previousSizeKB;
+
+console.log(`Bundle size: ${currentSizeKB} KB`);
+console.log(`Previous:    ${previousSizeKB} KB`);
+console.log(`Diff:        ${diffKB > 0 ? '+' : ''}${diffKB} KB`);
+
+fs.mkdirSync('reports', { recursive: true });
+fs.writeFileSync('reports/bundle-size.txt', String(currentSizeKB));
+
+const summary = `### Bundle Size Report
+| | サイズ |
+|--|------|
+| 今回 | ${currentSizeKB} KB |
+| 前回 | ${previousSizeKB} KB |
+| 差分 | ${diffKB > 0 ? '🔺' : '🔽'} ${diffKB > 0 ? '+' : ''}${diffKB} KB |
+${Math.abs(diffKB) > THRESHOLD_KB
+  ? `\n> ⚠️ 差分が ${THRESHOLD_KB}KB を超えています。追加したライブラリのサイズを確認してください。\n> \`pnpm why [pkg]\` で依存元を確認し、named import への変更を検討してください。`
+  : ''}
+`;
+
+fs.writeFileSync('reports/bundle-size-report.md', summary);
+
+if (diffKB > THRESHOLD_KB) {
+  console.error(`Bundle size increased by ${diffKB}KB (threshold: ${THRESHOLD_KB}KB)`);
+  process.exit(1);
+}
+```
+
+---
+
+## 13. MR へのスキャン結果コメント自動投稿
+
+```js
+// scripts/ci/post-mr-comment.js
+const fs = require('fs');
+const { apiRequest, CI_PROJECT_ID } = require('./gitlab-api');  // 共通モジュール
+
+const {
+  GITLAB_TOKEN,
+  CI_MERGE_REQUEST_IID,
+} = process.env;
+
+if (!CI_MERGE_REQUEST_IID || !GITLAB_TOKEN) {
+  console.log('Not a MR pipeline or token missing. Skipping comment.');
+  process.exit(0);
+}
+
+const sections = [];
+if (fs.existsSync('reports/bundle-size-report.md')) {
+  sections.push(fs.readFileSync('reports/bundle-size-report.md', 'utf8'));
+}
+if (fs.existsSync('reports/audit-summary.md')) {
+  sections.push(fs.readFileSync('reports/audit-summary.md', 'utf8'));
+}
+
+if (sections.length === 0) process.exit(0);
+
+const body = `## 🤖 自動チェック結果\n\n${sections.join('\n\n---\n\n')}`;
+
+async function run() {
+  const comments = await apiRequest(
+    'GET',
+    `/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes?per_page=100`,
+  );
+
+  for (const c of (Array.isArray(comments) ? comments : [])) {
+    if (c.body?.startsWith('## 🤖 自動チェック結果')) {
+      await apiRequest(
+        'DELETE',
+        `/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes/${c.id}`,
+      );
+    }
+  }
+
+  await apiRequest(
+    'POST',
+    `/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes`,
+    { body },
+  );
+
+  console.log('MR comment posted.');
+}
+
+run().catch((err) => {
+  console.error('Failed to post MR comment:', err);
+  process.exit(0);  // コメント投稿失敗はパイプラインを止めない
+});
+```
+
+---
+
+## 14. CI 全体構成（唯一の正）
+
+> **注意**: Section 2 のフロー図と本セクションの `stages` は一対一で対応している。  
+> ジョブを追加・変更する場合は必ず Section 2 のフロー図も同時に更新すること。
+
+```yaml
+# .gitlab-ci.yml
+
+stages:
+  - scan      # typecheck / lint / expo-doctor / audit / weekly-scan
+  - test      # unit-test / storybook-test / bundle-size
+  - report    # post-mr-report / update-bundle-baseline
+
+# ─── 共通ルール定義 ────────────────────────────────────────────────────────
+
+.mr-rules: &mr-rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+.node-base: &node-base
+  image: node:22-alpine
+  before_script:
+    - npm install -g pnpm@9
+    - pnpm install --frozen-lockfile
+
+# ─── MR 時の検証ゲート ─────────────────────────────────────────────────────
+
+typecheck:
+  <<: [*mr-rules, *node-base]
+  stage: scan
+  script: pnpm typecheck
+
+lint:
+  <<: [*mr-rules, *node-base]
+  stage: scan
+  script: pnpm lint
+
+expo-doctor:
+  <<: [*mr-rules, *node-base]
+  stage: scan
+  script:
+    - npx expo-doctor --non-interactive
+    - npx expo install --check && echo "All versions compatible" || {
+        echo "Version mismatch. Run: npx expo install --fix"
+        exit 1
+      }
+
+audit-check:
+  <<: [*mr-rules, *node-base]
+  stage: scan
+  script:
+    - pnpm audit --audit-level=high  # HIGH 以上で fail
+
+unit-test:
+  <<: [*mr-rules, *node-base]
+  stage: test
+  script: pnpm test --ci
+
+storybook-test:
+  <<: [*mr-rules, *node-base]
+  stage: test
+  cache:
+    key: storybook-build-$CI_COMMIT_REF_SLUG
+    paths:
+      - storybook-static/
+    policy: pull-push  # ビルドキャッシュで毎回フルビルドを回避
+  script:
+    - pnpm build:storybook
+    - pnpm test:storybook
+
+bundle-size:
+  <<: [*mr-rules, *node-base]
+  stage: test
+  script:
+    - node scripts/ci/check-bundle-size.js
+  artifacts:
+    paths: [reports/]
+    expire_in: 90 days
+  cache:
+    key: bundle-size-main
+    paths: [reports/bundle-size.txt]
+    policy: pull  # MR では read only
+
+post-mr-report:
+  <<: [*mr-rules, *node-base]
+  stage: report
+  script:
+    - node scripts/ci/post-mr-comment.js
+  when: always  # テスト失敗時もコメントを投稿する
+
+# ─── 週次スキャン（スケジュール実行）──────────────────────────────────────
+
+weekly-scan:
+  <<: *node-base
+  stage: scan
+  rules:
+    - if: '$PIPELINE_TYPE == "weekly_scan"'
+  script:
+    - node scripts/ci/check-pat-expiry.js
+    - pnpm outdated --format json > /tmp/outdated.json 2>/dev/null || true
+    - pnpm audit --json            > /tmp/audit.json    2>/dev/null || true
+    - npx expo-doctor              > /tmp/expo-doctor.txt 2>&1     || true
+    - node scripts/ci/check-expo-release.js
+    - node scripts/ci/generate-update-report.js
+    - node scripts/ci/create-gitlab-issue.js
+    - |
+      HIGH_COUNT=$(node -e "
+        const d = JSON.parse(require('fs').readFileSync('/tmp/audit.json','utf8'));
+        const n = Object.values(d.vulnerabilities || {})
+          .filter(v => ['high','critical'].includes(v.severity)).length;
+        process.stdout.write(String(n));
+      ")
+      [ "$HIGH_COUNT" -gt 0 ] && exit 1 || true
+  artifacts:
+    paths: [reports/]
+    expire_in: 30 days
+
+# ─── main マージ後の bundle size ベースライン更新 ────────────────────────
+
+update-bundle-baseline:
+  <<: *node-base
+  stage: report
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - node scripts/ci/check-bundle-size.js || true  # baseline 書き込みのみ目的
+  cache:
+    key: bundle-size-main
+    paths: [reports/bundle-size.txt]
+    policy: push  # main では write
+```
+
+---
+
+## 15. 更新運用カレンダー
+
+<table>
+  <thead>
+    <tr>
+      <th>頻度</th>
+      <th>タイミング</th>
+      <th>作業内容</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>週次</strong></td>
+      <td>毎週月曜 AM</td>
+      <td>自動スキャン → Issue 確認 → Patch MR 作成</td>
+    </tr>
+    <tr>
+      <td><strong>週次</strong></td>
+      <td>毎週水曜 AM</td>
+      <td>Patch MR のマージ判断（CI Pass 確認）</td>
+    </tr>
+    <tr>
+      <td><strong>月次</strong></td>
+      <td>月初</td>
+      <td>Minor 更新の計画・実施</td>
+    </tr>
+    <tr>
+      <td><strong>四半期</strong></td>
+      <td>Q 初月</td>
+      <td>Major 更新の調査・計画</td>
+    </tr>
+    <tr>
+      <td><strong>随時</strong></td>
+      <td>HIGH/CRITICAL 検出時</td>
+      <td>緊急脆弱性対応</td>
+    </tr>
+    <tr>
+      <td><strong>Expo SDK リリース時</strong></td>
+      <td>公式アナウンス後 2 週間以内</td>
+      <td>Minor: 即対応、Major: 計画立案</td>
+    </tr>
+  </tbody>
+</table>
+
+### Expo SDK リリース監視
+
+```js
+// scripts/ci/check-expo-release.js — 週次スキャンに追加
+
+const https = require('https');
+const { version: currentVersion } = require('../../package.json').dependencies?.expo
+  ? { version: require('../../package.json').dependencies.expo.replace(/[^0-9.]/g, '') }
+  : { version: null };
+
+function getLatestExpoSDKVersion() {
+  return new Promise((resolve, reject) => {
+    https.get('https://registry.npmjs.org/expo/latest', (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try { resolve(JSON.parse(data).version); }
+        catch (e) { reject(e); }
+      });
+    }).on('error', reject);
+  });
+}
+
+// トップレベル await を避けるため async IIFE でラップ
+(async () => {
+  const latestVersion = await getLatestExpoSDKVersion();
+  if (currentVersion && latestVersion !== currentVersion) {
+    console.log(`Expo SDK update available: ${currentVersion} → ${latestVersion}`);
+    process.env.EXPO_UPDATE_AVAILABLE = `${currentVersion} → ${latestVersion}`;
+  }
+})().catch(console.error);
+```
+
+---
+
+## 16. よくあるトラブルと対処
+
+<table>
+  <thead>
+    <tr>
+      <th>症状</th>
+      <th>原因</th>
+      <th>対処</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>pnpm install --frozen-lockfile</code> が CI で失敗</td>
+      <td>lockfile と package.json が乖離</td>
+      <td><code>pnpm install</code> を実行して lockfile を更新してコミット</td>
+    </tr>
+    <tr>
+      <td><code>expo-doctor</code> が警告を出す</td>
+      <td>ネイティブモジュールのバージョン不整合</td>
+      <td><code>npx expo install --fix</code> を実行してコミット</td>
+    </tr>
+    <tr>
+      <td>Patch 更新後に型エラー</td>
+      <td><code>@types/*</code> が含まれていた（Section 1 参照）</td>
+      <td>該当パッケージを Patch MR から切り出し Minor フローで再処理</td>
+    </tr>
+    <tr>
+      <td>bundle size が急増</td>
+      <td>tree-shaking が効かない import を追加した</td>
+      <td><code>pnpm why [pkg]</code> で依存元を確認。named import に変更</td>
+    </tr>
+    <tr>
+      <td>Issue の重複作成</td>
+      <td>スケジュールパイプラインの同日再実行</td>
+      <td>スクリプトの重複チェックが機能しているか確認。<code>vuln-suppressed</code> ラベル確認も忘れずに</td>
+    </tr>
+    <tr>
+      <td><code>pnpm audit</code> の HIGH が修正不可</td>
+      <td>間接依存の脆弱性でパッチがない</td>
+      <td><code>pnpm overrides</code> で安全なバージョンに上書き + <code>vuln-suppressed</code> ラベルで Issue 記録（Section 10）</td>
+    </tr>
+    <tr>
+      <td>CI が <code>gitlab.com</code> に接続できない</td>
+      <td>オンプレ GitLab CE で hostname がハードコードされていた旧実装</td>
+      <td><code>gitlab-api.js</code> が <code>CI_SERVER_URL</code> を参照しているか確認（Section 4）</td>
+    </tr>
+    <tr>
+      <td>GITLAB_TOKEN が期限切れで weekly-scan が失敗</td>
+      <td>PAT ローテーション漏れ</td>
+      <td><code>check-pat-expiry.js</code> が 14 日前に警告 Issue を起票する。Settings → CI/CD → Variables でトークンを更新</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 17. 変更履歴
+
+> **記録基準**: スクリプトのバグ修正・ジョブ定義の変更・運用ポリシーの変更はすべて記録する。  
+> 誤字修正・コメント追記のみの場合は記録不要。
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>2026-04</td>
+      <td>
+        gitlab-api.js を共通モジュールとして切り出し／
+        CI_SERVER_URL 対応（オンプレ GitLab CE 対応）／
+        @types/* を Minor 必須に変更／
+        vuln-suppressed ラベル運用追加／
+        PAT 期限切れ検知スクリプト追加／
+        段階的 rollout を EAS Update チャンネルで明文化／
+        Storybook ビルドキャッシュ追加／
+        Section 0 に RFC 2119 定義追加／
+        変更履歴の記録基準を追加
+      </td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

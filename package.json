@@ -1,0 +1,22 @@
+{
+  "name": "mobile-design-os-w",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "packageManager": "pnpm@10.25.0",
+  "scripts": {
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build -o dist/storybook",
+    "docs:check": "node ./scripts/check-docs.mjs"
+  },
+  "devDependencies": {
+    "@storybook/addon-docs": "^10.3.5",
+    "@storybook/react-vite": "^10.3.5",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "remark-gfm": "^4.0.1",
+    "storybook": "^10.3.5",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.8"
+  }
+}

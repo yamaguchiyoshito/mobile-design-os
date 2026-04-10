@@ -1,0 +1,1203 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Integrations/API Communication" />
+
+# API 通信ガイド
+
+> **ステータス**: `APPROVED`  
+> **対象**: React Native mobile（Expo）アプリの全 API 通信実装
+
+---
+
+## 目次
+
+1. [凡例・制約サマリー](#1-凡例制約サマリー)
+2. [設計方針](#2-設計方針)
+3. [OpenAPI → コード生成パイプライン](#3-openapi--コード生成パイプライン)
+4. [httpClient 詳細実装](#4-httpclient-詳細実装)
+5. [認証・トークン管理](#5-認証トークン管理)
+6. [エラーハンドリング戦略](#6-エラーハンドリング戦略)
+7. [リクエストキャンセル](#7-リクエストキャンセル)
+8. [ファイルアップロード](#8-ファイルアップロード)
+9. [ファイルダウンロード](#9-ファイルダウンロード)
+10. [ページネーション](#10-ページネーション)
+11. [Query Key Factory](#11-query-key-factory)
+12. [オフライン対応](#12-オフライン対応)
+13. [デバッグ・ロギング](#13-デバッグロギング)
+14. [MSW との統合](#14-msw-との統合)
+15. [セキュリティ](#15-セキュリティ)
+16. [テスト実装規約](#16-テスト実装規約)
+17. [変更履歴](#17-変更履歴)
+
+---
+
+## 1. 凡例・制約サマリー
+
+### アイコン凡例
+
+| アイコン | 意味 |
+|---|---|
+| 🔴 **MUST** | 違反するとバグ・セキュリティ事故・CI 失敗を引き起こす。例外なし |
+| 🟡 **SHOULD** | 正当な理由がある場合のみ逸脱可。逸脱時はコメントに理由を記す |
+
+### MUST 一覧（全文を読まなくてもルールを把握できる）
+
+| # | ルール | 参照セクション |
+|---|---|---|
+| M-01 | `src/api/generated/` を手書き編集しない | §3 |
+| M-02 | OpenAPI 仕様変更後は即 `pnpm orval` を実行してコミット | §3 |
+| M-03 | `BASE_URL` が未定義の場合は起動時にアサーションエラーを出す | §4 |
+| M-04 | リフレッシュの並行実行防止に Promise シングルトンを使う | §5 |
+| M-05 | リフレッシュ失敗時は即ログアウトし `/login` へ遷移 | §5 |
+| M-06 | トークンは `expo-secure-store` に保存する（AsyncStorage 禁止） | §5 |
+| M-07 | ファイルアップロードは `expo-file-system` の `createUploadTask` を使う | §8 |
+| M-08 | MSW ハンドラは正常系・異常系（404 / 500 / Network）を必ず用意 | §14 |
+| M-09 | Jest・Storybook web・Expo 開発環境でハンドラを共有する（3 重定義禁止） | §14 |
+| M-10 | `Authorization` ヘッダをログ・Sentry に送らない | §15 |
+| M-11 | 本番ビルドで Reactotron / Flipper 等のデバッグツールを無効化する | §15 |
+
+---
+
+## 2. 設計方針
+
+### 通信層の責務分離
+
+```
+OpenAPI 仕様（SSOT）
+    │  ↓ 自動生成（pnpm orval）
+    │
+Zod スキーマ / TypeScript 型          ← 手書き禁止
+    │  ↓ mutator として注入
+    │
+httpClient（fetch ラッパー）           ← Feature / Screen からの直接呼び出し禁止
+    │  ↓ 生成された hooks に内包
+    │
+API hooks（React Query）
+    │  ↓
+Feature / Screen
+```
+
+### 禁止事項
+
+| 禁止 | 理由 |
+|---|---|
+| `fetch` を Feature / Screen から直接呼ぶ | 認証ヘッダ・エラーハンドリング・ベース URL が散在する |
+| Zod スキーマを手書きする | OpenAPI との乖離が生じ、型とランタイムが別物になる |
+| API レスポンスを型アサーション（`as`）で扱う | ランタイム検証をバイパスし、実行時クラッシュの原因になる |
+| `axios` を新規採用する | Expo / React Native 環境では `fetch` が標準。外来依存を増やさない |
+
+---
+
+## 3. OpenAPI → コード生成パイプライン
+
+### orval 設定
+
+```ts
+// orval.config.ts
+import { defineConfig } from 'orval';
+
+export default defineConfig({
+  api: {
+    input: {
+      target:     './openapi/spec.yaml',
+      validation: true,          // 仕様の整合性チェック
+    },
+    output: {
+      target:  './src/api/generated/endpoints.ts',
+      schemas: './src/api/generated/schemas',
+      client:  'react-query',    // React Query hooks を生成
+      mode:    'split',          // エンドポイントごとにファイル分割
+      override: {
+        mutator: {
+          path: './src/lib/httpClient.ts',
+          name: 'httpClient',    // 独自 httpClient を注入
+        },
+        query: {
+          useQuery:         true,
+          useInfiniteQuery: true,
+          useMutation:      true,
+        },
+      },
+    },
+  },
+});
+```
+
+```bash
+pnpm orval          # spec.yaml から全ファイル再生成
+pnpm orval --watch  # ファイル監視モード（開発時）
+```
+
+### 生成物の構造
+
+```
+src/api/generated/
+  schemas/
+    getUserSchema.ts
+    createOrderSchema.ts
+    ...
+  endpoints/
+    users.ts           ← useGetUser / useCreateUser 等の React Query hooks
+    orders.ts
+    ...
+  index.ts             ← re-export
+```
+
+🔴 **MUST (M-01)**: `src/api/generated/` 配下を手書き編集しない（生成のたびに上書きされる）  
+🔴 **MUST (M-02)**: OpenAPI 仕様を変更したら即 `pnpm orval` を実行してコミットする  
+🟡 **SHOULD**: `pnpm orval` を GitLab CI の lint ステージで実行し、生成差分がないことを確認する
+
+```yaml
+# .gitlab-ci.yml（抜粋）
+check-generated:
+  stage: lint
+  script:
+    - pnpm orval
+    - git diff --exit-code src/api/generated/
+```
+
+### API バージョニング方針
+
+orval の `input.target` を切り替えることで v1 / v2 の並行管理が可能。
+
+```
+openapi/
+  v1/spec.yaml
+  v2/spec.yaml
+
+src/api/generated/
+  v1/
+  v2/
+```
+
+Breaking change が発生した場合は新バージョンのディレクトリを追加し、移行完了後に旧バージョンを削除する。v1 のスキーマを直接修正して v2 の挙動を再現することは禁止。
+
+---
+
+## 4. httpClient 詳細実装
+
+### 環境変数アサーション
+
+```ts
+// src/lib/env.ts — アプリ起動時に必ず import する
+const BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL;
+
+// 🔴 MUST (M-03): 未定義のまま fetch を呼ぶと URL が "undefined/path" になり
+//   デバッグ困難なネットワークエラーになる。起動時に明示的に落とす。
+if (!BASE_URL) {
+  throw new Error(
+    '[env] EXPO_PUBLIC_API_BASE_URL is not defined. ' +
+    'Set it in .env.local or EAS environment variables.',
+  );
+}
+
+export { BASE_URL };
+```
+
+### 全体構成
+
+```ts
+// src/lib/httpClient.ts
+import { Platform }   from 'react-native';
+import Constants      from 'expo-constants';
+import { z }          from 'zod';
+import { BASE_URL }   from '@/lib/env';
+import { getAuthToken, refreshAuthToken } from '@/lib/auth';
+import { clock }      from '@/lib/clock';
+import { idProvider } from '@/lib/idProvider';
+import { logger }     from '@/lib/logger';
+
+const TIMEOUT_MS  = 30_000;
+const MAX_RETRIES = 2;
+
+// ─── エラー型 ──────────────────────────────────────────────────────────────
+
+export class HttpError extends Error {
+  constructor(
+    public readonly status:  number,
+    public readonly path:    string,
+    public readonly body?:   unknown,
+    public readonly traceId: string = '',
+  ) {
+    super(`HTTP ${status}: ${path}`);
+    this.name = 'HttpError';
+  }
+}
+
+export class NetworkError extends Error {
+  constructor(public readonly path: string, cause?: Error) {
+    super(`Network error: ${path}`);
+    this.name  = 'NetworkError';
+    this.cause = cause;
+  }
+}
+
+export class ValidationError extends Error {
+  constructor(
+    public readonly path:   string,
+    public readonly issues: z.ZodIssue[],
+  ) {
+    super(`Validation error: ${path}`);
+    this.name = 'ValidationError';
+  }
+}
+
+// ─── リクエストオプション ────────────────────────────────────────────────
+
+type HttpClientOptions = {
+  signal?:   AbortSignal;
+  skipAuth?: boolean;   // ログイン画面など認証不要エンドポイント
+  retries?:  number;
+};
+
+// ─── ヘッダ構築 ──────────────────────────────────────────────────────────
+
+async function buildHeaders(skipAuth = false): Promise<Headers> {
+  const headers = new Headers({
+    'Content-Type':  'application/json',
+    'Accept':        'application/json',
+    'X-Request-ID':  idProvider.generate(),
+    'X-Timestamp':   clock.now().toISOString(),
+    'X-Platform':    Platform.OS,
+    'X-App-Version': Constants.expoConfig?.version ?? 'unknown',
+  });
+
+  if (!skipAuth) {
+    const token = await getAuthToken();
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  return headers;
+}
+
+// ─── AbortSignal の統合 ──────────────────────────────────────────────────
+//
+// AbortSignal.any() は Chrome 116+ / Node 20+ / RN 0.73+ (Hermes) で利用可能。
+// 対象 RN バージョンが未満の場合は下記の polyfill を使う。
+// 対象バージョンを上げた際は polyfill を削除して AbortSignal.any() に差し替えること。
+
+function mergeSignals(signals: AbortSignal[]): AbortSignal {
+  // polyfill: AbortSignal.any が使えない環境向け
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any(signals);
+  }
+  const controller = new AbortController();
+  for (const signal of signals) {
+    if (signal.aborted) { controller.abort(); break; }
+    signal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  return controller.signal;
+}
+
+// ─── コアリクエスト（リトライ込み）────────────────────────────────────────
+
+async function request<T>(
+  method:  string,
+  path:    string,
+  schema:  z.ZodType<T>,
+  body?:   unknown,
+  options: HttpClientOptions = {},
+): Promise<T> {
+  const { signal, skipAuth = false, retries = MAX_RETRIES } = options;
+  const url = `${BASE_URL}${path}`;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller    = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const mergedSignal  = signal
+      ? mergeSignals([signal, controller.signal])
+      : controller.signal;
+
+    try {
+      const headers = await buildHeaders(skipAuth);
+
+      if (__DEV__) {
+        logger.debug(`[API] ${method} ${path}`, {
+          body,
+          headers: maskHeaders(headers),  // Authorization はマスク済み
+        });
+      }
+
+      const res = await fetch(url, {
+        method,
+        headers,
+        body:   body != null ? JSON.stringify(body) : undefined,
+        signal: mergedSignal,
+      });
+
+      clearTimeout(timeoutHandle);
+
+      // 認証エラー: トークンリフレッシュして 1 回だけリトライ
+      if (res.status === 401 && attempt === 0) {
+        await refreshAuthToken();
+        continue;
+      }
+
+      // 再試行可能なサーバエラー（429 / 503）
+      if ((res.status === 429 || res.status === 503) && attempt < retries) {
+        const retryAfter = Number(res.headers.get('Retry-After') ?? 1);
+        await sleep(retryAfter * 1000 * (attempt + 1));
+        continue;
+      }
+
+      if (!res.ok) {
+        const resBody = await res.json().catch(() => null);
+        const traceId = res.headers.get('X-Trace-ID') ?? '';
+        throw new HttpError(res.status, path, resBody, traceId);
+      }
+
+      const json   = await res.json();
+      const parsed = schema.safeParse(json);
+
+      if (!parsed.success) {
+        logger.warn('API response validation failed', {
+          path,
+          issues: parsed.error.issues,
+        });
+        throw new ValidationError(path, parsed.error.issues);
+      }
+
+      return parsed.data;
+
+    } catch (err) {
+      clearTimeout(timeoutHandle);
+
+      if (err instanceof HttpError || err instanceof ValidationError) throw err;
+      if ((err as Error).name === 'AbortError') throw err;
+
+      if (attempt < retries) {
+        await sleep(500 * 2 ** attempt);  // 500ms → 1000ms
+        continue;
+      }
+
+      throw new NetworkError(path, err as Error);
+    }
+  }
+
+  throw new NetworkError(path);
+}
+
+// ─── public API ──────────────────────────────────────────────────────────
+
+export const httpClient = {
+  get: <T>(path: string, schema: z.ZodType<T>, opts?: HttpClientOptions) =>
+    request('GET',    path, schema, undefined, opts),
+
+  post: <T>(path: string, body: unknown, schema: z.ZodType<T>, opts?: HttpClientOptions) =>
+    request('POST',   path, schema, body, opts),
+
+  put: <T>(path: string, body: unknown, schema: z.ZodType<T>, opts?: HttpClientOptions) =>
+    request('PUT',    path, schema, body, opts),
+
+  patch: <T>(path: string, body: unknown, schema: z.ZodType<T>, opts?: HttpClientOptions) =>
+    request('PATCH',  path, schema, body, opts),
+
+  delete: <T>(path: string, schema: z.ZodType<T>, opts?: HttpClientOptions) =>
+    request('DELETE', path, schema, undefined, opts),
+};
+
+// ─── ユーティリティ ───────────────────────────────────────────────────────
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+const MASKED_HEADERS = ['Authorization', 'X-API-Key'];
+
+function maskHeaders(headers: Headers): Record<string, string> {
+  const masked: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    masked[key] = MASKED_HEADERS.includes(key) ? '***' : value;
+  });
+  return masked;
+}
+```
+
+---
+
+## 5. 認証・トークン管理
+
+### フロー全体像
+
+```
+アプリ起動
+    ↓
+SecureStore からトークン読み込み
+    ↓
+有効期限チェック（JWT decode、30 秒バッファ）
+    ├─ 有効         → そのまま使用
+    └─ 期限切れ     → refreshToken でリフレッシュ
+                  ├─ 成功 → 新トークンを SecureStore に保存
+                  └─ 失敗 → ログアウト（/login へ遷移）
+```
+
+### トークン管理実装
+
+```ts
+// src/lib/auth.ts
+import * as SecureStore from 'expo-secure-store';
+import { jwtDecode }    from 'jwt-decode';
+import { router }       from 'expo-router';
+import { BASE_URL }     from '@/lib/env';
+
+const ACCESS_TOKEN_KEY  = 'access_token';
+const REFRESH_TOKEN_KEY = 'refresh_token';
+
+// ─── トークン取得 ──────────────────────────────────────────────────────
+
+export async function getAuthToken(): Promise<string | null> {
+  const token = await SecureStore.getItemAsync(ACCESS_TOKEN_KEY);
+  if (!token) return null;
+
+  const { exp } = jwtDecode<{ exp: number }>(token);
+  const isExpired = exp * 1000 < Date.now() + 30_000;
+
+  return isExpired ? refreshAuthToken() : token;
+}
+
+// ─── リフレッシュ ────────────────────────────────────────────────────────
+//
+// 🔴 MUST (M-04): 複数リクエストが同時に 401 した場合に並行リフレッシュが発生する。
+//   Promise シングルトンで同一の処理を共有し、トークンの多重上書きを防ぐ。
+//
+// ⚠️ 注意: logout() を呼んだ後も進行中の refreshPromise が resolve すると
+//   古いトークンが SecureStore に上書きされる可能性がある。
+//   isLoggedOut フラグで logout 後の保存をスキップすることで防御する。
+
+let refreshPromise: Promise<string | null> | null = null;
+let isLoggedOut = false;
+
+export async function refreshAuthToken(): Promise<string | null> {
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = (async () => {
+    try {
+      const refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+      if (!refreshToken) { await logout(); return null; }
+
+      const res = await fetch(`${BASE_URL}/auth/refresh`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ refreshToken }),
+      });
+
+      if (!res.ok) { await logout(); return null; }
+
+      const { accessToken, refreshToken: newRefreshToken } = await res.json();
+
+      // logout() が先行していた場合は保存しない
+      if (isLoggedOut) return null;
+
+      await SecureStore.setItemAsync(ACCESS_TOKEN_KEY,  accessToken);
+      await SecureStore.setItemAsync(REFRESH_TOKEN_KEY, newRefreshToken);
+
+      return accessToken;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+}
+
+// ─── ログイン / ログアウト ─────────────────────────────────────────────
+
+export async function saveTokens(accessToken: string, refreshToken: string) {
+  isLoggedOut = false;
+  await Promise.all([
+    SecureStore.setItemAsync(ACCESS_TOKEN_KEY,  accessToken),
+    SecureStore.setItemAsync(REFRESH_TOKEN_KEY, refreshToken),
+  ]);
+}
+
+// 🔴 MUST (M-05): リフレッシュ失敗時は即ログアウトし /login へ遷移する
+export async function logout() {
+  isLoggedOut = true;
+  await Promise.all([
+    SecureStore.deleteItemAsync(ACCESS_TOKEN_KEY),
+    SecureStore.deleteItemAsync(REFRESH_TOKEN_KEY),
+  ]);
+  router.replace('/login');
+}
+```
+
+🔴 **MUST (M-06)**: トークンは `expo-secure-store` に保存する（`AsyncStorage` は平文保存のため禁止）
+
+---
+
+## 6. エラーハンドリング戦略
+
+### エラー型と対処方針
+
+| エラー型 | HTTP ステータス | 対処 |
+|---|---|---|
+| `HttpError` | 401 | トークンリフレッシュ → 再試行（httpClient 内で自動） |
+| `HttpError` | 403 | エラー画面 or 通知 |
+| `HttpError` | 404 | 空の状態を表示 |
+| `HttpError` | 409 | ユーザーに再操作を促す（楽観的ロック競合） |
+| `HttpError` | 422 | フィールドエラーとして表示 |
+| `HttpError` | 429 | Retry-After に従い自動リトライ（httpClient 内で自動） |
+| `HttpError` | 5xx | リトライ後、エラー通知 |
+| `NetworkError` | — | オフライン通知 + キャッシュ表示 |
+| `ValidationError` | — | Sentry にログ送信、フォールバック表示 |
+
+### Feature 層でのエラーハンドリング
+
+```tsx
+// features/order/components/OrderDetailFeature.tsx
+import { HttpError, NetworkError } from '@/lib/httpClient';
+
+export function OrderDetailFeature({ orderId }: { orderId: string }) {
+  const { data, error, refetch } = useGetOrder(orderId);
+
+  if (error instanceof HttpError) {
+    if (error.status === 404) return <NotFound message="この注文は存在しません" />;
+    if (error.status === 403) return <Forbidden />;
+  }
+
+  if (error instanceof NetworkError) {
+    return (
+      <OfflineState
+        cachedData={data}   // キャッシュがあれば表示し続ける
+        onRetry={refetch}
+      />
+    );
+  }
+
+  if (error) return <ErrorState onRetry={refetch} />;
+
+  return <OrderDetail order={data} />;
+}
+```
+
+### Mutation エラー（422 フィールドエラー）
+
+```tsx
+const { mutate: submitOrder } = useMutation({
+  mutationFn: (body: CreateOrderRequest) =>
+    httpClient.post('/orders', body, createOrderResponseSchema),
+  onError: (error) => {
+    if (error instanceof HttpError && error.status === 422) {
+      const fieldErrors = error.body as Record<string, string[]>;
+      Object.entries(fieldErrors).forEach(([field, messages]) => {
+        setError(field as keyof CreateOrderRequest, { message: messages[0] });
+      });
+      return;
+    }
+    notify.error('注文の送信に失敗しました');
+  },
+});
+```
+
+---
+
+## 7. リクエストキャンセル
+
+### React Query での自動キャンセル
+
+React Query v5 はコンポーネントのアンマウント時に `signal.abort()` を自動で呼ぶ。`httpClient` がその `signal` を `fetch` に渡しているため、追加の実装なしにキャンセルが機能する。
+
+```ts
+export function useGetUser(userId: string) {
+  return useQuery({
+    queryKey: queryKeys.users.detail(userId),
+    queryFn:  ({ signal }) =>
+      httpClient.get(`/users/${userId}`, getUserSchema, { signal }),
+  });
+}
+```
+
+### 手動キャンセル（ファイルアップロード等）
+
+```tsx
+export function FileUploadButton({ onUploadComplete }: Props) {
+  const controllerRef = useRef<AbortController | null>(null);
+
+  const handleCancel = () => controllerRef.current?.abort();
+
+  const handleUpload = async (file: File) => {
+    controllerRef.current = new AbortController();
+    try {
+      await uploadFile(fileUri, '/uploads', {
+        signal: controllerRef.current.signal,
+      });
+      onUploadComplete();
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') return; // キャンセルは正常系
+      notify.error('アップロードに失敗しました');
+    }
+  };
+
+  return (
+    <>
+      <Button label="アップロード" onPress={() => handleUpload(selectedFile)} />
+      <Button label="キャンセル"   onPress={handleCancel} variant="secondary" />
+    </>
+  );
+}
+```
+
+---
+
+## 8. ファイルアップロード
+
+> ⚠️ **制約**: `expo-file-system` の `createUploadTask` は `AbortSignal` を受け付けない。
+> キャンセルは `uploadTask.cancelAsync()` で行う。`signal` を渡しても無視される点に注意。
+
+```ts
+// src/lib/fileUpload.ts
+import * as FileSystem from 'expo-file-system';
+import { BASE_URL }    from '@/lib/env';
+import { getAuthToken, HttpError } from '@/lib/httpClient';
+
+type UploadOptions = {
+  onProgress?: (progress: number) => void;  // 0.0 〜 1.0
+  // signal は createUploadTask が未対応のため受け付けない。
+  // キャンセルが必要な場合は uploadFile が返す { cancel } を使うこと。
+};
+
+type UploadResult = {
+  url:    string;
+  cancel: () => Promise<void>;
+};
+
+// 🔴 MUST (M-07): ファイルアップロードは createUploadTask を使う
+//   （fetch で multipart を手書きすると進捗取得・キャンセルが困難になる）
+export async function uploadFile(
+  fileUri:  string,
+  destPath: string,
+  options:  UploadOptions = {},
+): Promise<UploadResult> {
+  const { onProgress } = options;
+  const token = await getAuthToken();
+
+  const uploadTask = FileSystem.createUploadTask(
+    `${BASE_URL}${destPath}`,
+    fileUri,
+    {
+      httpMethod:  'POST',
+      uploadType:  FileSystem.FileSystemUploadType.MULTIPART,
+      fieldName:   'file',
+      headers:     { Authorization: `Bearer ${token}` },
+      mimeType:    'application/octet-stream',
+    },
+    (uploadProgress) => {
+      const progress =
+        uploadProgress.totalBytesExpectedToSend > 0
+          ? uploadProgress.totalBytesSent / uploadProgress.totalBytesExpectedToSend
+          : 0;
+      onProgress?.(progress);
+    },
+  );
+
+  const resultPromise = uploadTask.uploadAsync().then((result) => {
+    if (!result || result.status >= 400) {
+      throw new HttpError(result?.status ?? 0, destPath);
+    }
+    return JSON.parse(result.body) as { url: string };
+  });
+
+  return {
+    url:    (await resultPromise).url,
+    cancel: () => uploadTask.cancelAsync(),
+  };
+}
+```
+
+🟡 **SHOULD**: 10MB 以上のファイルは `onProgress` を実装してプログレスバーを表示する
+
+---
+
+## 9. ファイルダウンロード
+
+```ts
+// src/lib/fileDownload.ts
+import * as FileSystem from 'expo-file-system';
+import * as Sharing    from 'expo-sharing';
+import { BASE_URL }    from '@/lib/env';
+import { getAuthToken } from '@/lib/auth';
+import { NetworkError } from '@/lib/httpClient';
+
+type DownloadOptions = {
+  onProgress?: (progress: number) => void;
+};
+
+export async function downloadAndShare(
+  remotePath: string,
+  filename:   string,
+  options:    DownloadOptions = {},
+): Promise<void> {
+  const { onProgress } = options;
+  const token    = await getAuthToken();
+  const localUri = FileSystem.cacheDirectory + filename;
+
+  const downloadResumable = FileSystem.createDownloadResumable(
+    `${BASE_URL}${remotePath}`,
+    localUri,
+    { headers: { Authorization: `Bearer ${token}` } },
+    (downloadProgress) => {
+      const progress =
+        downloadProgress.totalBytesExpectedToWrite > 0
+          ? downloadProgress.totalBytesWritten / downloadProgress.totalBytesExpectedToWrite
+          : 0;
+      onProgress?.(progress);
+    },
+  );
+
+  const result = await downloadResumable.downloadAsync();
+  if (!result) throw new NetworkError(remotePath);
+
+  const canShare = await Sharing.isAvailableAsync();
+  if (canShare) {
+    await Sharing.shareAsync(result.uri, { mimeType: 'application/pdf' });
+  }
+}
+```
+
+---
+
+## 10. ページネーション
+
+### カーソルベース（推奨）
+
+```ts
+// src/api/generated/schemas/paginationSchema.ts
+import { z } from 'zod';
+
+export const cursorPageSchema = <T>(itemSchema: z.ZodType<T>) =>
+  z.object({
+    items:      z.array(itemSchema),
+    nextCursor: z.string().nullable(),
+    hasMore:    z.boolean(),
+  });
+
+export function useInfiniteOrders() {
+  return useInfiniteQuery({
+    queryKey:         queryKeys.orders.infinite(),
+    queryFn:          ({ pageParam, signal }) =>
+      httpClient.get(
+        `/orders?cursor=${pageParam ?? ''}&limit=20`,
+        cursorPageSchema(orderSchema),
+        { signal },
+      ),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextCursor,
+  });
+}
+```
+
+```tsx
+export function OrderListFeature() {
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage } =
+    useInfiniteOrders();
+
+  const items = useMemo(
+    () => data?.pages.flatMap((p) => p.items) ?? [],
+    [data],
+  );
+
+  return (
+    <FlatList
+      data={items}
+      keyExtractor={(item) => item.id}
+      renderItem={({ item }) => <OrderCard order={item} />}
+      onEndReached={() => hasNextPage && fetchNextPage()}
+      onEndReachedThreshold={0.5}
+      ListFooterComponent={isFetchingNextPage ? <LoadingIndicator /> : null}
+    />
+  );
+}
+```
+
+### オフセットベース（後方互換 API のみ）
+
+```ts
+export function useOrdersByPage(page: number) {
+  return useQuery({
+    queryKey:        queryKeys.orders.page(page),
+    queryFn:         ({ signal }) =>
+      httpClient.get(`/orders?page=${page}&limit=20`, ordersPageSchema, { signal }),
+    placeholderData: keepPreviousData,  // ページ切り替え時に前データを維持
+  });
+}
+```
+
+---
+
+## 11. Query Key Factory
+
+Query Key は文字列リテラルの散在を防ぐためにファクトリパターンで一元管理する。
+
+```ts
+// src/api/queryKeys.ts
+export const queryKeys = {
+  users: {
+    all:    ()         => ['users']               as const,
+    lists:  ()         => ['users', 'list']       as const,
+    detail: (id: string) => ['users', 'detail', id] as const,
+  },
+  orders: {
+    all:      ()           => ['orders']                    as const,
+    lists:    ()           => ['orders', 'list']            as const,
+    detail:   (id: string) => ['orders', 'detail', id]     as const,
+    page:     (page: number) => ['orders', 'list', { page }] as const,
+    infinite: ()           => ['orders', 'infinite']        as const,
+  },
+} as const;
+```
+
+キャッシュの無効化は階層を利用して一括で行える。
+
+```ts
+// orders に関する全キャッシュを無効化
+queryClient.invalidateQueries({ queryKey: queryKeys.orders.all() });
+
+// 特定注文のキャッシュのみ無効化
+queryClient.invalidateQueries({ queryKey: queryKeys.orders.detail(orderId) });
+```
+
+---
+
+## 12. オフライン対応
+
+### React Query キャッシュ永続化
+
+```ts
+// src/lib/queryPersister.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { createAsyncStoragePersister } from '@tanstack/query-async-storage-persister';
+import { persistQueryClient }           from '@tanstack/react-query-persist-client';
+
+export const asyncStoragePersister = createAsyncStoragePersister({
+  storage:      AsyncStorage,
+  throttleTime: 1000,
+});
+
+// app/_layout.tsx で初期化
+persistQueryClient({
+  queryClient,
+  persister: asyncStoragePersister,
+  maxAge:    1000 * 60 * 60 * 24,  // 24 時間
+});
+```
+
+### QueryClient のデフォルト設定
+
+```ts
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      networkMode:  'offlineFirst',  // キャッシュがあればオフラインでも表示
+      staleTime:    1000 * 60 * 5,  // 5 分
+      gcTime:       1000 * 60 * 60, // 1 時間
+    },
+  },
+});
+```
+
+### オフライン状態の検知
+
+```ts
+// src/hooks/useNetworkStatus.ts
+import NetInfo from '@react-native-community/netinfo';
+import { useEffect, useState } from 'react';
+
+export function useNetworkStatus() {
+  const [isOnline, setIsOnline] = useState(true);
+
+  useEffect(() => {
+    return NetInfo.addEventListener((state) => {
+      setIsOnline(state.isConnected ?? true);
+    });
+  }, []);
+
+  return isOnline;
+}
+```
+
+```tsx
+export function NetworkStatusBanner() {
+  const isOnline = useNetworkStatus();
+
+  if (isOnline) return null;
+
+  return (
+    <View
+      className="bg-warning-surface px-4 py-2"
+      accessibilityLiveRegion="assertive"
+      accessibilityLabel="オフラインです。接続を確認してください"
+    >
+      <Text className="text-warning-content text-body-sm text-center">
+        オフラインです
+      </Text>
+    </View>
+  );
+}
+```
+
+---
+
+## 13. デバッグ・ロギング
+
+ログ出力は §4 の `httpClient` 内に集約済み。`__DEV__` ガードにより本番ビルドには含まれない。
+
+### Reactotron 統合（開発環境のみ）
+
+```ts
+// src/lib/reactotron.ts
+import Reactotron from 'reactotron-react-native';
+
+if (__DEV__) {
+  Reactotron
+    .configure({ name: 'MyApp' })
+    .useReactNative()
+    .connect();
+}
+```
+
+🟡 **SHOULD**: `__DEV__` ガードを使い、本番ビルドにデバッグログを残さない  
+🔴 **MUST (M-10)**: 認証トークン・パスワードをログに出力しない（`maskHeaders` を経由すること）
+
+---
+
+## 14. MSW との統合
+
+> ⚠️ **注意**: `msw/native` は MSW 公式の export ではない（v2 時点）。
+> React Native 環境では `msw-react-native` パッケージを使うか、`msw/node` をネイティブのインターセプターと組み合わせる。公式ドキュメントの最新状況を確認すること。
+
+### セットアップ（環境別）
+
+```ts
+// src/mocks/server.ts — Jest / Node 環境
+import { setupServer } from 'msw/node';
+import { handlers }    from './handlers';
+
+export const server = setupServer(...handlers);
+```
+
+```ts
+// src/mocks/browser.ts — Storybook web 環境
+import { setupWorker } from 'msw/browser';
+import { handlers }    from './handlers';
+
+export const worker = setupWorker(...handlers);
+```
+
+```ts
+// src/mocks/nativeServer.ts — Expo 開発環境
+// React Native は Service Worker 非対応のため msw-react-native を使う
+// $ pnpm add -D msw-react-native
+import { setupServer } from 'msw-react-native';
+import { handlers }    from './handlers';
+
+export const nativeServer = setupServer(...handlers);
+```
+
+🔴 **MUST (M-09)**: ハンドラ定義（`./handlers`）を 3 環境で共有する。セットアップ関数だけ環境別に分岐させる。
+
+### MSW ハンドラの書き方
+
+```ts
+// src/mocks/handlers/orderHandlers.ts
+import { http, HttpResponse } from 'msw';
+import { BASE_URL }           from '@/lib/env';
+import { createOrder }        from '@/mocks/factories/orderFactory';
+
+export const orderHandlers = {
+  // 正常系
+  success: [
+    http.get(`${BASE_URL}/orders`, () =>
+      HttpResponse.json({
+        items:      Array.from({ length: 10 }, () => createOrder()),
+        nextCursor: 'cursor_abc',
+        hasMore:    true,
+      }),
+    ),
+    http.get(`${BASE_URL}/orders/:id`, ({ params }) =>
+      HttpResponse.json(createOrder({ id: params.id as string })),
+    ),
+  ],
+
+  // 異常系 — 🔴 MUST (M-08): 必ず用意する
+  notFound: [
+    http.get(`${BASE_URL}/orders/:id`, () =>
+      HttpResponse.json({ message: 'Not found' }, { status: 404 }),
+    ),
+  ],
+  serverError: [
+    http.get(`${BASE_URL}/orders`, () =>
+      HttpResponse.json({ message: 'Internal server error' }, { status: 500 }),
+    ),
+  ],
+  networkError: [
+    http.get(`${BASE_URL}/orders`, () => HttpResponse.error()),
+  ],
+};
+```
+
+### Factory 関数
+
+テストデータの生成には `@faker-js/faker` を使ったファクトリ関数を定義する。
+
+```ts
+// src/mocks/factories/orderFactory.ts
+import { faker } from '@faker-js/faker/locale/ja';
+import { Order } from '@/api/generated/schemas';
+
+export function createOrder(overrides: Partial<Order> = {}): Order {
+  return {
+    id:        faker.string.uuid(),
+    status:    'pending',
+    total:     faker.number.int({ min: 100, max: 100_000 }),
+    createdAt: faker.date.recent().toISOString(),
+    ...overrides,
+  };
+}
+```
+
+---
+
+## 15. セキュリティ
+
+### Certificate Pinning
+
+```json
+// app.json（expo-build-properties で設定）
+{
+  "expo": {
+    "plugins": [
+      ["expo-build-properties", {
+        "ios": { "networkInspector": false }
+      }]
+    ]
+  }
+}
+```
+
+🟡 **SHOULD**: 本番環境では Certificate Pinning を検討する（金融・医療系アプリは MUST）
+
+🔴 **MUST (M-11)**: 本番ビルドで Reactotron / Flipper 等のデバッグツールを無効化する
+
+---
+
+## 16. テスト実装規約
+
+### httpClient のテスト
+
+```ts
+// src/lib/__tests__/httpClient.test.ts
+import { server }             from '@/mocks/server';
+import { http, HttpResponse } from 'msw';
+import { httpClient, NetworkError } from '@/lib/httpClient';
+import { getUserSchema }      from '@/api/generated/schemas';
+
+// MAX_RETRIES を定数参照することで、値変更時にテストが自動で追従する
+import { MAX_RETRIES } from '@/lib/httpClient';
+
+beforeAll(()  => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(()  => server.resetHandlers());
+afterAll(()   => server.close());
+
+describe('httpClient', () => {
+  test('正常レスポンスを Zod で検証して返す', async () => {
+    server.use(
+      http.get('*/users/1', () =>
+        HttpResponse.json({ id: '1', name: 'Taro', email: 'taro@example.com' }),
+      ),
+    );
+    const result = await httpClient.get('/users/1', getUserSchema);
+    expect(result.name).toBe('Taro');
+  });
+
+  test('401 でトークンリフレッシュを試みる', async () => {
+    // jest.mock はモジュールスコープ外で動かないため jest.spyOn を使う
+    const { refreshAuthToken } = await import('@/lib/auth');
+    const refreshSpy = jest
+      .spyOn({ refreshAuthToken }, 'refreshAuthToken')
+      .mockResolvedValue('new_token');
+
+    server.use(
+      http.get('*/users/1', () =>
+        HttpResponse.json({ message: 'Unauthorized' }, { status: 401 }),
+      ),
+    );
+
+    await expect(httpClient.get('/users/1', getUserSchema)).rejects.toThrow();
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test('NetworkError で MAX_RETRIES 回リトライする', async () => {
+    let callCount = 0;
+    server.use(
+      http.get('*/users/1', () => {
+        callCount++;
+        return HttpResponse.error();
+      }),
+    );
+
+    await expect(
+      httpClient.get('/users/1', getUserSchema),
+    ).rejects.toBeInstanceOf(NetworkError);
+
+    // MAX_RETRIES 定数を参照（ハードコード禁止）
+    expect(callCount).toBe(MAX_RETRIES + 1);  // 初回 + リトライ回数
+  });
+});
+```
+
+### Query Hooks のテスト
+
+```tsx
+// features/order/__tests__/useGetOrder.test.tsx
+import { renderHook, waitFor } from '@testing-library/react-native';
+import { createWrapper }       from '@/test/utils/createWrapper';
+import { useGetOrder }         from '@/api/generated/endpoints/orders';
+import { server }              from '@/mocks/server';
+import { orderHandlers }       from '@/mocks/handlers/orderHandlers';
+
+test('注文データを取得して返す', async () => {
+  server.use(...orderHandlers.success);
+
+  const { result } = renderHook(
+    () => useGetOrder('order-1'),
+    { wrapper: createWrapper() },
+  );
+
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  expect(result.current.data?.id).toBe('order-1');
+});
+```
+
+### createWrapper ユーティリティ
+
+```ts
+// src/test/utils/createWrapper.tsx
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { PropsWithChildren }                from 'react';
+
+export function createWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },   // テストでリトライしない
+      mutations: { retry: false },
+    },
+  });
+
+  return function Wrapper({ children }: PropsWithChildren) {
+    return (
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    );
+  };
+}
+```
+
+---
+
+## 17. 変更履歴
+
+| 日付 | 変更内容 | 担当 |
+|---|---|---|
+| 2026-03 | 初版作成 | — |
+| 2026-04 | 凡例・制約サマリー追加、AbortSignal.any() 対応、refreshAuthToken レースコンディション修正、queryKeys ファクトリ追加、MSW native 注意書き追加、テスト規約修正 | — |

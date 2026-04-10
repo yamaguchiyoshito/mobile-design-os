@@ -1,0 +1,369 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Foundation/UI System" />
+
+# UI / デザインシステム方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: Design System コンポーネント・スタイリング・トークン管理
+
+---
+
+## 1. デザイントークンパイプライン
+
+トークンの **Single Source of Truth は Figma Variables** である。
+変更は常に Figma 側で行い、コード側への伝播はパイプライン経由にする。
+
+```
+Figma Variables（SSOT）
+    ↓ [tokens-export plugin / Style Dictionary]
+token.json
+    ↓ [Style Dictionary transform]
+    ├─ tailwind.config.ts  （NativeWind テーマ拡張・JS定数参照）
+    └─ src/tokens/index.ts （TypeScript 型付きトークン定数）
+```
+
+🔴 **MUST**: トークン値をコード内にハードコードしない  
+🔴 **MUST**: `tailwind.config.ts` でのカラー指定は CSS カスタムプロパティ（`var(--color-*)`）ではなく、Style Dictionary が出力した JS 定数を直接参照する。NativeWind v4 はネイティブ側で CSS 変数を解決できないため
+
+```ts
+// ✅ 正解 — Style Dictionary 出力の JS 定数を参照
+import tokens from '@/src/tokens';
+
+export default {
+  theme: {
+    extend: {
+      colors: {
+        'surface-primary': tokens.colorSurfacePrimary,
+        'content-primary': tokens.colorContentPrimary,
+      },
+    },
+  },
+};
+
+// ❌ 禁止 — CSS カスタムプロパティ（NativeWind ネイティブ側で未解決）
+colors: {
+  'surface-primary': 'var(--color-surface-primary)',
+}
+```
+
+🟡 **SHOULD**: `token.json` はリポジトリに含め、Figma 非接続環境でもビルド可能にする
+
+### CI/CD 統合
+
+Figma Variables の変更を自動検知してパイプラインを実行する。手動実行は禁止とする。
+
+```yaml
+# .github/workflows/sync-tokens.yml（概要）
+on:
+  workflow_dispatch:         # Figma Webhook または手動トリガー
+  schedule:
+    - cron: '0 3 * * 1'     # 週次フォールバック
+jobs:
+  sync:
+    steps:
+      - run: npx tokens-export          # Figma → token.json
+      - run: npx style-dictionary build  # token.json → tailwind.config.ts / index.ts
+      - uses: peter-evans/create-pull-request@v6
+        with:
+          title: 'chore: sync design tokens from Figma'
+```
+
+🔴 **MUST**: Figma 変更後のパイプライン実行は GitHub Actions 経由とし、PR を自動作成してレビューを必須にする  
+🔴 **MUST**: token.json の差分を PR 上で可視化し、意図しないトークン削除・変更をレビューで検出する
+
+---
+
+## 2. NativeWind によるスタイリング
+
+### 基本方針
+
+Tailwind CSS（Web）は **使わない**。Expo 公式は native 側に NativeWind を案内している。
+NativeWind はユーティリティクラスを React Native StyleSheet に変換する。
+
+```tsx
+// ✅ 正解 — NativeWind className
+<View className="flex-1 bg-surface-primary px-4 py-6">
+  <Text className="text-heading-md text-content-primary">タイトル</Text>
+</View>
+
+// ❌ 禁止 — インライン StyleSheet 直書き（トークン外）
+<View style={{ backgroundColor: '#ffffff', padding: 16 }}>
+```
+
+### テーマ拡張規約
+
+```ts
+// tailwind.config.ts
+import tokens from '@/src/tokens';
+
+export default {
+  theme: {
+    extend: {
+      colors: {
+        'surface-primary':   tokens.colorSurfacePrimary,
+        'surface-secondary': tokens.colorSurfaceSecondary,
+        'content-primary':   tokens.colorContentPrimary,
+        // … Style Dictionary 出力から自動生成
+      },
+      fontSize: {
+        'heading-lg': ['24px', { lineHeight: '32px', fontWeight: '700' }],
+        'heading-md': ['20px', { lineHeight: '28px', fontWeight: '600' }],
+        'body-md':    ['16px', { lineHeight: '24px', fontWeight: '400' }],
+        // … Style Dictionary 出力から自動生成
+      },
+    },
+  },
+};
+```
+
+🔴 **MUST**: カラー・タイポグラフィは必ずトークン経由（`text-heading-md` 等）  
+🔴 **MUST**: 任意の数値クラス（`p-[13px]`）の乱用禁止
+
+---
+
+## 3. アイコン方針
+
+iOS/Android でネイティブアイコンセットが異なるため、以下の使い分けを必須とする。
+
+```tsx
+// ✅ プラットフォーム差異を吸収するラッパを必ず経由する
+// components/ui/Icon.tsx
+import { Platform } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
+import { SymbolView } from 'expo-symbols'; // iOS SF Symbols
+
+type IconProps = {
+  name: string;             // デザイントークン上のアイコン識別子
+  size?: number;
+  color?: string;
+  testID?: string;
+};
+
+export const Icon: React.FC<IconProps> = ({ name, size = 24, color, testID }) => {
+  if (Platform.OS === 'ios') {
+    return <SymbolView name={name} size={size} tintColor={color} testID={testID} />;
+  }
+  return <Ionicons name={name as any} size={size} color={color} testID={testID} />;
+};
+
+// ❌ 禁止 — lucide-react（Web DOM 依存）
+import { Camera } from 'lucide-react';
+
+// ❌ 禁止 — Ionicons を画面コンポーネントで直接インポート（ラッパを経由しない）
+import { Ionicons } from '@expo/vector-icons';
+```
+
+🔴 **MUST**: アイコンは必ず `Icon` コンポーネント経由で使用し、Ionicons / SF Symbols を画面から直参照しない  
+🔴 **MUST**: iOS と Android でアイコン名が異なる場合は `Icon` ラッパ内で吸収し、呼び出し側に差異を露出しない  
+🟡 **SHOULD**: `Icon` に渡す `name` はデザイントークン定義のアイコン識別子を Union Type で制限する
+
+---
+
+## 4. コンポーネント責務分類
+
+<table>
+  <thead>
+    <tr>
+      <th>分類</th>
+      <th>配置</th>
+      <th>責務</th>
+      <th>例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Primitive</strong></td>
+      <td><code>components/ui/</code></td>
+      <td>React Native core の薄いラッパ。内部 state・副作用・API 呼び出しを持たない。トークン適用のみ</td>
+      <td><code>Button</code>, <code>Text</code>, <code>Icon</code></td>
+    </tr>
+    <tr>
+      <td><strong>Composite</strong></td>
+      <td><code>components/ui/</code></td>
+      <td>Primitive を組み合わせた汎用 UI。2 箇所以上で再利用される、または単一責任が 1 Primitive に収まらない場合に切り出す</td>
+      <td><code>Card</code>, <code>ListItem</code>, <code>FormField</code></td>
+    </tr>
+    <tr>
+      <td><strong>Feature</strong></td>
+      <td><code>features/*/components/</code></td>
+      <td>業務コンテキストを持つコンポーネント</td>
+      <td><code>UserAvatar</code>, <code>OrderSummary</code></td>
+    </tr>
+    <tr>
+      <td><strong>Screen</strong></td>
+      <td><code>app/</code></td>
+      <td>Expo Router のページファイル</td>
+      <td><code>index.tsx</code>, <code>[id].tsx</code></td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST**: `components/ui/` に業務ロジック・API 呼び出しを書かない  
+🔴 **MUST**: Primitive は内部 state（`useState`）および副作用（`useEffect`）を持たない  
+🟡 **SHOULD**: Composite の切り出し基準は「再利用箇所が 2 以上」または「単一コンポーネントの責任が明確に分離できる」こと。Primitive の個数は基準としない
+
+### 非推奨化・削除プロセス
+
+破壊的変更を伴うコンポーネント修正は以下の手順を踏む。
+
+1. **非推奨宣言**: JSDoc `@deprecated` を付与し、代替コンポーネントを明示する
+2. **移行期間**: 最低 1 スプリント（2 週間）は旧コンポーネントを存続させる
+3. **一括移行**: `grep` または ESLint カスタムルールで利用箇所を特定して一括置換する
+4. **削除 PR**: 移行完了後に削除 PR を出し、Story・テストも同時に削除する
+
+🔴 **MUST**: 利用箇所の調査なしに Primitive・Composite を直接削除しない
+
+---
+
+## 5. コンポーネント実装規約
+
+### Props 設計
+
+```tsx
+// ✅ 推奨パターン
+type ButtonProps = {
+  label: string;
+  variant?: 'primary' | 'secondary' | 'destructive';
+  size?: 'sm' | 'md' | 'lg';
+  disabled?: boolean;
+  loading?: boolean;
+  onPress: () => void;
+  testID?: string;   // ← RNTL / E2E のセレクタ用に必須
+};
+
+export const Button: React.FC<ButtonProps> = ({
+  label,
+  variant = 'primary',
+  size = 'md',
+  disabled = false,
+  loading = false,
+  onPress,
+  testID,
+}) => { ... };
+```
+
+🔴 **MUST**: `testID` を全インタラクティブコンポーネントに必須定義する  
+🟡 **SHOULD**: `variant` / `size` は Union Type で網羅する  
+🟡 **SHOULD**: デフォルト値は Props 宣言側ではなく分割代入側で指定する
+
+### testID 命名規約
+
+`{screen}-{component}-{role}` の形式で統一する。
+
+```
+// 例
+login-submit-button
+profile-avatar-image
+order-quantity-input
+cart-item-delete-button
+```
+
+🔴 **MUST**: testID は上記命名規約に従い、スクリーン名・コンポーネント名・役割をハイフン区切りで連結する  
+🔴 **MUST**: 同一画面内で testID が重複してはならない
+
+### アニメーション
+
+```tsx
+// ✅ react-native-reanimated 使用（UI スレッド実行・60fps 保証）
+import Animated, { useSharedValue, withSpring } from 'react-native-reanimated';
+
+// ❌ 禁止 — Animated API（JS スレッド実行・フレーム落ちリスク）
+import { Animated } from 'react-native';
+```
+
+🟡 **SHOULD**: トランジション・スクロール連動アニメーションには必ず Reanimated を使う
+
+---
+
+## 6. Figma → Storybook 連携
+
+コンポーネント仕様の流れは **Figma が一次ソース** であり、Storybook が実証する。
+実装と Figma の乖離を検出した場合はデザイナーに差し戻し、Figma 側を更新してから Story を修正する。
+
+```
+Figma コンポーネント仕様（props・variant・状態定義）
+    ↓
+コンポーネント実装（React Native）
+    ↓
+Storybook Story（on-device + web で確認）
+    ↓ addon-vitest              ↓ addon-a11y
+インタラクションテスト         アクセシビリティ検証
+    ↑
+実装が Figma と乖離している場合 → Figma 差し戻し（デザイナーが Figma を修正）
+```
+
+### Story カバレッジ基準
+
+| 対象 | 必須カバレッジ |
+|---|---|
+| `variant` / `size` の全組み合わせ | 🔴 MUST |
+| `disabled` / `loading` 等の状態 | 🔴 MUST |
+| `onPress` 等インタラクションの動作確認（addon-vitest） | 🔴 MUST |
+| `a11y` 違反ゼロ（addon-a11y・WCAG 2.1 AA 準拠） | 🔴 MUST |
+| エラー状態・空状態 | 🟡 SHOULD |
+
+🔴 **MUST**: Story の `args` は Figma の variant 定義を網羅する  
+🔴 **MUST**: addon-a11y でエラーが出た Story はマージ禁止とする  
+🟡 **SHOULD**: Figma のコンポーネント URL を Story の `parameters.design` に記載する
+
+---
+
+## 7. ダークモード / テーマ切替
+
+NativeWind の `dark:` バリアントと Expo の `useColorScheme()` を組み合わせる。
+カラートークンはライト / ダーク両方の値を Figma Variables で定義する。
+
+### ユーザー設定 vs システム設定の優先順位
+
+アプリ内でユーザーがテーマを上書きできる場合、システム設定より **ユーザー設定を優先** する。
+
+```tsx
+// ✅ ユーザー設定をストアで管理し、システム設定より優先する
+import { useColorScheme as useSystemColorScheme } from 'expo';
+import { useThemeStore } from '@/stores/themeStore';
+
+export function useColorScheme() {
+  const userPreference = useThemeStore((s) => s.colorScheme); // 'light' | 'dark' | 'system'
+  const systemScheme = useSystemColorScheme();
+  return userPreference === 'system' ? systemScheme : userPreference;
+}
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const colorScheme = useColorScheme();
+  return (
+    <View className={colorScheme === 'dark' ? 'dark' : ''}>
+      {children}
+    </View>
+  );
+}
+```
+
+🔴 **MUST**: テーマ状態は `useColorScheme()` フックを一元窓口とし、画面コンポーネントが `expo` / `nativewind` を直接呼ばない  
+🟡 **SHOULD**: ユーザーのテーマ設定は永続化する（AsyncStorage または MMKV）
+
+---
+
+## 8. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-04</td>
+      <td>CSS変数禁止・CI/CD統合・testID命名規約・アイコンラッパ・Composite分類基準・非推奨化プロセス・Storyカバレッジ基準・テーマ優先順位を追記。Sectionの順序を再編</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

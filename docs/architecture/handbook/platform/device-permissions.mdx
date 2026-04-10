@@ -1,0 +1,868 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Platform/Device Permissions" />
+
+# デバイス権限・API アクセス方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: カメラ・位置情報・連絡先・生体認証・メディアライブラリ等のデバイス権限全般  
+> **依存**: 01_Principles（端末 API は wrapper 経由）、09_Message_Display（notify）
+
+---
+
+## 1. 方針
+
+### wrapper 経由の原則
+
+01_Principles で「端末 API は Expo module wrapper 経由とし、画面層から `expo-*` を直呼びしない」と定めている。本書はその実装標準を定義する。
+
+```
+Feature / Screen
+    ↓
+src/lib/permissions/[domain]Service.ts   ← wrapper（本書で定義）
+    ↓
+expo-camera / expo-location / ... 等
+    ↓
+iOS / Android ネイティブ API
+```
+
+### 権限リクエストの共通原則
+
+<table>
+  <thead>
+    <tr>
+      <th>原則</th>
+      <th>内容</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>文脈の原則</strong></td>
+      <td>権限が必要な操作の直前に要求する。起動直後は禁止</td>
+    </tr>
+    <tr>
+      <td><strong>説明の原則</strong></td>
+      <td>OS ダイアログの前に「なぜ必要か」を説明するプリプロンプト UI を必ず表示する</td>
+    </tr>
+    <tr>
+      <td><strong>拒否の原則</strong></td>
+      <td>一度拒否されたら OS ダイアログを再表示しない。設定アプリへ誘導する</td>
+    </tr>
+    <tr>
+      <td><strong>最小権限の原則</strong></td>
+      <td>必要なスコープのみ要求する（例: 位置情報は精度を状況に応じて選択）</td>
+    </tr>
+    <tr>
+      <td><strong>ラッパーの原則</strong></td>
+      <td><code>expo-*</code> を Feature から直接呼ばない</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST**: アプリ初回起動時・スプラッシュ画面・ログイン前に権限を要求しない  
+🔴 **MUST NOT**: 「後で」を選んだユーザーに同一セッション内で再度ダイアログを表示しない
+
+---
+
+## 2. 共通 Permission Hook
+
+各権限 wrapper が共有する基底パターン。
+
+```ts
+// src/lib/permissions/usePermission.ts
+import { useState, useCallback } from 'react';
+import { Linking, Platform }     from 'react-native';
+
+export type PermissionStatus =
+  | 'undetermined'
+  | 'granted'
+  | 'denied'
+  | 'limited'      // iOS の限定アクセス（写真ライブラリ等）
+  | 'unavailable'; // ハードウェアが存在しない
+
+type UsePermissionOptions = {
+  getStatus:    () => Promise<PermissionStatus>;
+  requestPerm:  () => Promise<PermissionStatus>;
+};
+
+export function usePermission({ getStatus, requestPerm }: UsePermissionOptions) {
+  const [status, setStatus] = useState<PermissionStatus | null>(null);
+
+  const refresh = useCallback(async () => {
+    const s = await getStatus();
+    setStatus(s);
+    return s;
+  }, [getStatus]);
+
+  const request = useCallback(async (): Promise<PermissionStatus> => {
+    const current = await getStatus();
+
+    if (current === 'denied') {
+      setStatus('denied');
+      return 'denied';
+    }
+    const result = await requestPerm();
+    setStatus(result);
+    return result;
+  }, [getStatus, requestPerm]);
+
+  const openSettings = useCallback(async () => {
+    if (Platform.OS === 'ios') {
+      await Linking.openURL('app-settings:');
+    } else {
+      await Linking.openSettings();
+    }
+  }, []);
+
+  return { status, refresh, request, openSettings };
+}
+```
+
+---
+
+## 3. 権限拒否時の共通 UI パターン
+
+```tsx
+// src/components/ui/PermissionDeniedPrompt/PermissionDeniedPrompt.tsx
+type Props = {
+  featureName:    string;   // 例: 'カメラ'
+  reason:         string;   // 例: 'プロフィール写真の撮影に使用します'
+  onOpenSettings: () => void;
+  onDismiss:      () => void;
+};
+
+export function PermissionDeniedPrompt({
+  featureName, reason, onOpenSettings, onDismiss,
+}: Props) {
+  return (
+    <View
+      className="bg-surface-secondary rounded-xl p-5 mx-4"
+      accessible={true}
+      accessibilityRole="alert"
+      accessibilityLabel={`${featureName}のアクセスが許可されていません。${reason}`}
+    >
+      <Text className="text-heading-sm text-content-primary mb-2">
+        {featureName}へのアクセスが必要です
+      </Text>
+      <Text className="text-body-md text-content-secondary mb-4">
+        {reason}設定アプリから{featureName}のアクセスを許可してください。
+      </Text>
+      <View className="flex-row gap-3 justify-end">
+        <Button label="後で" variant="secondary" onPress={onDismiss} />
+        <Button label="設定を開く" variant="primary" onPress={onOpenSettings} />
+      </View>
+    </View>
+  );
+}
+```
+
+---
+
+## 4. カメラ
+
+### wrapper
+
+```ts
+// src/lib/permissions/cameraService.ts
+import * as ImagePicker   from 'expo-image-picker';
+import * as Camera        from 'expo-camera';
+import { Platform }       from 'react-native';
+
+export type CapturedMedia = {
+  uri:      string;
+  mimeType: string;
+  width:    number;
+  height:   number;
+  fileSize?: number;
+};
+
+// ─── 権限 ─────────────────────────────────────────────────────────────────
+async function getCameraStatus(): Promise<PermissionStatus> {
+  const { status } = await Camera.getCameraPermissionsAsync();
+  return status as PermissionStatus;
+}
+
+async function requestCameraPermission(): Promise<PermissionStatus> {
+  const { status } = await Camera.requestCameraPermissionsAsync();
+  return status as PermissionStatus;
+}
+
+// ─── カメラで撮影 ─────────────────────────────────────────────────────────
+export async function launchCamera(options?: {
+  allowsEditing?: boolean;
+  aspect?:        [number, number];
+  quality?:       number;   // 0.0 〜 1.0
+}): Promise<CapturedMedia | null> {
+  const result = await ImagePicker.launchCameraAsync({
+    mediaTypes:     ImagePicker.MediaTypeOptions.Images,
+    allowsEditing:  options?.allowsEditing ?? true,
+    aspect:         options?.aspect ?? [1, 1],
+    quality:        options?.quality ?? 0.8,
+    exif:           false,   // EXIF（位置情報等）は取得しない
+  });
+
+  if (result.canceled || !result.assets[0]) return null;
+
+  const asset = result.assets[0];
+  return {
+    uri:      asset.uri,
+    mimeType: asset.mimeType ?? 'image/jpeg',
+    width:    asset.width,
+    height:   asset.height,
+    fileSize: asset.fileSize,
+  };
+}
+
+// ─── フォトライブラリから選択 ─────────────────────────────────────────────
+export async function launchImageLibrary(options?: {
+  allowsMultipleSelection?: boolean;
+  quality?:                 number;
+}): Promise<CapturedMedia[] | null> {
+  const result = await ImagePicker.launchImageLibraryAsync({
+    mediaTypes:              ImagePicker.MediaTypeOptions.Images,
+    allowsMultipleSelection: options?.allowsMultipleSelection ?? false,
+    quality:                 options?.quality ?? 0.8,
+    exif:                    false,
+  });
+
+  if (result.canceled || !result.assets.length) return null;
+
+  return result.assets.map((a) => ({
+    uri:      a.uri,
+    mimeType: a.mimeType ?? 'image/jpeg',
+    width:    a.width,
+    height:   a.height,
+    fileSize: a.fileSize,
+  }));
+}
+
+export const cameraService = {
+  getStatus:   getCameraStatus,
+  request:     requestCameraPermission,
+  launchCamera,
+  launchImageLibrary,
+};
+```
+
+### Feature での使用
+
+```tsx
+// features/profile/components/AvatarUploadButton.tsx
+import { cameraService }      from '@/lib/permissions/cameraService';
+import { usePermission }      from '@/lib/permissions/usePermission';
+import { PermissionDeniedPrompt } from '@/components/ui/PermissionDeniedPrompt';
+
+export function AvatarUploadButton() {
+  const { t }  = useTranslation();
+  const [showDenied, setShowDenied] = useState(false);
+
+  const { request, openSettings } = usePermission({
+    getStatus:   cameraService.getStatus,
+    requestPerm: cameraService.request,
+  });
+
+  const handlePress = async () => {
+    const status = await request();
+
+    if (status === 'denied') {
+      setShowDenied(true);
+      return;
+    }
+    if (status !== 'granted') return;
+
+    const media = await cameraService.launchCamera();
+    if (media) uploadAvatar(media);
+  };
+
+  return (
+    <>
+      <Pressable
+        onPress={handlePress}
+        accessibilityRole="button"
+        accessibilityLabel={t('profile.changeAvatar')}
+      >
+        <Icon name="camera" />
+      </Pressable>
+
+      {showDenied && (
+        <PermissionDeniedPrompt
+          featureName="カメラ"
+          reason="プロフィール写真の撮影に"
+          onOpenSettings={openSettings}
+          onDismiss={() => setShowDenied(false)}
+        />
+      )}
+    </>
+  );
+}
+```
+
+🔴 **MUST**: `exif: false` を設定して位置情報を含む EXIF メタデータを取得しない
+
+---
+
+## 5. 位置情報
+
+### 精度の選択基準
+
+<table>
+  <thead>
+    <tr>
+      <th>精度</th>
+      <th><code>Accuracy</code> 定数</th>
+      <th>消費電力</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>低精度</td>
+      <td><code>Balanced</code></td>
+      <td>低</td>
+      <td>市区町村レベルの近く検索</td>
+    </tr>
+    <tr>
+      <td>中精度</td>
+      <td><code>High</code></td>
+      <td>中</td>
+      <td>店舗・施設の近く検索</td>
+    </tr>
+    <tr>
+      <td>高精度</td>
+      <td><code>Highest</code></td>
+      <td>高</td>
+      <td>経路案内・リアルタイム追跡</td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: ユースケースに必要な最小精度を使う
+
+### wrapper
+
+```ts
+// src/lib/permissions/locationService.ts
+import * as Location from 'expo-location';
+
+export type LocationCoords = {
+  latitude:  number;
+  longitude: number;
+  accuracy:  number | null;
+};
+
+// ─── 権限 ─────────────────────────────────────────────────────────────────
+async function getLocationStatus(): Promise<PermissionStatus> {
+  const { status } = await Location.getForegroundPermissionsAsync();
+  return status as PermissionStatus;
+}
+
+async function requestLocationPermission(): Promise<PermissionStatus> {
+  const { status } = await Location.requestForegroundPermissionsAsync();
+  return status as PermissionStatus;
+  // ⚠️ バックグラウンド位置情報は別途 requestBackgroundPermissionsAsync が必要
+  // App Store はバックグラウンド位置情報の用途を厳しく審査する
+}
+
+// ─── 現在地を 1 回取得 ────────────────────────────────────────────────────
+export async function getCurrentLocation(
+  accuracy: Location.Accuracy = Location.Accuracy.Balanced,
+): Promise<LocationCoords | null> {
+  try {
+    const loc = await Location.getCurrentPositionAsync({
+      accuracy,
+      timeInterval:  10_000,   // ms。この時間内にキャッシュがあれば使用
+      distanceInterval: 0,
+    });
+    return {
+      latitude:  loc.coords.latitude,
+      longitude: loc.coords.longitude,
+      accuracy:  loc.coords.accuracy,
+    };
+  } catch (err) {
+    logger.warn('Failed to get location', { err });
+    return null;
+  }
+}
+
+// ─── 位置情報の継続監視 ───────────────────────────────────────────────────
+export function watchLocation(
+  callback: (coords: LocationCoords) => void,
+  accuracy: Location.Accuracy = Location.Accuracy.Balanced,
+): () => void {
+  let sub: Location.LocationSubscription | null = null;
+
+  Location.watchPositionAsync(
+    { accuracy, timeInterval: 5000, distanceInterval: 10 },
+    (loc) => callback({
+      latitude:  loc.coords.latitude,
+      longitude: loc.coords.longitude,
+      accuracy:  loc.coords.accuracy,
+    }),
+  ).then((s) => { sub = s; });
+
+  // クリーンアップ関数を返す
+  return () => sub?.remove();
+}
+
+export const locationService = {
+  getStatus:   getLocationStatus,
+  request:     requestLocationPermission,
+  getCurrent:  getCurrentLocation,
+  watch:       watchLocation,
+};
+```
+
+### app.json の位置情報使用説明（必須）
+
+```json
+{
+  "expo": {
+    "ios": {
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription":
+          "近くの店舗を表示するために現在地を使用します。",
+        "NSLocationAlwaysAndWhenInUseUsageDescription":
+          "配達状況のリアルタイム追跡に使用します。"
+      }
+    },
+    "android": {
+      "permissions": [
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION"
+      ]
+    }
+  }
+}
+```
+
+🔴 **MUST**: `NSLocationWhenInUseUsageDescription` を具体的に記述する（App Store 審査要件）  
+🔴 **MUST**: バックグラウンド位置情報は業務要件を精査し、不要なら要求しない
+
+---
+
+## 6. カメラロール / メディアライブラリ
+
+```ts
+// src/lib/permissions/mediaLibraryService.ts
+import * as MediaLibrary from 'expo-media-library';
+
+async function getMediaLibraryStatus(): Promise<PermissionStatus> {
+  const { status } = await MediaLibrary.getPermissionsAsync();
+  return status as PermissionStatus;
+}
+
+async function requestMediaLibraryPermission(): Promise<PermissionStatus> {
+  // iOS 14+ は LIMITED アクセス（選択した写真のみ）が返る場合がある
+  const { status, accessPrivileges } = await MediaLibrary.requestPermissionsAsync();
+
+  if (accessPrivileges === 'limited') return 'limited';
+  return status as PermissionStatus;
+}
+
+// ─── 端末に画像を保存 ─────────────────────────────────────────────────────
+export async function saveImageToLibrary(uri: string): Promise<boolean> {
+  try {
+    await MediaLibrary.saveToLibraryAsync(uri);
+    return true;
+  } catch (err) {
+    logger.warn('Failed to save image', { err });
+    return false;
+  }
+}
+
+export const mediaLibraryService = {
+  getStatus:   getMediaLibraryStatus,
+  request:     requestMediaLibraryPermission,
+  saveImage:   saveImageToLibrary,
+};
+```
+
+### LIMITED アクセスの扱い（iOS）
+
+```tsx
+// iOS 14+ で LIMITED の場合、追加写真の選択を促す
+if (status === 'limited') {
+  await MediaLibrary.presentLimitedLibraryPicker();
+}
+```
+
+🟡 **SHOULD**: `limited` 状態を `granted` と同様に扱い、アクセス可能な写真の範囲内で機能を提供する
+
+---
+
+## 7. 生体認証（Face ID / Touch ID / Fingerprint）
+
+```ts
+// src/lib/permissions/biometricService.ts
+import * as LocalAuthentication from 'expo-local-authentication';
+
+export type BiometricCapability =
+  | 'fingerprint'
+  | 'facial'
+  | 'iris'
+  | 'none';
+
+// ─── 生体認証の利用可否チェック ───────────────────────────────────────────
+export async function getBiometricCapability(): Promise<BiometricCapability> {
+  const isAvailable = await LocalAuthentication.hasHardwareAsync();
+  if (!isAvailable) return 'none';
+
+  const isEnrolled = await LocalAuthentication.isEnrolledAsync();
+  if (!isEnrolled) return 'none';   // 登録された生体情報がない
+
+  const types = await LocalAuthentication.supportedAuthenticationTypesAsync();
+
+  if (types.includes(LocalAuthentication.AuthenticationType.FACIAL_RECOGNITION)) {
+    return 'facial';
+  }
+  if (types.includes(LocalAuthentication.AuthenticationType.FINGERPRINT)) {
+    return 'fingerprint';
+  }
+  if (types.includes(LocalAuthentication.AuthenticationType.IRIS)) {
+    return 'iris';
+  }
+  return 'none';
+}
+
+// ─── 生体認証を実行 ───────────────────────────────────────────────────────
+export async function authenticate(options?: {
+  reason?:       string;
+  fallbackLabel?: string;   // iOS のみ。「パスコードを入力」等
+}): Promise<'success' | 'failed' | 'cancelled' | 'lockout'> {
+  const result = await LocalAuthentication.authenticateAsync({
+    promptMessage:    options?.reason ?? '認証してください',
+    fallbackLabel:    options?.fallbackLabel ?? 'パスコードを使用',
+    cancelLabel:      'キャンセル',
+    disableDeviceFallback: false,  // パスコードフォールバックを許可
+  });
+
+  if (result.success) return 'success';
+
+  // エラーコードで失敗理由を分類する
+  switch (result.error) {
+    case 'user_cancel':
+    case 'system_cancel':
+      return 'cancelled';
+    case 'lockout':
+    case 'lockout_permanent':
+      return 'lockout';
+    default:
+      return 'failed';
+  }
+}
+
+export const biometricService = {
+  getCapability: getBiometricCapability,
+  authenticate,
+};
+```
+
+### Feature での使用（再認証フロー）
+
+```tsx
+// features/settings/components/BiometricLockSetting.tsx
+export function BiometricLockSetting() {
+  const handleEnable = async () => {
+    const capability = await biometricService.getCapability();
+
+    if (capability === 'none') {
+      notify.info('この端末では生体認証を利用できません');
+      return;
+    }
+
+    const result = await biometricService.authenticate({
+      reason: '生体認証を有効にするために認証してください',
+    });
+
+    if (result === 'success') {
+      await enableBiometricLock();
+      notify.success('生体認証を設定しました');
+    } else if (result === 'lockout') {
+      notify.error('認証に複数回失敗しました。しばらく後にお試しください');
+    }
+  };
+  // ...
+}
+```
+
+🔴 **MUST**: `disableDeviceFallback: false` を設定してパスコードフォールバックを許可する  
+🟡 **SHOULD**: `lockout` の場合は「しばらく後に」という文言に留め、具体的な待機時間を断言しない（OS 依存）
+
+---
+
+## 8. 連絡先
+
+```ts
+// src/lib/permissions/contactsService.ts
+import * as Contacts from 'expo-contacts';
+
+async function getContactsStatus(): Promise<PermissionStatus> {
+  const { status } = await Contacts.getPermissionsAsync();
+  return status as PermissionStatus;
+}
+
+async function requestContactsPermission(): Promise<PermissionStatus> {
+  const { status } = await Contacts.requestPermissionsAsync();
+  return status as PermissionStatus;
+}
+
+export type Contact = {
+  id:          string;
+  name:        string;
+  phoneNumbers: string[];
+  emails:      string[];
+};
+
+export async function searchContacts(query: string): Promise<Contact[]> {
+  const { data } = await Contacts.getContactsAsync({
+    fields: [Contacts.Fields.Name, Contacts.Fields.PhoneNumbers, Contacts.Fields.Emails],
+    name:   query,
+    sort:   Contacts.SortTypes.FirstName,
+  });
+
+  return data.map((c) => ({
+    id:           c.id ?? '',
+    name:         c.name ?? '',
+    phoneNumbers: (c.phoneNumbers ?? []).map((p) => p.number ?? '').filter(Boolean),
+    emails:       (c.emails ?? []).map((e) => e.email ?? '').filter(Boolean),
+  }));
+}
+
+export const contactsService = {
+  getStatus:  getContactsStatus,
+  request:    requestContactsPermission,
+  search:     searchContacts,
+};
+```
+
+🔴 **MUST**: 連絡先データをサーバーに送信する場合はプライバシーポリシーに明記し、ユーザーへの説明を義務化する  
+🟡 **SHOULD**: 連絡先を検索する際は取得フィールドを `fields` で最小化する
+
+---
+
+## 9. app.json 権限記述テンプレート
+
+各権限の `infoPlist`（iOS）と `permissions`（Android）を一覧化する。
+使用しない権限は記述しない。
+
+```json
+{
+  "expo": {
+    "ios": {
+      "infoPlist": {
+        "NSCameraUsageDescription":
+          "プロフィール写真や書類の撮影に使用します。",
+        "NSPhotoLibraryUsageDescription":
+          "プロフィール写真の選択に使用します。",
+        "NSPhotoLibraryAddUsageDescription":
+          "写真をカメラロールに保存するために使用します。",
+        "NSLocationWhenInUseUsageDescription":
+          "近くの店舗を表示するために現在地を使用します。",
+        "NSContactsUsageDescription":
+          "友人への送金先を選択するために使用します。",
+        "NSFaceIDUsageDescription":
+          "アプリへのサインインを簡単にするために使用します。"
+      }
+    },
+    "android": {
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.READ_CONTACTS",
+        "android.permission.USE_BIOMETRIC",
+        "android.permission.USE_FINGERPRINT"
+      ]
+    }
+  }
+}
+```
+
+🔴 **MUST**: 使用する権限のみを宣言する（App Store は未使用権限を却下対象にすることがある）  
+🔴 **MUST**: iOS の `UsageDescription` は機能とユーザーへのメリットを具体的に記述する
+
+---
+
+## 10. 権限状態と UI の対応マトリクス
+
+<table>
+  <thead>
+    <tr>
+      <th>権限状態</th>
+      <th>表示すべき UI</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>undetermined</code></td>
+      <td>プリプロンプト説明 → OS ダイアログ</td>
+    </tr>
+    <tr>
+      <td><code>granted</code></td>
+      <td>機能を通常通り提供</td>
+    </tr>
+    <tr>
+      <td><code>limited</code>（iOS）</td>
+      <td>機能を提供しつつ「フル許可」への誘導 Banner を任意表示</td>
+    </tr>
+    <tr>
+      <td><code>denied</code></td>
+      <td><code>PermissionDeniedPrompt</code>（設定アプリへ誘導）</td>
+    </tr>
+    <tr>
+      <td><code>unavailable</code></td>
+      <td>機能を非表示 or グレーアウト（エラーは出さない）</td>
+    </tr>
+  </tbody>
+</table>
+
+```tsx
+// 権限状態に応じた UI の分岐パターン（共通テンプレート）
+export function PermissionGatedFeature({ children }: { children: React.ReactNode }) {
+  const { status, refresh, request, openSettings } = usePermission({
+    getStatus:   cameraService.getStatus,
+    requestPerm: cameraService.request,
+  });
+
+  useEffect(() => { refresh(); }, []);
+
+  if (status === null) return <Skeleton />;
+
+  if (status === 'unavailable') return null;   // ハードウェアなし → 非表示
+
+  if (status === 'denied') {
+    return (
+      <PermissionDeniedPrompt
+        featureName="カメラ"
+        reason="書類のスキャンに"
+        onOpenSettings={openSettings}
+        onDismiss={() => {}}
+      />
+    );
+  }
+
+  if (status === 'undetermined') {
+    return (
+      <Button
+        label="カメラのアクセスを許可する"
+        onPress={request}
+        variant="primary"
+      />
+    );
+  }
+
+  // granted / limited
+  return <>{children}</>;
+}
+```
+
+---
+
+## 11. テスト実装規約
+
+```ts
+// src/lib/permissions/__tests__/locationService.test.ts
+jest.mock('expo-location');
+import * as Location     from 'expo-location';
+import { locationService } from '@/lib/permissions/locationService';
+
+describe('locationService.getStatus', () => {
+  test.each([
+    ['granted',     'granted'],
+    ['denied',      'denied'],
+    ['undetermined', 'undetermined'],
+  ])('expo-location が %s を返すとき %s を返す', async (expoStatus, expected) => {
+    (Location.getForegroundPermissionsAsync as jest.Mock)
+      .mockResolvedValue({ status: expoStatus });
+
+    expect(await locationService.getStatus()).toBe(expected);
+  });
+});
+
+describe('locationService.getCurrent', () => {
+  test('位置情報を取得して返す', async () => {
+    (Location.getCurrentPositionAsync as jest.Mock).mockResolvedValue({
+      coords: { latitude: 35.6812, longitude: 139.7671, accuracy: 10 },
+    });
+
+    const result = await locationService.getCurrent();
+    expect(result?.latitude).toBeCloseTo(35.6812);
+  });
+
+  test('例外が発生したとき null を返す', async () => {
+    (Location.getCurrentPositionAsync as jest.Mock).mockRejectedValue(new Error('denied'));
+    expect(await locationService.getCurrent()).toBeNull();
+  });
+});
+```
+
+🔴 **MUST**: 権限 wrapper のテストは全ステータス（granted / denied / undetermined / unavailable）をカバーする  
+🟡 **SHOULD**: `expo-*` モジュールはすべて `jest.mock` で差し替え、実機 API を呼ばない
+
+---
+
+## 12. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>リスク / 結果</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>起動直後に権限を要求</td>
+      <td>ユーザーの拒否率上昇・App Store リジェクト</td>
+      <td>文脈のある操作の直前まで遅らせる</td>
+    </tr>
+    <tr>
+      <td>拒否後に再度ダイアログを表示しようとする</td>
+      <td>iOS では何も起きない、Android では2回目が出ることがある（バージョン依存）</td>
+      <td><code>getStatus()</code> で <code>denied</code> を確認後は設定アプリへ誘導</td>
+    </tr>
+    <tr>
+      <td><code>NSCameraUsageDescription</code> が汎用文言</td>
+      <td>App Store 審査で理由不十分として却下される</td>
+      <td>具体的なユースケースを記述する</td>
+    </tr>
+    <tr>
+      <td><code>unavailable</code> を <code>denied</code> と同様に扱う</td>
+      <td>シミュレーターや特定端末でエラー画面が出る</td>
+      <td><code>unavailable</code> は非表示で対応する</td>
+    </tr>
+    <tr>
+      <td>EXIF を含むまま画像を送信</td>
+      <td>位置情報がサーバーに送信される</td>
+      <td><code>exif: false</code> で取得しない</td>
+    </tr>
+    <tr>
+      <td><code>expo-*</code> を Feature から直接 import</td>
+      <td>wrapper が機能せず、テスト・差し替えが困難になる</td>
+      <td><code>src/lib/permissions/</code> の service を経由する</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 13. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,625 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Foundation/Screen Composition" />
+
+# 画面実装方式
+
+> **ステータス**: `APPROVED`  
+> **オーナー**: DPC フロントエンド基盤チーム  
+> **承認日**: 2026-03  
+> **適用バージョン**: Expo SDK 52 / Expo Router 4 / React Query 5 / Zustand 5  
+> **対象**: Screen / Template / Feature / Component の分割規約・実装パターン
+
+---
+
+## 1. 画面分割の 4 層モデル
+
+```
+Screen（app/）
+  └─ Template（components/templates/）
+       └─ Feature（features/*/）
+            └─ Component（components/ui/）
+```
+
+<table>
+  <thead>
+    <tr>
+      <th>層</th>
+      <th>配置</th>
+      <th>持てるもの</th>
+      <th>持てないもの</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Screen</strong></td>
+      <td><code>app/</code></td>
+      <td>Expo Router params・Feature 配置・Root Provider</td>
+      <td>API 呼び出し・業務ロジック・状態</td>
+    </tr>
+    <tr>
+      <td><strong>Template</strong></td>
+      <td><code>components/templates/</code></td>
+      <td>レイアウト構造・Slot 定義（children props）</td>
+      <td>状態・ロジック・API 呼び出し</td>
+    </tr>
+    <tr>
+      <td><strong>Feature</strong></td>
+      <td><code>features/*/</code></td>
+      <td>React Query hooks・Zustand slice・MSW handlers</td>
+      <td>デザイントークン直書き・他 Feature の直接 import</td>
+    </tr>
+    <tr>
+      <td><strong>Component</strong></td>
+      <td><code>components/ui/</code></td>
+      <td>NativeWind className・アニメーション・tokens/ 参照</td>
+      <td>API 呼び出し・グローバル状態・業務ロジック</td>
+    </tr>
+  </tbody>
+</table>
+
+### lib/ の位置づけ
+
+`lib/` はすべての層から参照可能なインフラ共通層である。ただし業務ロジックを持たない純粋なユーティリティに限定する。
+
+<table>
+  <thead>
+    <tr>
+      <th>モジュール</th>
+      <th>責務</th>
+      <th>Feature からの import</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>httpClient.ts</code></td>
+      <td>Axios インスタンス・インターセプター設定</td>
+      <td>✅ 許可（hooks 内で使用）</td>
+    </tr>
+    <tr>
+      <td><code>clock.ts</code></td>
+      <td>現在時刻取得の抽象化（テスト差し替え用）</td>
+      <td>✅ 許可</td>
+    </tr>
+    <tr>
+      <td><code>idProvider.ts</code></td>
+      <td>UUID 生成の抽象化</td>
+      <td>✅ 許可</td>
+    </tr>
+    <tr>
+      <td><code>i18n.ts</code></td>
+      <td>i18next 初期化・翻訳関数エクスポート</td>
+      <td>✅ 許可</td>
+    </tr>
+    <tr>
+      <td><code>locationService.ts</code></td>
+      <td>Expo Location のラッパー</td>
+      <td>✅ 許可</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 2. ディレクトリ構造
+
+```
+src/
+  app/                          ← Expo Router（ナビゲーション一次ソース）
+    (auth)/
+      _layout.tsx               ← 未認証ガード
+      login.tsx
+      signup.tsx
+    (main)/
+      _layout.tsx               ← Tab / Stack Navigator + 認証ガード
+      index.tsx                 ← ホーム画面
+      search/
+        index.tsx
+        [id].tsx
+    _layout.tsx                 ← Root layout（Provider 注入）
+
+  features/                     ← 業務機能単位
+    auth/
+      components/
+      hooks/
+      index.ts                  ← public API（外部 import はこれだけ）
+    order/
+      components/
+      hooks/
+      index.ts
+    search/
+      components/
+      hooks/
+      index.ts
+
+  components/
+    ui/                         ← Design System（Primitive / Composite）
+      Button/
+        Button.tsx
+        Button.stories.tsx
+        Button.test.tsx
+        index.ts
+      Card/
+      FormField/
+    templates/                  ← レイアウトテンプレート
+      MainLayout.tsx
+      AuthLayout.tsx
+
+  lib/                          ← インフラ共通層（全層から参照可）
+    httpClient.ts
+    clock.ts
+    idProvider.ts
+    i18n.ts
+    locationService.ts
+
+  hooks/                        ← アプリ横断 custom hooks
+  stores/                       ← Zustand stores（Feature 横断の状態のみ）
+  api/                          ← 型・スキーマ・QueryKeys
+  mocks/                        ← MSW handlers / factories（アプリ全体共通）
+  tokens/                       ← デザイントークン定数
+```
+
+---
+
+## 3. Screen 実装パターン
+
+### 基本パターン
+
+```tsx
+// app/(main)/search/index.tsx
+import { SearchFeature } from '@/features/search';
+import { useLocalSearchParams } from 'expo-router';
+
+export default function SearchScreen() {
+  // Screen の責務: Expo Router params 取得 + Feature 配置のみ
+  const { q } = useLocalSearchParams<{ q?: string }>();
+
+  return <SearchFeature initialQuery={q} />;
+}
+```
+
+🔴 **MUST**: Screen（`app/` 配下）に API 呼び出し・状態・業務ロジックを書かない  
+🔴 **MUST**: Screen は Feature を並べるだけ。ロジックは Feature に委譲する
+
+> **MUST / SHOULD の定義**  
+> `🔴 MUST` = PR レビューで必ず指摘し、マージをブロックする  
+> `🟡 SHOULD` = 原則として従う。逸脱する場合はコメントで理由を明記する
+
+### Root Layout での Provider 注入
+
+```tsx
+// app/_layout.tsx
+export default function RootLayout() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <ThemeProvider>
+          <NotifyProvider>
+            <Stack />
+          </NotifyProvider>
+        </ThemeProvider>
+      </GestureHandlerRootView>
+    </QueryClientProvider>
+  );
+}
+```
+
+🔴 **MUST**: `GestureHandlerRootView` はアプリ最上位に配置する  
+🟡 **SHOULD**: Provider の順序は依存関係の順（外側が先）に並べる
+
+---
+
+## 4. Template 実装パターン
+
+Template はレイアウト構造の定義のみを持ち、状態・ロジックを持たない。Feature から Slot（children props）を受け取ってレイアウトする。
+
+```tsx
+// components/templates/MainLayout.tsx
+import { SafeAreaView, View } from 'react-native';
+
+type Props = {
+  header: React.ReactNode;
+  body: React.ReactNode;
+  footer?: React.ReactNode;
+};
+
+export function MainLayout({ header, body, footer }: Props) {
+  return (
+    <SafeAreaView className="flex-1 bg-background">
+      <View className="px-4 py-2">{header}</View>
+      <View className="flex-1">{body}</View>
+      {footer && <View className="border-t border-border px-4 py-2">{footer}</View>}
+    </SafeAreaView>
+  );
+}
+```
+
+```tsx
+// Feature 側での使用例
+import { MainLayout } from '@/components/templates/MainLayout';
+
+export function SearchFeature({ initialQuery }: { initialQuery?: string }) {
+  return (
+    <MainLayout
+      header={<SearchBar value={query} onChangeText={setQuery} />}
+      body={<SearchResultList items={data ?? []} />}
+    />
+  );
+}
+```
+
+🔴 **MUST**: Template に状態・API 呼び出し・業務ロジックを書かない  
+🟡 **SHOULD**: Slot は `children` ではなく名前付き props で定義し、構造の意図を明示する
+
+---
+
+## 5. Feature 実装パターン
+
+### Feature の構造
+
+```tsx
+// features/search/components/SearchFeature.tsx
+import { useState } from 'react';
+import { useSearchResults } from '../hooks/useSearchResults';
+import { SearchBar } from '@/components/ui/SearchBar';
+import { SearchResultList } from './SearchResultList';
+import { LoadingSkeleton } from './LoadingSkeleton';
+import { ErrorState } from './ErrorState';
+import { MainLayout } from '@/components/templates/MainLayout';
+
+export function SearchFeature({ initialQuery }: { initialQuery?: string }) {
+  const [query, setQuery] = useState(initialQuery ?? '');
+  const { data, isLoading, error, refetch } = useSearchResults(query);
+
+  if (isLoading) return <LoadingSkeleton />;
+  if (error) return <ErrorState onRetry={refetch} />;
+
+  return (
+    <MainLayout
+      header={<SearchBar value={query} onChangeText={setQuery} />}
+      body={<SearchResultList items={data ?? []} />}
+    />
+  );
+}
+```
+
+### React Query hooks の実装
+
+```ts
+// features/search/hooks/useSearchResults.ts
+import { useQuery } from '@tanstack/react-query';
+import { searchApi } from '@/api/searchApi';
+import { searchKeys } from '@/api/queryKeys';
+
+export function useSearchResults(query: string) {
+  return useQuery({
+    queryKey: searchKeys.results(query),
+    queryFn: () => searchApi.search(query),
+    enabled: query.trim().length > 0,  // 空クエリ時はAPIを叩かない
+    staleTime: 30_000,
+  });
+}
+```
+
+### Feature の public API
+
+```ts
+// features/search/index.ts — 外部に公開するのはここだけ
+export { SearchFeature } from './components/SearchFeature';
+export type { SearchResult } from './types';
+// hooks は外部公開しない（features/search/hooks/ は非公開）
+```
+
+🔴 **MUST**: Feature 間の直接 import を禁止。必ず `index.ts` 経由  
+🟡 **SHOULD**: Feature 内の hooks は `features/*/hooks/` に配置し、外部公開しない
+
+### Feature 横断の状態共有
+
+Feature A が Feature B の状態を必要とする場合、直接 import ではなく以下のいずれかで解決する。
+
+<table>
+  <thead>
+    <tr>
+      <th>ケース</th>
+      <th>解決策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>認証状態（isAuthenticated, userId 等）</td>
+      <td><code>stores/authStore.ts</code>（Zustand）に移動し、各 Feature から参照</td>
+    </tr>
+    <tr>
+      <td>Feature をまたぐ UI 状態（モーダル開閉等）</td>
+      <td><code>stores/uiStore.ts</code> に集約</td>
+    </tr>
+    <tr>
+      <td>複数 Feature が共有する API データ</td>
+      <td>QueryKey を共通化し React Query キャッシュで共有（<code>api/queryKeys.ts</code> で管理）</td>
+    </tr>
+    <tr>
+      <td>純粋なユーティリティ関数</td>
+      <td><code>lib/</code> または <code>hooks/</code>（アプリ横断）に移動</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 6. Zustand ストア設計
+
+`stores/` には Feature 横断の状態のみ配置する。Feature スコープの状態は Feature 内 hooks の `useState` / `useReducer` で管理する。
+
+```ts
+// stores/authStore.ts
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+type AuthState = {
+  userId: string | null;
+  token: string | null;
+  isAuthenticated: boolean;
+  setAuth: (userId: string, token: string) => void;
+  clearAuth: () => void;
+};
+
+export const useAuthStore = create<AuthState>()(
+  persist(
+    (set) => ({
+      userId: null,
+      token: null,
+      isAuthenticated: false,
+      setAuth: (userId, token) => set({ userId, token, isAuthenticated: true }),
+      clearAuth: () => set({ userId: null, token: null, isAuthenticated: false }),
+    }),
+    { name: 'auth-storage' },
+  ),
+);
+
+// selector を export して re-render 範囲を最小化
+export const selectUserId = (s: AuthState) => s.userId;
+export const selectIsAuthenticated = (s: AuthState) => s.isAuthenticated;
+```
+
+```tsx
+// Feature での使用
+import { useAuthStore, selectIsAuthenticated } from '@/stores/authStore';
+
+function ProfileFeature() {
+  // selector 経由で参照し、無関係な状態変化で再レンダーしない
+  const isAuthenticated = useAuthStore(selectIsAuthenticated);
+  // ...
+}
+```
+
+🟡 **SHOULD**: selector を `store` ファイルと同じ場所に export し、コンポーネント内でインラインの関数を渡さない  
+🟡 **SHOULD**: `persist` は認証トークン等の永続化が必要な store のみに使用する
+
+---
+
+## 7. ナビゲーションパターン
+
+### 画面遷移
+
+```tsx
+import { useRouter } from 'expo-router';
+
+export function OrderCard({ orderId }: { orderId: string }) {
+  const router = useRouter();
+  return (
+    <Card onPress={() => router.push(`/order/${orderId}`)}>
+      {/* ... */}
+    </Card>
+  );
+}
+```
+
+### 型付き params（Expo Router 4）
+
+```ts
+// types/routes.ts
+// Expo Router 4 では typed routes 設定が必要
+// app.json: { "expo": { "experiments": { "typedRoutes": true } } }
+// 型は expo-router が自動生成するため、RouteParams の手動拡張は不要
+```
+
+🔴 **MUST**: `react-navigation` を直接 import しない（Expo Router 経由で利用する）  
+🟡 **SHOULD**: Dynamic Route は `[id].tsx` 形式に統一する  
+🟡 **SHOULD**: `typedRoutes: true` を有効化し、自動生成型を使用する
+
+---
+
+## 8. 認証ガードパターン
+
+未認証ユーザーを `(auth)/login` にリダイレクトするガードは `(main)/_layout.tsx` に配置する。
+
+```tsx
+// app/(main)/_layout.tsx
+import { Redirect, Stack } from 'expo-router';
+import { useAuthStore, selectIsAuthenticated } from '@/stores/authStore';
+
+export default function MainLayout() {
+  const isAuthenticated = useAuthStore(selectIsAuthenticated);
+
+  if (!isAuthenticated) {
+    return <Redirect href="/login" />;
+  }
+
+  return <Stack />;
+}
+```
+
+```tsx
+// app/(auth)/_layout.tsx — 認証済みなら main へリダイレクト
+import { Redirect, Stack } from 'expo-router';
+import { useAuthStore, selectIsAuthenticated } from '@/stores/authStore';
+
+export default function AuthLayout() {
+  const isAuthenticated = useAuthStore(selectIsAuthenticated);
+
+  if (isAuthenticated) {
+    return <Redirect href="/" />;
+  }
+
+  return <Stack screenOptions={{ headerShown: false }} />;
+}
+```
+
+🔴 **MUST**: 認証ガードは `_layout.tsx` に配置し、各 Screen に分散させない
+
+---
+
+## 9. エラーハンドリングパターン
+
+### API エラー
+
+```tsx
+export function SearchFeature() {
+  const [query, setQuery] = useState('');
+  const { data, error, refetch } = useSearchResults(query);
+
+  if (error instanceof HttpError && error.status === 404) {
+    return <EmptyState message="検索結果がありません" />;
+  }
+  if (error) {
+    return <ErrorState onRetry={refetch} />;
+  }
+  // ...
+}
+```
+
+### グローバルエラー
+
+```ts
+// app/_layout.tsx 内 queryClient 設定
+import { useRouter } from 'expo-router';
+import { AuthError, HttpError } from '@/lib/httpClient';
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: 2,
+      throwOnError: false,   // 個別ハンドリングを優先
+    },
+    mutations: {
+      onError: (error) => {
+        if (error instanceof AuthError) {
+          // 認証エラー時はストアをクリアしてログイン画面へ
+          useAuthStore.getState().clearAuth();
+        }
+      },
+    },
+  },
+});
+```
+
+---
+
+## 10. ローディング・スケルトン方針
+
+🟡 **SHOULD**: 初回ロード時はスケルトン UI を表示する（`isLoading` フラグ）  
+🟡 **SHOULD**: 再検証中（`isFetching && !isLoading`）は既存データを表示し続ける  
+🟡 **SHOULD**: スケルトンは実際のレイアウトと同じ構造で作成する
+
+```tsx
+// isLoading / isFetching の使い分け
+function SearchResultList() {
+  const { data, isLoading, isFetching } = useSearchResults(query);
+
+  if (isLoading) return <SearchResultSkeleton />;   // 初回: スケルトン
+
+  return (
+    <>
+      {isFetching && <RefetchIndicator />}          {/* 再検証中: インジケーターのみ */}
+      <FlatList data={data} renderItem={...} />
+    </>
+  );
+}
+```
+
+---
+
+## 11. MSW の配置規約
+
+<table>
+  <thead>
+    <tr>
+      <th>配置場所</th>
+      <th>用途</th>
+      <th>例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>mocks/handlers/</code></td>
+      <td>アプリ全体の共通モック（Storybook・Jest 共用）</td>
+      <td><code>mocks/handlers/searchHandlers.ts</code></td>
+    </tr>
+    <tr>
+      <td><code>features/*/</code> 内</td>
+      <td>その Feature 固有のエッジケース用モック（Feature テスト専用）</td>
+      <td><code>features/search/mocks/emptyResultHandler.ts</code></td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: Storybook Story でモックを上書きする場合は `parameters.msw.handlers` を使用する
+
+---
+
+## 12. テスト方針
+
+<table>
+  <thead>
+    <tr>
+      <th>対象</th>
+      <th>テスト種別</th>
+      <th>ツール</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Component（ui/）</td>
+      <td>ユニットテスト・Story</td>
+      <td>Vitest + Testing Library / Storybook</td>
+    </tr>
+    <tr>
+      <td>Feature hooks</td>
+      <td>ユニットテスト（MSW モック）</td>
+      <td>Vitest + renderHook</td>
+    </tr>
+    <tr>
+      <td>Feature コンポーネント</td>
+      <td>統合テスト（MSW + React Query）</td>
+      <td>Vitest + Testing Library</td>
+    </tr>
+    <tr>
+      <td>Screen 遷移</td>
+      <td>E2E</td>
+      <td>Maestro / Detox</td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: Feature テストは hooks 単体ではなく Feature コンポーネント全体を対象とし、実装詳細に依存しない
+
+---
+
+## 13. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>DPC フロントエンド基盤チーム</td>
+    </tr>
+  </tbody>
+</table>

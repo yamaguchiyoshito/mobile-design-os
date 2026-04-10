@@ -1,0 +1,1226 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Quality/Test Strategy" />
+
+# テスト戦略標準
+
+> **ステータス**: `APPROVED`  
+> **対象**: React Native mobile（Expo）アプリの全テスト実装  
+> **前提**: 05_Quality のテスト種別・ツール構成を前提とする。本書はその「何をどう書くか」を規定する
+
+---
+
+## 1. テスト戦略の哲学
+
+### 中心原則
+
+**「テストは仕様書である」**
+
+テストコードは動作するドキュメントである。
+テストを読めば「この実装が何をすべきか」が分かる状態を目指す。
+実装の詳細（どう動かすか）ではなく、**振る舞い（何をするか）** を記述する。
+
+### テスト投資の配分方針
+
+```
+テスト種別の推奨投資比率
+
+ E2E               ▓▓▓▓▓            10%
+ Screen Integration ▓▓▓▓▓▓▓▓▓▓▓▓▓  30%
+ Component          ▓▓▓▓▓▓▓▓▓       20%
+ Logic              ▓▓▓▓▓▓▓▓▓▓▓▓▓  30%
+ Static             ▓▓▓▓▓            10%
+```
+
+E2E を厚くしない理由が 2 つある。
+第一に、実機 E2E はフィードバックが遅く CI コストが高い。
+第二に、React Native Testing Library の Screen Integration Tests は
+「API・状態・ナビゲーション込みの振る舞い」をほぼ同等に検証できる。
+E2E はクリティカルジャーニーの業務観点検証に絞る。
+
+### テストを書く / 書かない の判断基準
+
+🔴 **MUST**: 以下は必ずテストを書く
+
+<table>
+  <thead>
+    <tr>
+      <th>対象</th>
+      <th>理由</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>純粋関数（計算・変換・バリデーション）</td>
+      <td>入出力が明確で最も費用対効果が高い</td>
+    </tr>
+    <tr>
+      <td>API エラーハンドリング分岐</td>
+      <td>手動確認が難しく、バグが本番に漏れやすい</td>
+    </tr>
+    <tr>
+      <td>認証・認可フロー</td>
+      <td>セキュリティ上の影響が大きい</td>
+    </tr>
+    <tr>
+      <td>フォームのバリデーションルール</td>
+      <td>条件の組み合わせが多く、目視では漏れる</td>
+    </tr>
+    <tr>
+      <td>notify / navigate のトリガー</td>
+      <td>画面間の連携は統合テストでしか検証できない</td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: 以下は原則テストを書く
+
+- Mutation（API 送信）の成功 / 失敗フロー
+- 空の状態・ローディング状態の表示
+- アクセシビリティ属性の付与確認
+
+🟢 **MAY**: 以下はテストを省略してよい
+
+- Design System コンポーネントの見た目（VRT で代替）
+- 自動生成コード（`src/api/generated/` 配下）
+- 定数定義・型定義のみのファイル
+
+---
+
+## 2. カバレッジ方針
+
+### 数値目標
+
+<table>
+  <thead>
+    <tr>
+      <th>対象</th>
+      <th>Line カバレッジ</th>
+      <th>方針</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>src/lib/</code></td>
+      <td><strong>90%</strong> 以上</td>
+      <td>インフラ共通層は高精度に保つ</td>
+    </tr>
+    <tr>
+      <td><code>src/features/</code></td>
+      <td><strong>70%</strong> 以上</td>
+      <td>業務ロジックを重点カバー</td>
+    </tr>
+    <tr>
+      <td><code>src/components/ui/</code></td>
+      <td><strong>60%</strong> 以上</td>
+      <td>Storybook + RNTL の組み合わせ</td>
+    </tr>
+    <tr>
+      <td><code>src/api/generated/</code></td>
+      <td>対象外</td>
+      <td>自動生成コードはカバレッジ計測から除外</td>
+    </tr>
+    <tr>
+      <td><code>src/app/</code></td>
+      <td>対象外</td>
+      <td>Screen は Integration Tests で代替</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST NOT**: カバレッジ数値を上げるためだけのテストを書かない  
+（空実装のテスト・`expect(true).toBe(true)` 等）  
+🟡 **SHOULD**: カバレッジが低い箇所を CI レポートで可視化し、レビューで議論する
+
+### jest 設定
+
+```ts
+// jest.config.ts
+import type { Config } from 'jest';
+
+const config: Config = {
+  preset: 'jest-expo',
+  setupFilesAfterFramework: ['<rootDir>/src/test/setup.ts'],
+
+  collectCoverageFrom: [
+    'src/**/*.{ts,tsx}',
+    '!src/api/generated/**',   // 自動生成除外
+    '!src/app/**',             // Screen 除外
+    '!src/**/*.stories.tsx',   // Story 除外
+    '!src/**/*.d.ts',
+    '!src/test/**',
+  ],
+
+  coverageThresholds: {
+    'src/lib/': {
+      lines:    90,
+      branches: 85,
+    },
+    'src/features/': {
+      lines:    70,
+      branches: 65,
+    },
+  },
+
+  // タイムゾーンを固定（Date 依存テストの再現性）
+  testEnvironmentOptions: {
+    timezone: 'Asia/Tokyo',
+  },
+
+  moduleNameMapper: {
+    '^@/(.*)$': '<rootDir>/src/$1',
+  },
+
+  // テストファイルの探索パターン
+  testMatch: [
+    '**/__tests__/**/*.test.{ts,tsx}',
+    '**/*.test.{ts,tsx}',
+  ],
+
+  // 遅いテストを検知する（2 秒超で警告）
+  slowTestThreshold: 2000,
+};
+
+export default config;
+```
+
+### テストセットアップファイル
+
+```ts
+// src/test/setup.ts
+import '@testing-library/react-native/extend-expect';
+import { server } from '@/mocks/server';
+
+// MSW の起動・停止
+beforeAll(() =>
+  server.listen({ onUnhandledRequest: 'error' })
+  //                                  ↑ 未定義リクエストは即 fail（意図しない外部通信を検知）
+);
+afterEach(() => server.resetHandlers());
+afterAll(()  => server.close());
+
+// タイマーのリセット（fake timer の漏れ防止）
+afterEach(() => {
+  jest.useRealTimers();
+  jest.clearAllTimers();
+});
+
+// notify のモック（全テストで共通）
+jest.mock('@/lib/notify', () => ({
+  notify: {
+    success:  jest.fn(),
+    error:    jest.fn(),
+    warning:  jest.fn(),
+    info:     jest.fn(),
+    snackbar: jest.fn(),
+    dialog:   jest.fn(),
+    dismiss:  jest.fn(),
+  },
+}));
+
+// clock / idProvider のモック（決定論的値の保証）
+jest.mock('@/lib/clock', () => ({
+  clock: { now: () => new Date('2026-01-15T09:00:00+09:00') },
+}));
+
+jest.mock('@/lib/idProvider', () => ({
+  idProvider: { generate: jest.fn().mockReturnValue('test-id-001') },
+}));
+```
+
+---
+
+## 3. テストの命名規約
+
+### ファイル配置
+
+```
+src/
+  lib/
+    formatPrice.ts
+    __tests__/
+      formatPrice.test.ts       ← lib の Logic Tests はここ
+
+  features/
+    order/
+      components/
+        OrderDetail.tsx
+        OrderDetail.test.tsx    ← Feature の Component Tests は同階層
+
+  components/
+    ui/
+      Button/
+        Button.tsx
+        Button.test.tsx         ← Design System の Component Tests は同階層
+        Button.stories.tsx
+```
+
+🟡 **SHOULD**: コンポーネントテストはコンポーネントと同階層に配置する  
+🟡 **SHOULD**: Feature / lib の Integration / Logic Tests は `__tests__/` ディレクトリに配置する
+
+### テスト名の書き方
+
+```ts
+// 構造: describe（対象）→ describe（状況）→ test（期待する振る舞い）
+
+describe('formatPrice', () => {
+  describe('JPY の場合', () => {
+    test('千円未満はカンマなしで返す', () => { ... });
+    test('千円以上はカンマ区切りで返す', () => { ... });
+    test('0 円は ¥0 を返す',             () => { ... });
+  });
+
+  describe('USD の場合', () => {
+    test('小数点 2 桁で返す', () => { ... });
+  });
+});
+```
+
+**命名ルール**
+
+🟡 **SHOULD**: `test` の文字列は「〜する」「〜を返す」「〜を表示する」の形で書く  
+🔴 **MUST NOT**: `test('正常系')` / `test('test1')` のような意味のない名前を使わない  
+🟡 **SHOULD**: `describe` は対象の名前（関数名・コンポーネント名）を使う  
+🟡 **SHOULD**: 内側の `describe` で **状況・前提条件** を表現する
+
+---
+
+## 4. Logic Tests（純粋関数・変換ロジック）
+
+最もコストパフォーマンスが高いテスト。迷わず書く。
+
+### 基本パターン
+
+```ts
+// src/lib/__tests__/formatPrice.test.ts
+import { formatPrice } from '@/lib/formatPrice';
+
+describe('formatPrice', () => {
+  describe('JPY', () => {
+    test('整数金額をカンマ区切りで返す', () => {
+      expect(formatPrice(1_500, 'JPY')).toBe('¥1,500');
+    });
+
+    test('0 円は ¥0 を返す', () => {
+      expect(formatPrice(0, 'JPY')).toBe('¥0');
+    });
+
+    test('負の値は符号付きで返す', () => {
+      expect(formatPrice(-500, 'JPY')).toBe('-¥500');
+    });
+  });
+
+  describe('USD', () => {
+    test('小数点 2 桁を保持する', () => {
+      expect(formatPrice(9.9, 'USD')).toBe('$9.90');
+    });
+  });
+
+  describe('不正な入力', () => {
+    test('NaN は空文字を返す', () => {
+      expect(formatPrice(NaN, 'JPY')).toBe('');
+    });
+  });
+});
+```
+
+### 境界値テスト
+
+```ts
+// 条件分岐の境界値を必ず網羅する
+describe('isOrderEditable', () => {
+  // 境界: ステータスによる編集可否
+  test.each([
+    ['pending',   true],
+    ['confirmed', false],
+    ['shipped',   false],
+    ['cancelled', false],
+  ])('ステータスが %s の場合 %s を返す', (status, expected) => {
+    expect(isOrderEditable({ status })).toBe(expected);
+  });
+});
+```
+
+🟡 **SHOULD**: 境界値（0 / null / undefined / 最大値 / 最小値）を必ずテストする  
+🟡 **SHOULD**: `test.each` で入出力のパターンを表形式で網羅する
+
+---
+
+## 5. Component Tests（Design System）
+
+Design System コンポーネントは **振る舞いのみ** をテストする。見た目は VRT に任せる。
+
+### 基本パターン
+
+```tsx
+// src/components/ui/Button/Button.test.tsx
+import { render, fireEvent } from '@testing-library/react-native';
+import { Button } from './Button';
+
+describe('Button', () => {
+  describe('onPress', () => {
+    test('タップすると onPress が呼ばれる', () => {
+      const onPress = jest.fn();
+      const { getByRole } = render(
+        <Button label="送信する" onPress={onPress} />
+      );
+      fireEvent.press(getByRole('button', { name: '送信する' }));
+      expect(onPress).toHaveBeenCalledTimes(1);
+    });
+
+    test('disabled のとき onPress が呼ばれない', () => {
+      const onPress = jest.fn();
+      const { getByRole } = render(
+        <Button label="送信する" onPress={onPress} disabled />
+      );
+      fireEvent.press(getByRole('button', { name: '送信する' }));
+      expect(onPress).not.toHaveBeenCalled();
+    });
+
+    test('loading のとき onPress が呼ばれない', () => {
+      const onPress = jest.fn();
+      const { getByRole } = render(
+        <Button label="送信する" onPress={onPress} loading />
+      );
+      fireEvent.press(getByRole('button', { name: '送信する' }));
+      expect(onPress).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('アクセシビリティ', () => {
+    test('accessibilityRole が button である', () => {
+      const { getByRole } = render(
+        <Button label="送信する" onPress={jest.fn()} />
+      );
+      expect(getByRole('button', { name: '送信する' })).toBeTruthy();
+    });
+
+    test('disabled のとき accessibilityState.disabled が true', () => {
+      const { getByRole } = render(
+        <Button label="送信する" onPress={jest.fn()} disabled />
+      );
+      expect(getByRole('button')).toHaveAccessibilityState({ disabled: true });
+    });
+  });
+});
+```
+
+### フォームフィールドのテスト
+
+```tsx
+// src/components/ui/FormField/FormField.test.tsx
+describe('FormField', () => {
+  describe('エラー表示', () => {
+    test('error が渡されたとき FieldError を表示する', () => {
+      const { getByRole, getByText } = render(
+        <FormField
+          label="メールアドレス"
+          error="正しいメールアドレスを入力してください"
+          value=""
+          onChangeText={jest.fn()}
+        />
+      );
+      // アクセシビリティツリーでエラーが alert として存在する
+      expect(getByRole('alert')).toBeTruthy();
+      expect(getByText('正しいメールアドレスを入力してください')).toBeTruthy();
+    });
+
+    test('error がないとき FieldError を表示しない', () => {
+      const { queryByRole } = render(
+        <FormField label="メールアドレス" value="" onChangeText={jest.fn()} />
+      );
+      expect(queryByRole('alert')).toBeNull();
+    });
+  });
+});
+```
+
+🔴 **MUST**: 要素の取得は `getByRole` / `getByLabelText` を使う（`getByTestId` は最終手段）  
+🔴 **MUST NOT**: スタイル・className のアサーションをテストに書かない（VRT の責務）
+
+---
+
+## 6. Screen Integration Tests
+
+**最も重要なテスト層。** API・状態・ナビゲーション込みの振る舞いを検証する。
+
+### 基本セットアップ
+
+```tsx
+// src/test/utils/createWrapper.tsx
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+
+export function createWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries:   { retry: false },  // テストでリトライさせない
+      mutations: { retry: false },
+    },
+  });
+
+  return function Wrapper({ children }: { children: React.ReactNode }) {
+    return (
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    );
+  };
+}
+```
+
+### Screen 全体のテスト（Expo Router 統合）
+
+```tsx
+// src/app/(main)/order/__tests__/order-detail.test.tsx
+import { renderRouter }  from 'expo-router/testing-library';
+import { server }        from '@/mocks/server';
+import { orderHandlers } from '@/mocks/handlers/orderHandlers';
+import { createOrder }   from '@/mocks/factories/orderFactory';
+import { notify }        from '@/lib/notify';
+
+const mockOrder = createOrder({ id: 'order-001', status: 'pending' });
+
+describe('注文詳細画面', () => {
+  describe('初期表示', () => {
+    test('注文情報を取得して表示する', async () => {
+      server.use(...orderHandlers.success([mockOrder]));
+
+      const { findByText } = renderRouter(
+        { '(main)/order/[id]': require('@/app/(main)/order/[id]').default },
+        { initialUrl: '/order/order-001' },
+      );
+
+      expect(await findByText('注文番号: order-001')).toBeTruthy();
+      expect(await findByText('¥1,500')).toBeTruthy();
+    });
+
+    test('404 のとき「注文が見つかりません」を表示する', async () => {
+      server.use(...orderHandlers.notFound);
+
+      const { findByText } = renderRouter(
+        { '(main)/order/[id]': require('@/app/(main)/order/[id]').default },
+        { initialUrl: '/order/order-404' },
+      );
+
+      expect(await findByText('注文が見つかりません')).toBeTruthy();
+    });
+
+    test('ネットワークエラーのとき ErrorState を表示する', async () => {
+      server.use(...orderHandlers.networkError);
+
+      const { findByRole } = renderRouter(
+        { '(main)/order/[id]': require('@/app/(main)/order/[id]').default },
+        { initialUrl: '/order/order-001' },
+      );
+
+      expect(await findByRole('button', { name: '再試行' })).toBeTruthy();
+    });
+  });
+
+  describe('注文キャンセル', () => {
+    test('キャンセルボタンを押すと confirm Dialog が表示される', async () => {
+      server.use(...orderHandlers.success([mockOrder]));
+
+      const { findByRole } = renderRouter(
+        { '(main)/order/[id]': require('@/app/(main)/order/[id]').default },
+        { initialUrl: '/order/order-001' },
+      );
+
+      fireEvent.press(await findByRole('button', { name: '注文をキャンセルする' }));
+
+      expect(notify.dialog).toHaveBeenCalledWith(
+        expect.objectContaining({ destructive: true }),
+      );
+    });
+
+    test('キャンセル成功後に success トーストを表示する', async () => {
+      server.use(
+        ...orderHandlers.success([mockOrder]),
+        ...orderHandlers.cancelSuccess,
+      );
+
+      const { findByRole } = renderRouter(
+        { '(main)/order/[id]': require('@/app/(main)/order/[id]').default },
+        { initialUrl: '/order/order-001' },
+      );
+
+      // Dialog の onConfirm を呼び出す
+      fireEvent.press(await findByRole('button', { name: '注文をキャンセルする' }));
+      const dialogCall = (notify.dialog as jest.Mock).mock.calls[0][0];
+      await act(async () => dialogCall.onConfirm());
+
+      expect(notify.success).toHaveBeenCalled();
+    });
+  });
+});
+```
+
+### 非同期の扱い
+
+```tsx
+// ✅ findBy* を使う（waitFor の簡略版。要素が見つかるまで待機する）
+const element = await findByText('読み込み完了');
+
+// ✅ waitFor で複数アサーションを待機
+await waitFor(() => {
+  expect(notify.success).toHaveBeenCalled();
+  expect(queryClient.getQueryData(queryKeys.orders.detail('1'))).toBeDefined();
+});
+
+// ❌ 避ける — setTimeout での待機（フレーキーになる）
+await new Promise(r => setTimeout(r, 100));
+expect(getByText('完了')).toBeTruthy();
+```
+
+🔴 **MUST**: 非同期 UI の確認は `findBy*` / `waitFor` を使う。`setTimeout` での待機禁止  
+🟡 **SHOULD**: `act()` は React の状態更新が伴う操作にのみ使う（過剰な `act` ラップは避ける）
+
+---
+
+## 7. Custom Hooks のテスト
+
+```tsx
+// src/features/order/hooks/__tests__/useOrderSubmit.test.tsx
+import { renderHook, waitFor, act } from '@testing-library/react-native';
+import { createWrapper }   from '@/test/utils/createWrapper';
+import { useOrderSubmit }  from '@/features/order/hooks/useOrderSubmit';
+import { server }          from '@/mocks/server';
+import { orderHandlers }   from '@/mocks/handlers/orderHandlers';
+import { createOrderInput } from '@/mocks/factories/orderFactory';
+import { notify }           from '@/lib/notify';
+
+describe('useOrderSubmit', () => {
+  test('送信成功時に success トーストを表示して query を invalidate する', async () => {
+    server.use(...orderHandlers.createSuccess);
+
+    const { result } = renderHook(
+      () => useOrderSubmit(),
+      { wrapper: createWrapper() },
+    );
+
+    await act(async () => {
+      result.current.mutate(createOrderInput());
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(notify.success).toHaveBeenCalledWith(
+      expect.stringContaining('受け付けました'),
+    );
+  });
+
+  test('422 のとき error を返す（notify は呼ばない）', async () => {
+    server.use(...orderHandlers.validationError);
+
+    const { result } = renderHook(
+      () => useOrderSubmit(),
+      { wrapper: createWrapper() },
+    );
+
+    await act(async () => {
+      result.current.mutate(createOrderInput());
+    });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.status).toBe(422);
+    expect(notify.error).not.toHaveBeenCalled(); // フィールドエラーは notify しない
+  });
+});
+```
+
+---
+
+## 8. テストダブル戦略
+
+### 使い分け原則
+
+<table>
+  <thead>
+    <tr>
+      <th>種類</th>
+      <th>使用場面</th>
+      <th>実装</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Mock</strong></td>
+      <td>呼び出しを検証したい（<code>notify</code> / <code>router.push</code> 等）</td>
+      <td><code>jest.fn()</code></td>
+    </tr>
+    <tr>
+      <td><strong>Stub</strong></td>
+      <td>依存の戻り値を制御したい（<code>httpClient</code> / <code>clock</code>）</td>
+      <td>MSW / <code>jest.fn().mockResolvedValue()</code></td>
+    </tr>
+    <tr>
+      <td><strong>Spy</strong></td>
+      <td>実装を維持しつつ呼び出しだけ記録したい</td>
+      <td><code>jest.spyOn()</code></td>
+    </tr>
+    <tr>
+      <td><strong>Fake</strong></td>
+      <td>実際に近い軽量実装で代替したい（<code>AsyncStorage</code>）</td>
+      <td><code>@react-native-async-storage/async-storage/jest/async-storage-mock</code></td>
+    </tr>
+  </tbody>
+</table>
+
+### MSW を第一選択にする理由
+
+```ts
+// ❌ 避ける — httpClient をモジュールモックで置き換える
+jest.mock('@/lib/httpClient', () => ({
+  httpClient: { get: jest.fn().mockResolvedValue({ id: '1', name: 'Taro' }) },
+}));
+
+// ✅ 推奨 — MSW でネットワーク層をインターセプトする
+server.use(
+  http.get('*/users/1', () =>
+    HttpResponse.json(createUser({ id: '1', name: 'Taro' })),
+  ),
+);
+```
+
+MSW を使う理由は 3 つある。
+第一に、`httpClient` 内の認証・Zod 検証・エラーハンドリングが実際に動く。
+第二に、同じハンドラを Storybook・Jest・E2E で共有できる。
+第三に、`onUnhandledRequest: 'error'` で未定義エンドポイントへのアクセスを即検知できる。
+
+🔴 **MUST**: API 呼び出しのモックは原則 MSW を使う  
+🔴 **MUST NOT**: `httpClient` をモジュールモックで丸ごと置き換えない  
+🟡 **SHOULD**: `jest.fn()` は外部システム（notify / router）の呼び出し確認にのみ使う
+
+### Expo Router のナビゲーションモック
+
+```tsx
+// ✅ renderRouter を使う（Expo Router 公式のテストユーティリティ）
+import { renderRouter } from 'expo-router/testing-library';
+
+// ❌ useRouter をモック関数で置き換えない
+jest.mock('expo-router', () => ({
+  useRouter: () => ({ push: jest.fn(), replace: jest.fn() }),
+}));
+```
+
+🔴 **MUST**: Expo Router のテストは `renderRouter` を使い、`useRouter` を手書きモックしない
+
+---
+
+## 9. テストデータ管理（Factory パターン）
+
+### Factory の実装規約
+
+```ts
+// src/mocks/factories/orderFactory.ts
+import { faker }       from '@faker-js/faker/locale/ja';
+import { orderSchema } from '@/api/generated/schemas';
+import type { z }      from 'zod';
+
+type Order = z.infer<typeof orderSchema>;
+
+// ─── Counter で決定論的な ID を生成 ──────────────────────────────────────
+let counter = 0;
+const nextId = () => `order-${String(++counter).padStart(4, '0')}`;
+
+// ─── Factory 本体 ─────────────────────────────────────────────────────────
+export function createOrder(overrides: Partial<Order> = {}): Order {
+  return {
+    id:        nextId(),
+    status:    'pending',
+    total:     faker.number.int({ min: 100, max: 50_000 }),
+    createdAt: '2026-01-15T09:00:00+09:00',  // clock モックと一致させる
+    items:     [createOrderItem()],
+    ...overrides,
+  };
+}
+
+export function createOrderItem(overrides: Partial<OrderItem> = {}): OrderItem {
+  return {
+    id:        nextId(),
+    productId: faker.string.uuid(),
+    name:      faker.commerce.productName(),
+    quantity:  faker.number.int({ min: 1, max: 5 }),
+    price:     faker.number.int({ min: 100, max: 10_000 }),
+    ...overrides,
+  };
+}
+
+// ─── リスト生成ヘルパー ───────────────────────────────────────────────────
+export function createOrderList(
+  count: number,
+  overrides: Partial<Order> = {},
+): Order[] {
+  return Array.from({ length: count }, () => createOrder(overrides));
+}
+
+// ─── カーソルページネーションレスポンス ───────────────────────────────────
+export function createOrderPage(
+  items: Order[],
+  hasMore = false,
+): { items: Order[]; nextCursor: string | null; hasMore: boolean } {
+  return {
+    items,
+    nextCursor: hasMore ? `cursor_${items.at(-1)?.id}` : null,
+    hasMore,
+  };
+}
+```
+
+### Factory 使用規約
+
+```ts
+// ✅ 正解 — Factory でデフォルト値を生成し、必要な部分だけ上書きする
+const order = createOrder({ status: 'cancelled' });
+
+// ❌ 禁止 — オブジェクトリテラルで全フィールドを手書きする
+const order = {
+  id:        'order-001',
+  status:    'cancelled',
+  total:     1500,
+  createdAt: '2026-01-15',
+  items:     [],
+};
+```
+
+🔴 **MUST**: テストデータは Factory 経由で生成する（オブジェクトリテラル直書き禁止）  
+🟡 **SHOULD**: テストに関係のないフィールドはオーバーライドせずデフォルト値のままにする  
+🟡 **SHOULD**: `beforeEach` で counter をリセットし、テスト間の ID 衝突を防ぐ
+
+```ts
+beforeEach(() => {
+  counter = 0;  // Factory の counter をリセット
+  jest.clearAllMocks();
+});
+```
+
+---
+
+## 10. タイマー・日時のテスト
+
+### 日時
+
+`clock` モックが `setup.ts` で全テストに適用されるため、
+`new Date()` / `Date.now()` は直接使わない。
+
+```ts
+// ✅ 正解 — clock モックの値と一致する定数を Factory で使用
+export function createOrder(): Order {
+  return {
+    createdAt: '2026-01-15T09:00:00+09:00',  // clock.now() と一致
+    ...
+  };
+}
+
+// ❌ 禁止 — テスト内で直接 new Date()
+const order = createOrder({ createdAt: new Date().toISOString() });
+```
+
+### タイマー（setTimeout / setInterval）
+
+```ts
+// ✅ fake timer を使う
+jest.useFakeTimers();
+
+test('3 秒後に Toast が消える', () => {
+  const { queryByRole } = render(<Toast item={...} />);
+  expect(queryByRole('alert')).toBeTruthy();
+
+  act(() => jest.advanceTimersByTime(3000));
+
+  expect(queryByRole('alert')).toBeNull();
+});
+
+// setup.ts の afterEach で useRealTimers() が呼ばれるので、
+// テスト終了時のクリーンアップは不要
+```
+
+---
+
+## 11. 非同期エラーのテスト
+
+```ts
+// ✅ rejects.toThrow でエラーの型と内容を検証
+test('サーバー 500 は NetworkError を throw する', async () => {
+  server.use(http.get('*/orders', () => HttpResponse.error()));
+
+  await expect(
+    httpClient.get('/orders', ordersSchema),
+  ).rejects.toBeInstanceOf(NetworkError);
+});
+
+// ✅ try-catch でエラープロパティを詳細検証
+test('404 は HttpError を throw し status が 404 である', async () => {
+  server.use(
+    http.get('*/orders/999', () =>
+      HttpResponse.json({ message: 'Not found' }, { status: 404 }),
+    ),
+  );
+
+  try {
+    await httpClient.get('/orders/999', orderSchema);
+    fail('エラーが throw されるべき');
+  } catch (err) {
+    expect(err).toBeInstanceOf(HttpError);
+    expect((err as HttpError).status).toBe(404);
+  }
+});
+```
+
+---
+
+## 12. MSW ハンドラ設計標準
+
+### ハンドラの構造
+
+```ts
+// src/mocks/handlers/orderHandlers.ts
+import { http, HttpResponse } from 'msw';
+import { createOrder, createOrderPage } from '@/mocks/factories/orderFactory';
+
+const BASE = process.env.EXPO_PUBLIC_API_BASE_URL;
+
+export const orderHandlers = {
+  // ── 正常系 ────────────────────────────────────────────────────────────────
+
+  // 一覧取得（引数で items を差し替え可能）
+  list: (items = createOrderList(5)) => [
+    http.get(`${BASE}/orders`, () =>
+      HttpResponse.json(createOrderPage(items)),
+    ),
+  ],
+
+  // 詳細取得（ID を動的に解決）
+  detail: (order = createOrder()) => [
+    http.get(`${BASE}/orders/:id`, ({ params }) =>
+      HttpResponse.json(order.id === params.id ? order : createOrder({ id: params.id as string })),
+    ),
+  ],
+
+  // 作成成功
+  createSuccess: [
+    http.post(`${BASE}/orders`, async ({ request }) => {
+      const body = await request.json();
+      return HttpResponse.json(createOrder(body as Partial<Order>), { status: 201 });
+    }),
+  ],
+
+  // キャンセル成功
+  cancelSuccess: [
+    http.patch(`${BASE}/orders/:id/cancel`, ({ params }) =>
+      HttpResponse.json(createOrder({ id: params.id as string, status: 'cancelled' })),
+    ),
+  ],
+
+  // ── 異常系 ────────────────────────────────────────────────────────────────
+
+  notFound: [
+    http.get(`${BASE}/orders/:id`, () =>
+      HttpResponse.json({ message: 'Not found' }, { status: 404 }),
+    ),
+  ],
+
+  validationError: [
+    http.post(`${BASE}/orders`, () =>
+      HttpResponse.json(
+        { quantity: ['1 以上の値を入力してください'] },
+        { status: 422 },
+      ),
+    ),
+  ],
+
+  serverError: [
+    http.get(`${BASE}/orders`, () =>
+      HttpResponse.json({ message: 'Internal Server Error' }, { status: 500 }),
+    ),
+  ],
+
+  networkError: [
+    http.get(`${BASE}/orders`, () => HttpResponse.error()),
+  ],
+
+  // ── 遅延レスポンス（ローディング状態テスト用）──────────────────────────
+
+  slowResponse: (delayMs = 2000) => [
+    http.get(`${BASE}/orders`, async () => {
+      await delay(delayMs);
+      return HttpResponse.json(createOrderPage(createOrderList(5)));
+    }),
+  ],
+};
+```
+
+### ハンドラ設計の規約
+
+🔴 **MUST**: 正常系・404・500・NetworkError の 4 パターンを全エンドポイントで用意する  
+🟡 **SHOULD**: 異常系ハンドラは `server.use()` で上書きする形にし、正常系をデフォルトにする  
+🟡 **SHOULD**: 遅延ハンドラをローディング状態のテストで使い、Skeleton の表示を確認する
+
+---
+
+## 13. Storybook Play 関数によるインタラクションテスト
+
+```tsx
+// src/components/ui/FormField/FormField.stories.tsx
+import type { Meta, StoryObj }     from '@storybook/react';
+import { expect, userEvent, within } from '@storybook/test';
+import { FormField }               from './FormField';
+
+const meta: Meta<typeof FormField> = {
+  title:     'UI/FormField',
+  component: FormField,
+};
+export default meta;
+
+type Story = StoryObj<typeof FormField>;
+
+// Play 関数 — web Storybook の addon-vitest でテストとして実行される
+export const ShowsErrorOnBlur: Story = {
+  args: {
+    label:        'メールアドレス',
+    value:        '',
+    onChangeText: () => {},
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const input  = canvas.getByLabelText('メールアドレス');
+
+    // 入力して即クリア → blur でエラーが出るケース
+    await userEvent.type(input, 'invalid');
+    await userEvent.clear(input);
+    await userEvent.tab();
+
+    // エラーメッセージが表示される
+    await expect(
+      canvas.getByRole('alert'),
+    ).toBeInTheDocument();
+  },
+};
+
+export const ClearsErrorOnValidInput: Story = {
+  args: {
+    label:        'メールアドレス',
+    value:        '',
+    error:        '正しいメールアドレスを入力してください',
+    onChangeText: () => {},
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const input  = canvas.getByLabelText('メールアドレス');
+
+    await userEvent.type(input, 'valid@example.com');
+
+    // エラーが消える（親から error prop が消えた状態）
+    // Story 側で制御するには args を更新する必要があるため、
+    // ここでは error が表示されていることの確認にとどめる
+    await expect(canvas.getByRole('alert')).toBeVisible();
+  },
+};
+```
+
+🟡 **SHOULD**: インタラクションが複雑なコンポーネントは Play 関数を書く  
+🟡 **SHOULD**: Play 関数は web Storybook の `addon-vitest` で CI テストとして実行する
+
+---
+
+## 14. テストのアンチパターン
+
+### 実装の詳細をテストしない
+
+```tsx
+// ❌ アンチパターン — 内部状態を直接確認する
+test('フラグが true になる', () => {
+  const { result } = renderHook(() => useOrderForm());
+  act(() => result.current.setIsSubmitting(true));
+  expect(result.current.isSubmitting).toBe(true);
+});
+
+// ✅ 正解 — ユーザーが観察できる振る舞いを確認する
+test('送信中はボタンが disabled になる', async () => {
+  server.use(...orderHandlers.slowResponse(5000));
+  jest.useFakeTimers();
+
+  const { getByRole } = render(<OrderSubmitButton />);
+  fireEvent.press(getByRole('button', { name: '送信する' }));
+
+  await waitFor(() =>
+    expect(getByRole('button')).toHaveAccessibilityState({ disabled: true }),
+  );
+});
+```
+
+### テスト間で状態を共有しない
+
+```tsx
+// ❌ アンチパターン — describe スコープの変数をテスト間で使い回す
+describe('OrderList', () => {
+  let orders: Order[];  // ← テスト間で共有される
+
+  beforeAll(() => {
+    orders = createOrderList(3);
+    server.use(...orderHandlers.list(orders));
+  });
+
+  test('A', async () => { orders.push(createOrder()); ... });  // 副作用が漏れる
+  test('B', async () => { /* orders が変わっている */ });
+});
+
+// ✅ 正解 — 各テストで独立したデータを作る
+describe('OrderList', () => {
+  test('A', async () => {
+    const orders = createOrderList(3);
+    server.use(...orderHandlers.list(orders));
+    ...
+  });
+
+  test('B', async () => {
+    const orders = createOrderList(5);
+    server.use(...orderHandlers.list(orders));
+    ...
+  });
+});
+```
+
+### `getByTestId` を主要セレクタにしない
+
+```tsx
+// ❌ アンチパターン — testID 依存（リファクタリングに弱い）
+const button = getByTestId('submit-button');
+
+// ✅ 正解 — ユーザーが認識できる属性で取得
+const button = getByRole('button', { name: '送信する' });
+const input  = getByLabelText('メールアドレス');
+const text   = getByText('注文番号: order-001');
+```
+
+🔴 **MUST NOT**: `getByTestId` を主要セレクタとして使う（E2E の補助としては許容）  
+🔴 **MUST NOT**: 実装の内部状態（state / hooks の戻り値）を直接アサートする  
+🔴 **MUST NOT**: テスト間で可変な変数を `describe` スコープで共有する  
+🔴 **MUST NOT**: スナップショットテスト（`toMatchSnapshot`）を Design System に使う  
+　（スナップショットは変更のたびに更新され、レビューの意味が薄れるため）
+
+---
+
+## 15. CI ゲートとレポーティング
+
+### CI 設定
+
+```yaml
+# .gitlab-ci.yml（テスト関連の完全版）
+
+unit-test:
+  stage: test
+  script:
+    - pnpm test --ci --coverage --coverageReporters=text-summary,lcov
+  coverage: '/Lines\s*:\s*(\d+\.?\d*)%/'   # GitLab の Coverage 表示に使用
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 30 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+storybook-vitest:
+  stage: test
+  script:
+    - pnpm build:storybook:web
+    - pnpm test:storybook
+  artifacts:
+    when: always
+    reports:
+      junit: storybook-test-results.xml
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+```
+
+### カバレッジ可視化
+
+GitLab CE は `coverage:` キーワードで MR にカバレッジを表示できる。
+Cobertura 形式を `artifacts.reports.coverage_report` に指定することで、
+MR の「Changes」タブにファイルごとのカバレッジ行表示が有効になる。
+
+🟡 **SHOULD**: MR ごとのカバレッジ変化（+ / -）を確認する習慣を作る  
+🔴 **MUST NOT**: カバレッジが下がる MR をマージしない（ただし破壊的リファクタは例外として記録する）
+
+---
+
+## 16. 05_Quality との関係
+
+本書（11）と 05_Quality の責務分担を明示する。
+
+<table>
+  <thead>
+    <tr>
+      <th>内容</th>
+      <th>05_Quality</th>
+      <th>11_Test_Strategy（本書）</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>テスト種別の一覧</td>
+      <td>✅ 定義</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>Storybook 二系統の構成</td>
+      <td>✅ 定義</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>CI ゲートの種類</td>
+      <td>✅ 定義</td>
+      <td>設定の詳細を補完</td>
+    </tr>
+    <tr>
+      <td><strong>何をテストすべきか</strong></td>
+      <td>—</td>
+      <td>✅ 判断基準</td>
+    </tr>
+    <tr>
+      <td><strong>どう書くか（実装パターン）</strong></td>
+      <td>—</td>
+      <td>✅ コードサンプル付き</td>
+    </tr>
+    <tr>
+      <td><strong>カバレッジ数値目標</strong></td>
+      <td>—</td>
+      <td>✅ 定義</td>
+    </tr>
+    <tr>
+      <td><strong>アンチパターン</strong></td>
+      <td>—</td>
+      <td>✅ 定義</td>
+    </tr>
+    <tr>
+      <td><strong>Factory / MSW の設計</strong></td>
+      <td>—</td>
+      <td>✅ 詳細規約</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 17. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,1350 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Integrations/AWS Mobile Services" />
+
+# AWS モバイル関連サービス利用ガイド
+
+> **ステータス**: `APPROVED`  
+> **対象**: Expo アプリで AWS の S3 / CloudFront / Cognito / SNS / AppSync を採用する場合の責務分離・実装規約  
+> **依存（参照先）**: [08_API_Communication](?path=/docs/architecture-handbook-api-communication--docs)（httpClient）/ [13_Push_Notifications](?path=/docs/architecture-handbook-push-notifications--docs)（通知方針）/ [21_File_Media](?path=/docs/architecture-handbook-file-media--docs)（ファイル選択）/ [23_Feature_Flags](?path=/docs/architecture-handbook-feature-flags--docs)（環境変数管理）  
+> **被参照（参照元）**: [08_API_Communication](?path=/docs/architecture-handbook-api-communication--docs) §認証インターセプター / [21_File_Media](?path=/docs/architecture-handbook-file-media--docs) §アップロード連携  
+> **RFC 2119 準拠**: 本文書の 🔴 **MUST** / 🔴 **MUST NOT** / 🟡 **SHOULD** は [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) の定義に従う
+
+---
+
+## 目次
+
+1. [採用方針と責務分離](#1-採用方針と責務分離)
+2. [環境分離と設定値管理](#2-環境分離と設定値管理)
+3. [S3 アップロード方式](#3-s3-アップロード方式)
+4. [CloudFront 配信方式](#4-cloudfront-配信方式)
+5. [Cognito 認証方式](#5-cognito-認証方式)
+6. [SNS 利用方式](#6-sns-利用方式)
+7. [AppSync 利用方式](#7-appsync-利用方式)
+8. [テストとモック戦略](#8-テストとモック戦略)
+9. [セキュリティと運用チェックリスト](#9-セキュリティと運用チェックリスト)
+10. [推奨ディレクトリ構成](#10-推奨ディレクトリ構成)
+11. [変更履歴](#11-変更履歴)
+
+---
+
+## 1. 採用方針と責務分離
+
+### 結論
+
+このアプリでは、**AWS を端末から直接たたく範囲を極小化する**。  
+原則は **mobile app → 自社 API / BFF → AWS** であり、端末からの AWS 直アクセスは次の 3 パターンに限定する。
+
+1. **Cognito Hosted UI + PKCE** によるユーザー認証
+2. **S3 Presigned URL** によるユーザー生成ファイルのアップロード
+3. **AppSync** による GraphQL Query / Mutation / Subscription（後述の採用条件を満たす場合のみ）
+
+🔴 **MUST**: 端末内に AWS の `accessKeyId` / `secretAccessKey` を保持しない  
+🔴 **MUST**: 管理者権限を持つ AWS API（SNS Publish、CloudFront Invalidation、S3 Delete など）をアプリから直接呼ばない  
+🔴 **MUST**: AWS 採用後も既存の `httpClient` / React Query / `src/lib` ラッパー構成を崩さない
+
+### サービス別の責務マップ
+
+| AWS サービス | 採用 | モバイルからの直接利用 | 主用途 | 判断 |
+|-------------|------|----------------------|--------|------|
+| **S3** | ✅ 採用 | 制限付きで許可 | 画像・PDF・動画などのオブジェクト保管 | **Presigned URL 経由のみ許可** |
+| **CloudFront** | ✅ 採用 | 読み取りのみ | 配信高速化・署名付き配布・キャッシュ | **S3 直 URL を使わず CloudFront 経由に統一** |
+| **Cognito User Pools** | ✅ 条件付き採用 | 許可 | 認証・トークン発行 | **Hosted UI + PKCE を標準** |
+| **Cognito Identity Pools** | 🟡 例外採用 | 制限付きで許可 | 一時 AWS Credentials 発行 | **Presigned URL で足りるなら不採用** |
+| **SNS** | ✅ バックエンド専用 | 禁止 | SMS・トピック配信・業務通知 | **Publish はサーバー責務** |
+| **AppSync** | 🟡 条件付き採用 | 許可 | GraphQL API・Subscription | **§7 の採用条件を参照** |
+| **AWS Amplify（全面導入）** | ❌ 不採用 | - | 包括 SDK | **責務過多・バンドル肥大・状態管理の二重化を招く** |
+
+### 推奨アーキテクチャ
+
+```text
+Mobile App
+  ├─ 認証            → Cognito Hosted UI (PKCE)
+  ├─ API             → httpClient → BFF / Backend
+  ├─ ファイル送信     → Backend で presign → S3 へ PUT
+  ├─ 配信 URL 利用    → CloudFront URL / Signed URL
+  ├─ 通知要求         → Backend → SNS
+  └─ リアルタイム      → AppSync（採用条件を満たす場合のみ）
+```
+
+🟡 **SHOULD**: AWS の利用を「認証」「オブジェクト保管」「配信」「リアルタイム」の 4 役に固定する  
+🔴 **MUST NOT**: Amplify DataStore と React Query 永続化を同時採用しない（同期責務が競合する）
+
+---
+
+## 2. 環境分離と設定値管理
+
+### AWS アカウント / リソースの分離
+
+```text
+AWS Accounts
+  ├─ mobile-dev
+  ├─ mobile-staging
+  └─ mobile-production
+```
+
+🔴 **MUST**: `dev / staging / production` で AWS アカウントまたは最低でも主要リソースを分離する  
+🔴 **MUST**: 本番の S3 バケット・CloudFront Distribution・Cognito User Pool・AppSync API を開発環境と共有しない  
+🟡 **SHOULD**: CloudFront / Cognito / AppSync のドメインも環境別に分ける
+
+### `EXPO_PUBLIC_*` に置いてよい値
+
+`EXPO_PUBLIC_*` に置いてよいのは **公開識別子のみ**。秘密情報は入れない。
+
+```bash
+# .env.example
+EXPO_PUBLIC_AWS_REGION=
+EXPO_PUBLIC_CLOUDFRONT_BASE_URL=
+EXPO_PUBLIC_COGNITO_DOMAIN=
+EXPO_PUBLIC_COGNITO_USER_POOL_ID=
+EXPO_PUBLIC_COGNITO_USER_POOL_CLIENT_ID=
+# Identity Pool は例外採用時のみ定義する
+EXPO_PUBLIC_COGNITO_IDENTITY_POOL_ID=
+EXPO_PUBLIC_APPSYNC_GRAPHQL_URL=
+EXPO_PUBLIC_APPSYNC_AUTH_MODE=
+```
+
+```ts
+// src/lib/aws/env.ts
+import { z } from 'zod';
+
+const awsEnvSchema = z.object({
+  EXPO_PUBLIC_AWS_REGION: z.string().min(1),
+  EXPO_PUBLIC_CLOUDFRONT_BASE_URL: z.string().url(),
+  EXPO_PUBLIC_COGNITO_DOMAIN: z.string().min(1),
+  EXPO_PUBLIC_COGNITO_USER_POOL_ID: z.string().min(1),
+  EXPO_PUBLIC_COGNITO_USER_POOL_CLIENT_ID: z.string().min(1),
+  // Identity Pool は例外採用時のみ必須化する
+  EXPO_PUBLIC_COGNITO_IDENTITY_POOL_ID: z.string().optional(),
+  EXPO_PUBLIC_APPSYNC_GRAPHQL_URL: z.string().url().optional(),
+  EXPO_PUBLIC_APPSYNC_AUTH_MODE: z.enum(['userPools', 'iam', 'apiKey']).optional(),
+});
+
+const parsed = awsEnvSchema.safeParse(process.env);
+
+if (!parsed.success) {
+  const formatted = parsed.error.format();
+  // staging / production は即時クラッシュ。dev は警告にとどめてモック動作を許容する
+  if (
+    process.env.EXPO_PUBLIC_APP_ENV === 'production' ||
+    process.env.EXPO_PUBLIC_APP_ENV === 'staging'
+  ) {
+    throw new Error(`AWS environment variables are invalid: ${JSON.stringify(formatted)}`);
+  } else {
+    console.warn('[aws/env] Invalid AWS env — using empty fallback for local dev:', formatted);
+  }
+}
+
+export const awsEnv = parsed.data ?? ({} as z.infer<typeof awsEnvSchema>);
+```
+
+🔴 **MUST**: `EXPO_PUBLIC_*` に secret / private key / signing key を入れない  
+🔴 **MUST**: CloudFront signed URL の秘密鍵、SNS publish 権限、AppSync 管理 API キーはサーバー側だけに置く  
+🔴 **MUST**: staging / production は Zod バリデーション失敗で即時クラッシュさせる  
+🟡 **SHOULD**: dev 環境はバリデーション失敗を警告どまりとし、MSW モックでの開発を継続可能にする
+
+---
+
+## 3. S3 アップロード方式
+
+### 結論
+
+S3 アップロードは **Presigned URL を BFF で発行して PUT する方式** を標準とする。  
+アプリは S3 バケット名も IAM 権限も知らなくてよい。
+
+### 標準フロー
+
+```text
+1. アプリが Backend に「アップロード予約」を要求
+2. Backend が objectKey を決定し Presigned URL を返す
+3. アプリが S3 に直接 PUT（XHR で進捗取得）
+4. アプリが Backend に完了通知
+5. Backend が DB にメタデータを保存
+```
+
+🔴 **MUST**: object key はサーバー側で決定する  
+🔴 **MUST**: S3 オブジェクトは **private** を前提とし、`public-read` ACL を使わない  
+🔴 **MUST**: ファイル登録は「S3 PUT 成功」と「業務 DB 登録」を分離し、完了通知で整合を取る  
+🔴 **MUST**: 20MB 超のアップロードは `uploadLargeFileToS3`（multipart）に切り替える  
+🔴 **MUST**: サイズ判定は **Blob 展開前**に行う（メモリ節約のため）
+
+### object key 命名規約
+
+```text
+{env}/{tenantId}/{category}/{yyyy}/{mm}/{uuid}-{sanitizedFilename}
+```
+
+例:
+
+```text
+production/acme/avatar/2026/04/3f6a1f8d-user-photo.jpg
+```
+
+🔴 **MUST**: object key にメールアドレス・電話番号・氏名を含めない  
+🟡 **SHOULD**: 再生成時は UUID か content hash を変えてキャッシュ破棄より **キー変更** を優先する
+
+### Presigned URL の有効期限
+
+> S3 Presigned URL と CloudFront Signed URL は別物。それぞれ独立した有効期限を設定する。
+
+| 対象 | 操作 | 有効期限の上限 |
+|------|------|--------------|
+| **S3 Presigned URL** | PUT（アップロード） | **5 分** |
+| **S3 Presigned URL** | GET（ダウンロード直接参照） | 原則不使用（CloudFront 経由に統一） |
+| **CloudFront Signed URL** | 一時プレビュー画像 | 5 分 |
+| **CloudFront Signed URL** | PDF ダウンロード | 1〜10 分 |
+| **CloudFront Signed URL** | ストリーミング動画 | 10〜60 分 |
+
+🔴 **MUST**: S3 Presigned URL（PUT）の有効期限は **5 分以内** にする  
+🔴 **MUST**: CloudFront Signed URL の有効期限はコンテンツ種別ごとに上表に従う
+
+### 通常アップロード実装（20MB 以下）
+
+```ts
+// src/lib/aws/s3Upload.ts
+import { z } from 'zod';
+import { httpClient } from '@/lib/httpClient';
+import type { PickedFile } from '@/lib/filePicker';
+
+const LARGE_FILE_THRESHOLD = 20 * 1024 * 1024; // 20MB
+
+const createUploadSessionResponseSchema = z.object({
+  objectKey: z.string(),
+  uploadUrl: z.string().url(),
+  requiredHeaders: z.record(z.string()).default({}),
+  expiresInSeconds: z.number().int().positive(),
+});
+
+const completeUploadResponseSchema = z.object({
+  assetId: z.string(),
+  objectKey: z.string(),
+});
+
+export type UploadProgressCallback = (loaded: number, total: number) => void;
+
+export class S3UploadError extends Error {
+  constructor(
+    public readonly code:
+      | 'PRESIGNED_URL_EXPIRED_OR_INVALID'
+      | 'HTTP_ERROR'
+      | 'NETWORK_ERROR'
+      | 'TIMEOUT',
+    public readonly httpStatus: number,
+  ) {
+    super(`S3 upload failed: ${code} (status=${httpStatus})`);
+    this.name = 'S3UploadError';
+  }
+}
+
+/** ネットワーク断と HTTP エラーを区別して throw する */
+async function putToS3(
+  url: string,
+  blob: Blob,
+  headers: Record<string, string>,
+  mimeType: string,
+  onProgress?: UploadProgressCallback,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    xhr.setRequestHeader('Content-Type', mimeType);
+    for (const [key, value] of Object.entries(headers)) {
+      xhr.setRequestHeader(key, value);
+    }
+
+    if (onProgress) {
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) onProgress(e.loaded, e.total);
+      });
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+      } else if (xhr.status === 403) {
+        // Presigned URL 有効期限切れを含む認証失敗
+        reject(new S3UploadError('PRESIGNED_URL_EXPIRED_OR_INVALID', xhr.status));
+      } else {
+        reject(new S3UploadError('HTTP_ERROR', xhr.status));
+      }
+    };
+
+    xhr.onerror = () => reject(new S3UploadError('NETWORK_ERROR', 0));
+    xhr.ontimeout = () => reject(new S3UploadError('TIMEOUT', 0));
+
+    xhr.send(blob);
+  });
+}
+
+/**
+ * Presigned URL が有効期限切れだった場合は再発行して 1 回だけリトライする。
+ * ネットワーク断はそのまま上位へ throw し、UI 側でリトライを促す。
+ *
+ * @throws {S3UploadError} アップロード失敗時
+ * @throws {Error} ファイルサイズが閾値超の場合（uploadLargeFileToS3 を使うこと）
+ */
+export async function uploadFileToS3(
+  file: PickedFile,
+  options?: { onProgress?: UploadProgressCallback },
+): Promise<z.infer<typeof completeUploadResponseSchema>> {
+  // サイズ判定を Blob 展開前に行う
+  if (file.size > LARGE_FILE_THRESHOLD) {
+    throw new Error(
+      `File size ${file.size} exceeds ${LARGE_FILE_THRESHOLD} bytes. Use uploadLargeFileToS3 instead.`,
+    );
+  }
+
+  const presign = async () =>
+    httpClient.post(
+      '/v1/uploads/presign',
+      { filename: file.name, mimeType: file.mimeType, size: file.size },
+      createUploadSessionResponseSchema,
+    );
+
+  let session = await presign();
+  // 閾値確認後に Blob を展開する
+  const blob = await (await fetch(file.uri)).blob();
+
+  const attemptPut = async () =>
+    putToS3(session.uploadUrl, blob, session.requiredHeaders, file.mimeType, options?.onProgress);
+
+  try {
+    await attemptPut();
+  } catch (err) {
+    if (err instanceof S3UploadError && err.code === 'PRESIGNED_URL_EXPIRED_OR_INVALID') {
+      // 有効期限切れ → 再 presign してリトライ（1 回のみ）
+      session = await presign();
+      await attemptPut();
+    } else {
+      throw err;
+    }
+  }
+
+  return httpClient.post(
+    '/v1/uploads/complete',
+    { objectKey: session.objectKey, size: file.size, mimeType: file.mimeType },
+    completeUploadResponseSchema,
+  );
+}
+```
+
+### Multipart アップロード実装（20MB 超）
+
+Backend が multipart session（`uploadId` + パート別 presigned URL のリスト）を発行し、アプリは各パートを PUT した後に完了を通知する。
+
+```ts
+// src/lib/aws/s3MultipartUpload.ts
+import pLimit from 'p-limit';
+import { z } from 'zod';
+import { httpClient } from '@/lib/httpClient';
+import type { PickedFile } from '@/lib/filePicker';
+import type { UploadProgressCallback } from './s3Upload';
+
+const PART_SIZE = 10 * 1024 * 1024; // 10MB
+/** 同時 PUT 数の上限。帯域を占有しないよう制限する */
+const UPLOAD_CONCURRENCY = 4;
+
+const multipartSessionSchema = z.object({
+  objectKey: z.string(),
+  uploadId: z.string(),
+  parts: z.array(
+    z.object({
+      partNumber: z.number().int().positive(),
+      uploadUrl: z.string().url(),
+    }),
+  ),
+});
+
+const completeMultipartSchema = z.object({
+  assetId: z.string(),
+  objectKey: z.string(),
+});
+
+export type MultipartUploadState = {
+  objectKey: string;
+  uploadId: string;
+};
+
+/**
+ * 大容量ファイルの multipart アップロード。
+ *
+ * バックグラウンド遷移で中断した場合は OS の制約上 PUT の完走を保証できない。
+ * フォアグラウンド復帰後に呼び出し元が再開 UI を提示すること。
+ * 中断した uploadId はサーバー側でライフサイクルルール（7 日）により自動削除されるため、
+ * クライアント側での明示的なキャンセル API 呼び出しは任意とする。
+ */
+export async function uploadLargeFileToS3(
+  file: PickedFile,
+  options?: { onProgress?: UploadProgressCallback },
+): Promise<z.infer<typeof completeMultipartSchema>> {
+  const session = await httpClient.post(
+    '/v1/uploads/multipart/presign',
+    { filename: file.name, mimeType: file.mimeType, size: file.size, partSize: PART_SIZE },
+    multipartSessionSchema,
+  );
+
+  const blob = await (await fetch(file.uri)).blob();
+
+  // 各パートの「前回イベント時点の loaded」を記録して差分で集計する
+  const partPreviousLoaded = new Map<number, number>();
+  let totalLoaded = 0;
+
+  const limit = pLimit(UPLOAD_CONCURRENCY);
+
+  const etags = await Promise.all(
+    session.parts.map(({ partNumber, uploadUrl }) =>
+      limit(
+        () =>
+          new Promise<{ partNumber: number; etag: string }>((resolve, reject) => {
+            const start = (partNumber - 1) * PART_SIZE;
+            const chunk = blob.slice(start, start + PART_SIZE, file.mimeType);
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('PUT', uploadUrl);
+            xhr.setRequestHeader('Content-Type', file.mimeType);
+
+            xhr.upload.addEventListener('progress', (e) => {
+              if (e.lengthComputable && options?.onProgress) {
+                // XHR progress の loaded は累積値なので、差分だけ totalLoaded に加算する
+                const prev = partPreviousLoaded.get(partNumber) ?? 0;
+                totalLoaded += e.loaded - prev;
+                partPreviousLoaded.set(partNumber, e.loaded);
+                options.onProgress(totalLoaded, file.size);
+              }
+            });
+
+            xhr.onload = () => {
+              if (xhr.status >= 200 && xhr.status < 300) {
+                const etag = xhr.getResponseHeader('ETag') ?? '';
+                resolve({ partNumber, etag });
+              } else {
+                reject(new Error(`Part ${partNumber} upload failed: ${xhr.status}`));
+              }
+            };
+            xhr.onerror = () => reject(new Error(`Part ${partNumber} network error`));
+            xhr.send(chunk);
+          }),
+      ),
+    ),
+  );
+
+  return httpClient.post(
+    '/v1/uploads/multipart/complete',
+    { objectKey: session.objectKey, uploadId: session.uploadId, parts: etags },
+    completeMultipartSchema,
+  );
+}
+```
+
+🔴 **MUST**: ファイルサイズが 20MB を超える場合は `uploadLargeFileToS3` へ自動切り替えする  
+🔴 **MUST**: `21_File_Media` の `filePicker` を通したファイルだけをアップロード対象にする  
+🔴 **MUST**: S3 PUT 失敗時は DB の登録 API を呼ばない  
+🔴 **MUST**: 同時 PUT 数は `UPLOAD_CONCURRENCY`（4）以下に制限する  
+🟡 **SHOULD**: 完了後に一時ファイルを削除し、キャッシュ肥大を防ぐ  
+🟡 **SHOULD**: バックグラウンド遷移でアップロードが中断した場合は `expo-task-manager` を使わず、フォアグラウンド復帰後に再開 UI を提示する
+
+### バケット設定の必須条件
+
+| 項目 | 方針 |
+|------|------|
+| **Block Public Access** | 有効化する |
+| **Default Encryption** | SSE-S3 または SSE-KMS を有効化する |
+| **CORS** | 後述の CORS ポリシー例を参照 |
+| **Lifecycle Rule** | 一時ファイル・失敗 multipart upload を自動削除（7 日） |
+| **Versioning** | 監査要件がある場合のみ有効化 |
+
+#### S3 CORS ポリシー例
+
+```json
+[
+  {
+    "AllowedHeaders": ["Content-Type"],
+    "AllowedMethods": ["PUT", "GET", "HEAD"],
+    "AllowedOrigins": [
+      "https://app.example.com",
+      "http://localhost:*"
+    ],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]
+```
+
+`AllowedOrigins` はワイルドカード `*` を使わず、環境別ドメインを明示する。  
+multipart upload で ETag が必要なため `ExposeHeaders` に `ETag` を含める。
+
+🔴 **MUST**: `public-read` ACL を使わない  
+🔴 **MUST**: アップロード対象 MIME type とサイズ上限をサーバー側で再検証する
+
+---
+
+## 4. CloudFront 配信方式
+
+### 結論
+
+**配信 URL は常に CloudFront ドメインを返す**。  
+S3 の生 URL をアプリに出さない。private コンテンツは **signed URL** を標準とする。
+
+### 配信の 2 パターン
+
+| 種別 | 方式 | 用途 |
+|------|------|------|
+| **Public asset** | `https://assets.example.com/...` | 一般公開画像、アプリ内の共通静的リソース |
+| **Private asset** | Backend 発行の signed URL | 領収書、個人画像、契約書、限定動画 |
+
+🔴 **MUST**: private asset は signed URL または signed cookie を使う  
+🟡 **SHOULD**: モバイルでは signed cookie より **signed URL** を優先する。メディアコンポーネントとの相性がよい  
+🔴 **MUST NOT**: 画像更新のたびに CloudFront Invalidation に依存しない
+
+### CloudFront Signed URL の取得 API スキーマ
+
+signed URL は Backend が発行し、アプリは `assetId` を渡してURLを受け取る。
+
+```ts
+// src/lib/aws/cloudFrontAsset.ts
+import { z } from 'zod';
+import { httpClient } from '@/lib/httpClient';
+import { awsEnv } from '@/lib/aws/env';
+
+const signedUrlResponseSchema = z.object({
+  signedUrl: z.string().url(),
+  expiresAt: z.string().datetime(), // ISO 8601
+});
+
+export type SignedUrlResponse = z.infer<typeof signedUrlResponseSchema>;
+
+export function fetchSignedUrl(assetId: string): Promise<SignedUrlResponse> {
+  return httpClient.get(`/v1/assets/${assetId}/signed-url`, signedUrlResponseSchema);
+}
+
+// Public asset のみ直接 URL を組み立てる
+export function toCloudFrontUrl(path: string): string {
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  return `${awsEnv.EXPO_PUBLIC_CLOUDFRONT_BASE_URL}${normalized}`;
+}
+
+export type AssetDescriptor =
+  | { type: 'public'; path: string }
+  | { type: 'private'; signedUrl: string };
+
+export function resolveAssetUrl(asset: AssetDescriptor): string {
+  if (asset.type === 'private') return asset.signedUrl;
+  return toCloudFrontUrl(asset.path);
+}
+```
+
+### キャッシュ戦略
+
+```text
+静的で不変なアセット
+  → object key に hash を含める
+  → Cache-Control: public, max-age=31536000, immutable
+
+ユーザー生成ファイル
+  → object key を毎回変える
+  → CloudFront は長期キャッシュ可
+
+頻繁に内容が変わる参照 URL
+  → アセット ID は固定、実オブジェクトキーは更新
+  → API から最新の配信 URL を再取得
+```
+
+🔴 **MUST**: キャッシュ破棄より **キー変更** を優先する  
+🔴 **MUST**: Invalidation はデプロイ運用またはサーバー運用手順に限定する  
+🔴 **MUST**: アプリは CloudFront の Distribution ID を持たない  
+🟡 **SHOULD**: CloudFront の origin は S3 へ **OAC（Origin Access Control）** で接続する
+
+---
+
+## 5. Cognito 認証方式
+
+### 結論
+
+**Cognito User Pools + Hosted UI + Authorization Code + PKCE** を標準とする。  
+`USER_PASSWORD_AUTH` のような「アプリがパスワードを直接扱う方式」は採用しない。
+
+### User Pool / Identity Pool の使い分け
+
+| 仕組み | 用途 | 方針 |
+|--------|------|------|
+| **User Pool** | ログイン・JWT 発行 | 標準採用 |
+| **Identity Pool** | 一時 AWS Credentials 発行 | 例外採用 |
+
+Identity Pool は「S3 直アクセスや AppSync IAM 認証がどうしても必要な場合」に限る。  
+**Presigned URL と User Pool で足りるなら Identity Pool は不要**。
+
+🔴 **MUST**: 認証フローは Hosted UI + PKCE に統一する  
+🔴 **MUST**: Access Token / Refresh Token は `expo-secure-store` に保存する  
+🔴 **MUST NOT**: `AsyncStorage` に認証トークンを保存しない
+
+### サインイン実装
+
+```bash
+expo install expo-auth-session expo-web-browser expo-secure-store
+```
+
+```ts
+// src/lib/aws/cognitoAuth.ts
+import * as AuthSession from 'expo-auth-session';
+import * as SecureStore from 'expo-secure-store';
+import { awsEnv } from '@/lib/aws/env';
+
+const discovery = {
+  authorizationEndpoint: `https://${awsEnv.EXPO_PUBLIC_COGNITO_DOMAIN}/oauth2/authorize`,
+  tokenEndpoint: `https://${awsEnv.EXPO_PUBLIC_COGNITO_DOMAIN}/oauth2/token`,
+  revocationEndpoint: `https://${awsEnv.EXPO_PUBLIC_COGNITO_DOMAIN}/oauth2/revoke`,
+};
+
+const redirectUri = AuthSession.makeRedirectUri({ scheme: 'myapp', path: 'auth/callback' });
+
+export function useCognitoSignIn() {
+  const [request, response, promptAsync] = AuthSession.useAuthRequest(
+    {
+      clientId: awsEnv.EXPO_PUBLIC_COGNITO_USER_POOL_CLIENT_ID,
+      responseType: AuthSession.ResponseType.Code,
+      usePKCE: true,
+      scopes: ['openid', 'email', 'profile'],
+      redirectUri,
+    },
+    discovery,
+  );
+
+  const complete = async () => {
+    if (response?.type !== 'success') return null;
+
+    const tokenResponse = await AuthSession.exchangeCodeAsync(
+      {
+        clientId: awsEnv.EXPO_PUBLIC_COGNITO_USER_POOL_CLIENT_ID,
+        code: response.params.code,
+        redirectUri,
+        extraParams: { code_verifier: request?.codeVerifier ?? '' },
+      },
+      discovery,
+    );
+
+    await SecureStore.setItemAsync('auth.accessToken', tokenResponse.accessToken ?? '');
+    await SecureStore.setItemAsync('auth.refreshToken', tokenResponse.refreshToken ?? '');
+
+    return tokenResponse;
+  };
+
+  return { promptAsync, complete, request };
+}
+```
+
+### リフレッシュトークン更新
+
+```ts
+// src/lib/aws/cognitoSession.ts
+import * as AuthSession from 'expo-auth-session';
+import * as SecureStore from 'expo-secure-store';
+import { awsEnv } from '@/lib/aws/env';
+
+const tokenEndpoint = `https://${awsEnv.EXPO_PUBLIC_COGNITO_DOMAIN}/oauth2/token`;
+
+export async function refreshAccessToken(): Promise<string | null> {
+  const refreshToken = await SecureStore.getItemAsync('auth.refreshToken');
+  if (!refreshToken) return null;
+
+  const tokenResponse = await AuthSession.refreshAsync(
+    {
+      clientId: awsEnv.EXPO_PUBLIC_COGNITO_USER_POOL_CLIENT_ID,
+      refreshToken,
+    },
+    { tokenEndpoint },
+  );
+
+  if (tokenResponse.accessToken) {
+    await SecureStore.setItemAsync('auth.accessToken', tokenResponse.accessToken);
+  }
+
+  return tokenResponse.accessToken ?? null;
+}
+```
+
+### サインアウト・トークン revoke
+
+```ts
+// src/lib/aws/cognitoSignOut.ts
+import * as SecureStore from 'expo-secure-store';
+import * as WebBrowser from 'expo-web-browser';
+import { awsEnv } from '@/lib/aws/env';
+
+const revokeEndpoint = `https://${awsEnv.EXPO_PUBLIC_COGNITO_DOMAIN}/oauth2/revoke`;
+const logoutEndpoint = `https://${awsEnv.EXPO_PUBLIC_COGNITO_DOMAIN}/logout`;
+
+/**
+ * 1. Cognito の revoke エンドポイントでリフレッシュトークンを無効化
+ * 2. SecureStore のトークンを削除
+ * 3. Hosted UI のセッションも破棄（Cognito logout URL を開く）
+ */
+export async function signOut(): Promise<void> {
+  const refreshToken = await SecureStore.getItemAsync('auth.refreshToken');
+
+  if (refreshToken) {
+    try {
+      await fetch(revokeEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          token: refreshToken,
+          client_id: awsEnv.EXPO_PUBLIC_COGNITO_USER_POOL_CLIENT_ID,
+        }).toString(),
+      });
+    } catch {
+      // revoke 失敗は無視し、ローカル削除を優先
+    }
+  }
+
+  await SecureStore.deleteItemAsync('auth.accessToken');
+  await SecureStore.deleteItemAsync('auth.refreshToken');
+
+  await WebBrowser.openAuthSessionAsync(
+    `${logoutEndpoint}?client_id=${awsEnv.EXPO_PUBLIC_COGNITO_USER_POOL_CLIENT_ID}&logout_uri=myapp://auth/logout`,
+    'myapp://auth/logout',
+  );
+}
+```
+
+### httpClient との統合（401 自動リフレッシュ）
+
+```ts
+// src/lib/httpClient.ts（抜粋 — Cognito リフレッシュインターセプター）
+import * as SecureStore from 'expo-secure-store';
+import { refreshAccessToken } from '@/lib/aws/cognitoSession';
+import { signOut } from '@/lib/aws/cognitoSignOut';
+
+/**
+ * @param isRetry true のとき 401 でも再リフレッシュしない（無限ループ防止）
+ */
+async function fetchWithAuth(
+  input: RequestInfo,
+  init?: RequestInit,
+  isRetry = false,
+): Promise<Response> {
+  const accessToken = await SecureStore.getItemAsync('auth.accessToken');
+  const headers = new Headers(init?.headers);
+  if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
+
+  const response = await fetch(input, { ...init, headers });
+
+  if (response.status === 401 && !isRetry) {
+    const newToken = await refreshAccessToken();
+
+    if (!newToken) {
+      await signOut();
+      throw new Error('SESSION_EXPIRED');
+    }
+
+    // isRetry=true を渡して 2 度目の 401 でループしないようにする
+    return fetchWithAuth(input, init, true);
+  }
+
+  return response;
+}
+```
+
+**トークン有効期限切れ時の UX ルール**
+
+| ケース | 挙動 |
+|--------|------|
+| リフレッシュ成功 | 元のリクエストを透過的に再送。ユーザー通知なし |
+| リフレッシュ失敗（ネットワーク断） | エラートーストを表示し、ユーザーに手動リトライを促す |
+| リフレッシュ失敗（トークン無効） | `signOut()` を呼び出し、ログイン画面へリダイレクト |
+
+🔴 **MUST**: callback URL / logout URL は環境別に固定し、Cognito 側に事前登録する  
+🔴 **MUST**: `openid` を含む scope を使い、`sub` claim をアプリ内の匿名識別子として扱う  
+🔴 **MUST**: セッション切れは `SESSION_EXPIRED` エラーとして上位へ伝播させ、画面遷移は UI 層が担う  
+🔴 **MUST**: `fetchWithAuth` は `isRetry` フラグで 401 ループを防ぐ  
+🟡 **SHOULD**: グループやロールは JWT claim で受け取り、画面権限制御に使用する
+
+### Identity Pool（例外採用）
+
+Presigned URL で賄えない場合のみ使用する。採用する際は ADR に理由を明文化すること。  
+取得した一時 credentials はメモリにのみ保持し、SecureStore / AsyncStorage に保存しない。
+
+```ts
+// src/lib/aws/cognitoIdentityPool.ts
+import {
+  CognitoIdentityClient,
+  GetIdCommand,
+  GetCredentialsForIdentityCommand,
+} from '@aws-sdk/client-cognito-identity';
+import * as SecureStore from 'expo-secure-store';
+import { awsEnv } from '@/lib/aws/env';
+
+export async function getTemporaryCredentials() {
+  const accessToken = await SecureStore.getItemAsync('auth.accessToken');
+  if (!accessToken) throw new Error('Not authenticated');
+
+  // Identity Pool ID は env.ts で管理する（ハードコード禁止）
+  const identityPoolId = awsEnv.EXPO_PUBLIC_COGNITO_IDENTITY_POOL_ID;
+  if (!identityPoolId) throw new Error('EXPO_PUBLIC_COGNITO_IDENTITY_POOL_ID is not set');
+
+  const client = new CognitoIdentityClient({ region: awsEnv.EXPO_PUBLIC_AWS_REGION });
+
+  const { IdentityId } = await client.send(
+    new GetIdCommand({
+      IdentityPoolId: identityPoolId,
+      Logins: {
+        [`cognito-idp.${awsEnv.EXPO_PUBLIC_AWS_REGION}.amazonaws.com/${awsEnv.EXPO_PUBLIC_COGNITO_USER_POOL_ID}`]:
+          accessToken,
+      },
+    }),
+  );
+
+  const { Credentials } = await client.send(
+    new GetCredentialsForIdentityCommand({
+      IdentityId,
+      Logins: {
+        [`cognito-idp.${awsEnv.EXPO_PUBLIC_AWS_REGION}.amazonaws.com/${awsEnv.EXPO_PUBLIC_COGNITO_USER_POOL_ID}`]:
+          accessToken,
+      },
+    }),
+  );
+
+  // credentials はメモリにのみ保持する（SecureStore / AsyncStorage への保存禁止）
+  return Credentials;
+}
+```
+
+🔴 **MUST**: 一時 credentials を SecureStore / AsyncStorage に保存しない  
+🔴 **MUST**: Identity Pool ID を `awsEnv` 経由で注入し、コード内にハードコードしない  
+🔴 **MUST**: Identity Pool の採用理由を ADR に明文化する
+
+---
+
+## 6. SNS 利用方式
+
+### 結論
+
+**SNS はバックエンド専用サービス** として扱う。  
+アプリは「通知を出してほしい」という業務要求を自社 API に送るだけで、SNS `Publish` は一切行わない。
+
+### 許可される用途
+
+| 用途 | モバイルからの直接利用 | 方針 |
+|------|----------------------|------|
+| **SMS 送信要求** | ❌ 禁止 | Backend API に要求し、Backend が SNS Publish |
+| **業務イベントの fan-out** | ❌ 禁止 | Backend / Worker 専用 |
+| **モバイル Push** | ❌ 原則不採用 | Expo アプリは [13_Push_Notifications](?path=/docs/architecture-handbook-push-notifications--docs) の方式を優先 |
+
+🔴 **MUST**: SNS Topic ARN / PlatformApplication ARN をアプリに埋め込まない  
+🔴 **MUST**: レート制限・再送制限・監査ログはサーバー側で実装する  
+🔴 **MUST NOT**: アプリから `Publish`、`CreatePlatformEndpoint`、`Subscribe` を直接行わない
+
+### モバイル側の実装例
+
+```ts
+// src/features/verification/api/requestSmsCode.ts
+import { z } from 'zod';
+import { httpClient } from '@/lib/httpClient';
+
+const requestSmsCodeResponseSchema = z.object({
+  requestId: z.string(),
+  retryAfterSeconds: z.number().int().nonnegative(),
+});
+
+export function requestSmsCode(phoneNumber: string) {
+  return httpClient.post(
+    '/v1/verification/sms/request',
+    { phoneNumber },
+    requestSmsCodeResponseSchema,
+  );
+}
+```
+
+🟡 **SHOULD**: UI では `retryAfterSeconds` を受けて再送ボタンを制御する  
+🟡 **SHOULD**: 業務上の通知種別は API 名・イベント名で表現し、SNS 実装詳細をクライアントへ漏らさない
+
+---
+
+## 7. AppSync 利用方式
+
+### 採用判断フロー
+
+AppSync を採用するか否かは、以下のフローで判断する。実装コードを読む前にこのフローを確認すること。
+
+```text
+Q1. GraphQL Subscription によるリアルタイム更新が要件にあるか？
+    Yes → AppSync 採用を検討する（Q3 へ）
+    No  → Q2 へ
+
+Q2. オフライン競合解決を含む Graph 構造の API が明確に必要か？
+    Yes → AppSync 採用を検討する（Q3 へ）
+    No  → REST + httpClient（08_API_Communication）を維持する ✅
+
+Q3. 採用理由を issue / ADR に明文化できるか？
+    Yes → AppSync 採用 ✅
+    No  → 採用しない
+```
+
+🔴 **MUST**: AppSync 採用理由を issue / ADR で明文化する  
+🔴 **MUST NOT**: REST で十分な CRUD を AppSync に寄せて二重 API を作らない
+
+### 認証モードの選択
+
+| 認証モード | 用途 | 方針 |
+|-----------|------|------|
+| **Cognito User Pools** | 一般ユーザー向け Query / Mutation / Subscription | 標準 |
+| **IAM** | サーバー間・特権処理 | バックエンド専用 |
+| **API Key** | 短命な検証環境のみ | 本番禁止 |
+| **Lambda Authorizer** | 既存 JWT との統合が必要な場合 | 個別設計 |
+
+🔴 **MUST**: 本番 AppSync で長期 API Key 運用をしない  
+🔴 **MUST**: end-user トラフィックは User Pools 認証を第一候補にする
+
+### HTTPS Query / Mutation の標準実装
+
+```ts
+// src/lib/aws/appSyncClient.ts
+import * as SecureStore from 'expo-secure-store';
+import { z } from 'zod';
+import { awsEnv } from '@/lib/aws/env';
+
+export type AppSyncErrorType =
+  | 'UnauthorizedException'
+  | 'Unauthorized'
+  | 'ValidationError'
+  | 'ConditionalCheckFailedException'
+  | string;
+
+export class AppSyncError extends Error {
+  constructor(
+    public readonly errors: { message: string; errorType?: AppSyncErrorType }[],
+  ) {
+    super(errors.map((e) => e.message).join(', '));
+    this.name = 'AppSyncError';
+  }
+
+  get isAuthError(): boolean {
+    return this.errors.some(
+      (e) => e.errorType === 'UnauthorizedException' || e.errorType === 'Unauthorized',
+    );
+  }
+
+  get isValidationError(): boolean {
+    return this.errors.some((e) => e.errorType === 'ValidationError');
+  }
+}
+
+const graphQLErrorSchema = z.object({
+  message: z.string(),
+  errorType: z.string().optional(),
+});
+
+const graphQLResponseSchema = <T extends z.ZodTypeAny>(dataSchema: T) =>
+  z.object({
+    data: dataSchema.optional(),
+    errors: z.array(graphQLErrorSchema).optional(),
+  });
+
+export async function appSyncRequest<T>({
+  query,
+  variables,
+  dataSchema,
+}: {
+  query: string;
+  variables?: Record<string, unknown>;
+  dataSchema: z.ZodType<T>;
+}): Promise<T> {
+  const accessToken = await SecureStore.getItemAsync('auth.accessToken');
+  if (!accessToken)
+    throw new AppSyncError([{ message: 'Not authenticated', errorType: 'Unauthorized' }]);
+
+  const response = await fetch(awsEnv.EXPO_PUBLIC_APPSYNC_GRAPHQL_URL ?? '', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: accessToken,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`AppSync HTTP error: ${response.status}`);
+  }
+
+  const json = await response.json();
+  const parsed = graphQLResponseSchema(dataSchema).parse(json);
+
+  if (parsed.errors?.length) {
+    const err = new AppSyncError(parsed.errors);
+    if (err.isAuthError) throw new Error('SESSION_EXPIRED');
+    throw err;
+  }
+
+  if (!parsed.data) throw new Error('AppSync response data is empty');
+
+  return parsed.data;
+}
+```
+
+### React Query からの利用例
+
+```ts
+// src/features/chat/hooks/useConversation.ts
+import { useQuery } from '@tanstack/react-query';
+import { z } from 'zod';
+import { appSyncRequest } from '@/lib/aws/appSyncClient';
+
+const conversationQuery = `
+  query GetConversation($id: ID!) {
+    getConversation(id: $id) {
+      id
+      title
+      unreadCount
+    }
+  }
+`;
+
+const conversationSchema = z.object({
+  getConversation: z.object({
+    id: z.string(),
+    title: z.string(),
+    unreadCount: z.number(),
+  }),
+});
+
+export function useConversation(id: string) {
+  return useQuery({
+    queryKey: ['conversation', id],
+    queryFn: () =>
+      appSyncRequest({
+        query: conversationQuery,
+        variables: { id },
+        dataSchema: conversationSchema,
+      }).then((data) => data.getConversation),
+  });
+}
+```
+
+### AppSync Subscription の実装
+
+```ts
+// src/lib/aws/appSyncSubscription.ts
+import * as SecureStore from 'expo-secure-store';
+import { awsEnv } from '@/lib/aws/env';
+
+type SubscriptionMessage<T> = { data: { [key: string]: T } };
+
+/** KA（keep-alive）無受信を接続断とみなすタイムアウト（ms）*/
+const KA_TIMEOUT_MS = 60_000;
+
+/**
+ * AppSync の WebSocket Subscription を管理するクラス。
+ * React Query キャッシュへの差分反映手段として使用し、
+ * 独立したデータソースとして扱わない。
+ */
+export class AppSyncSubscriptionClient<T> {
+  private ws: WebSocket | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private kaTimer: ReturnType<typeof setTimeout> | null = null;
+  private isClosed = false;
+  /** 複数 Subscription の同時利用で ID が衝突しないよう UUID を生成する */
+  private readonly subscriptionId = crypto.randomUUID();
+
+  constructor(
+    private readonly query: string,
+    private readonly variables: Record<string, unknown>,
+    private readonly onData: (data: T) => void,
+    private readonly onError?: (err: Error) => void,
+  ) {}
+
+  async connect(): Promise<void> {
+    const accessToken = await SecureStore.getItemAsync('auth.accessToken');
+    if (!accessToken) throw new Error('Not authenticated');
+
+    const endpointUrl = awsEnv.EXPO_PUBLIC_APPSYNC_GRAPHQL_URL ?? '';
+
+    // URL オブジェクトで分解して安全に WebSocket URL を組み立てる
+    const parsed = new URL(endpointUrl);
+    parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+    parsed.pathname = parsed.pathname.replace(/\/graphql$/, '/realtime/graphql');
+    const wsBaseUrl = parsed.toString();
+
+    const header = btoa(
+      JSON.stringify({ Authorization: accessToken, host: parsed.host }),
+    );
+    const payload = btoa(JSON.stringify({}));
+    const wsUrl = `${wsBaseUrl}?header=${header}&payload=${payload}`;
+
+    this.ws = new WebSocket(wsUrl, ['graphql-ws']);
+
+    this.ws.onopen = () => {
+      this.ws?.send(JSON.stringify({ type: 'connection_init' }));
+    };
+
+    this.ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data as string);
+
+      if (msg.type === 'connection_ack') {
+        this.ws?.send(
+          JSON.stringify({
+            id: this.subscriptionId,
+            type: 'start',
+            payload: {
+              data: JSON.stringify({ query: this.query, variables: this.variables }),
+            },
+          }),
+        );
+      } else if (msg.type === 'data') {
+        const payload = (msg.payload as SubscriptionMessage<T>).data;
+        const value = Object.values(payload)[0];
+        if (value !== undefined) this.onData(value);
+      } else if (msg.type === 'ka') {
+        // keep-alive 受信 → タイムアウトタイマーをリセットする
+        this.resetKaTimer();
+      }
+    };
+
+    this.ws.onerror = () => {
+      this.onError?.(new Error('AppSync WebSocket error'));
+    };
+
+    this.ws.onclose = () => {
+      this.clearKaTimer();
+      if (!this.isClosed) {
+        this.scheduleReconnect();
+      }
+    };
+
+    // 初回接続確立後に KA タイマーを開始する
+    this.resetKaTimer();
+  }
+
+  disconnect(): void {
+    this.isClosed = true;
+    this.clearKaTimer();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.ws?.close();
+    this.ws = null;
+  }
+
+  private resetKaTimer(): void {
+    this.clearKaTimer();
+    this.kaTimer = setTimeout(() => {
+      // KA が途絶えた → 接続断とみなして再接続する
+      this.onError?.(new Error('AppSync keep-alive timeout'));
+      this.ws?.close();
+    }, KA_TIMEOUT_MS);
+  }
+
+  private clearKaTimer(): void {
+    if (this.kaTimer) {
+      clearTimeout(this.kaTimer);
+      this.kaTimer = null;
+    }
+  }
+
+  private scheduleReconnect(): void {
+    this.reconnectTimer = setTimeout(() => this.connect(), 3000);
+  }
+}
+```
+
+#### React との統合例
+
+```ts
+// src/features/chat/hooks/useChatSubscription.ts
+import { useEffect } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { z } from 'zod';
+import { AppSyncSubscriptionClient } from '@/lib/aws/appSyncSubscription';
+
+const newMessageSchema = z.object({
+  id: z.string(),
+  conversationId: z.string(),
+  body: z.string(),
+  createdAt: z.string(),
+});
+
+type NewMessage = z.infer<typeof newMessageSchema>;
+
+const onNewMessageSubscription = `
+  subscription OnNewMessage($conversationId: ID!) {
+    onNewMessage(conversationId: $conversationId) {
+      id
+      conversationId
+      body
+      createdAt
+    }
+  }
+`;
+
+export function useChatSubscription(conversationId: string) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    const client = new AppSyncSubscriptionClient<NewMessage>(
+      onNewMessageSubscription,
+      { conversationId },
+      (message) => {
+        queryClient.setQueryData<NewMessage[]>(['messages', conversationId], (prev = []) => [
+          ...prev,
+          message,
+        ]);
+      },
+    );
+
+    client.connect();
+    return () => client.disconnect();
+  }, [conversationId, queryClient]);
+}
+```
+
+### Subscription とオフラインの扱い
+
+🔴 **MUST**: Subscription クライアントは `src/lib/aws` 配下に閉じ込める  
+🔴 **MUST**: React Query キャッシュを正として扱い、Subscription は差分反映手段に限定する  
+🔴 **MUST NOT**: AppSync 独自のオフラインストアと React Query 永続化を併用しない  
+🔴 **MUST**: KA タイムアウト検出ロジックを実装し、サイレントな接続断を防ぐ  
+🔴 **MUST**: Subscription ID は `crypto.randomUUID()` で生成し、複数同時利用時の衝突を回避する  
+🟡 **SHOULD**: 再接続時は REST / GraphQL の再フェッチで最終整合を取る
+
+---
+
+## 8. テストとモック戦略
+
+### 方針
+
+AWS 依存（S3 PUT、Cognito、AppSync）は **MSW でモック** する。  
+LocalStack は CI コスト・保守コストが高く、原則採用しない。
+
+### MSW ハンドラー例
+
+```ts
+// src/mocks/handlers/aws.ts
+import { http, HttpResponse } from 'msw';
+
+export const awsHandlers = [
+  // Presigned URL 発行
+  http.post('/v1/uploads/presign', () =>
+    HttpResponse.json({
+      objectKey: 'dev/test-tenant/avatar/2026/04/mock-uuid-photo.jpg',
+      uploadUrl: 'https://mock-s3.local/put',
+      requiredHeaders: {},
+      expiresInSeconds: 300,
+    }),
+  ),
+
+  // S3 PUT 正常系
+  http.put('https://mock-s3.local/put', () => new HttpResponse(null, { status: 200 })),
+
+  // S3 PUT 異常系 — Presigned URL 有効期限切れ
+  http.put('https://mock-s3.local/put-expired', () => new HttpResponse(null, { status: 403 })),
+
+  // S3 PUT 異常系 — ネットワーク断
+  http.put('https://mock-s3.local/put-network-error', () => HttpResponse.error()),
+
+  // アップロード完了
+  http.post('/v1/uploads/complete', () =>
+    HttpResponse.json({
+      assetId: 'asset-mock-id',
+      objectKey: 'dev/test-tenant/avatar/2026/04/mock-uuid-photo.jpg',
+    }),
+  ),
+
+  // Signed URL 取得
+  http.get('/v1/assets/:assetId/signed-url', () =>
+    HttpResponse.json({
+      signedUrl: 'https://mock-cdn.local/signed/photo.jpg?Expires=9999999999&Signature=mock',
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    }),
+  ),
+
+  // AppSync Query
+  http.post('https://mock-appsync.local/graphql', async ({ request }) => {
+    const body = (await request.json()) as { query: string };
+    if (body.query.includes('GetConversation')) {
+      return HttpResponse.json({
+        data: { getConversation: { id: 'conv-1', title: 'Mock Chat', unreadCount: 3 } },
+      });
+    }
+    return HttpResponse.json({ data: null, errors: [{ message: 'Unknown query' }] });
+  }),
+];
+```
+
+🔴 **MUST**: テスト・Storybook 環境では `EXPO_PUBLIC_APP_ENV=development` にして MSW を有効化する  
+🔴 **MUST**: MSW ハンドラーを `src/mocks/handlers/aws.ts` に集約し、feature 別ハンドラーと分離する  
+🟡 **SHOULD**: `S3UploadError` の各コード（`PRESIGNED_URL_EXPIRED_OR_INVALID` / `NETWORK_ERROR` / `TIMEOUT`）に対応するエラーケースを MSW で再現できるようにする
+
+---
+
+## 9. セキュリティと運用チェックリスト
+
+### セキュリティチェックリスト（リリース前に必ず確認）
+
+> 実施タイミング: **リリース前**（必須）および **四半期ごと**（定期監査）
+
+🔴 **MUST**: IAM ポリシーは最小権限にする  
+🔴 **MUST**: CloudFront / AppSync / Cognito の監査ログを有効化する  
+🔴 **MUST**: S3 / AppSync / Cognito のエラーをアプリ側で握り潰さず、`19_Observability` の logger / Sentry に流す  
+🔴 **MUST**: presigned URL 発行 API では MIME type、size、認可対象、利用回数をサーバー側で検証する  
+🟡 **SHOULD**: WAF を CloudFront / AppSync の前段に置く
+
+### 運用チェックリスト（四半期ごと）
+
+| 項目 | ルール | 確認頻度 |
+|------|--------|--------|
+| **S3 ライフサイクル** | 中断 multipart upload の自動削除（7 日）を有効化 | リリース前 |
+| **CloudFront** | Invalidation を定常運用にしない | 四半期 |
+| **Cognito** | App client を環境別に分離し callback URL を固定 | リリース前 |
+| **SNS** | 配信失敗・再送回数・コストを監視 | 月次 |
+| **AppSync** | GraphQL schema 変更時に型生成とクライアント更新を同時実施 | 変更時 |
+| **IAM ポリシー** | 未使用 Permission の棚卸し | 四半期 |
+
+---
+
+## 10. 推奨ディレクトリ構成
+
+```text
+src/
+  lib/
+    aws/
+      env.ts                    # 環境変数バリデーション（全 AWS 設定値の唯一の入口）
+      s3Upload.ts               # 通常アップロード（20MB 以下）
+      s3MultipartUpload.ts      # 大容量アップロード（20MB 超）
+      cloudFrontAsset.ts        # CloudFront URL 解決・signed URL 取得
+      cognitoAuth.ts            # サインイン（PKCE）
+      cognitoSession.ts         # トークンリフレッシュ
+      cognitoSignOut.ts         # サインアウト・revoke
+      cognitoIdentityPool.ts    # 例外採用時のみ（ADR 必須）
+      appSyncClient.ts          # HTTPS Query / Mutation
+      appSyncSubscription.ts    # WebSocket Subscription
+  mocks/
+    handlers/
+      aws.ts                    # AWS 関連 MSW ハンドラー（feature ハンドラーと分離）
+  features/
+    media/                      # S3 / CloudFront 利用
+    auth/                       # Cognito 利用
+    verification/               # SNS 経由 SMS 要求
+    realtime/                   # AppSync Subscription 利用
+```
+
+🔴 **MUST**: AWS 関連ロジックを `src/lib/aws` に集約する  
+🔴 **MUST NOT**: Screen / Feature から `fetch('https://*.amazonaws.com/...')` を直書きしない  
+🟡 **SHOULD**: 画面層では「AWS のサービス名」ではなく「業務動作名」で呼ぶ
+
+```ts
+// ✅ よい例
+await uploadFileToS3(file);
+await requestSmsCode(phoneNumber);
+const { data } = useConversation(conversationId);
+useChatSubscription(conversationId);
+
+// ❌ 悪い例
+await fetch('https://my-bucket.s3.ap-northeast-1.amazonaws.com/...', ...);
+await fetch('https://graphql.appsync-api.ap-northeast-1.amazonaws.com/graphql', ...);
+```
+
+---
+
+## 11. 変更履歴
+
+| 日付 | 変更者 | レビュアー | 内容 |
+|------|--------|-----------|------|
+| 2026-04-10 | Codex（AI 生成） | — | 初版作成。S3 / CloudFront / Cognito / SNS / AppSync の採用境界と実装規約を追加 |
+| 2026-04-10 | Codex（AI 生成） | — | v2：AppSync Subscription 実装追加、multipart upload 実装追加、Identity Pool 実装追加、XHR 進捗ラッパー追加、signOut / revoke フロー追加、httpClient 401 インターセプター統合、CloudFront signed URL スキーマ定義、S3 CORS ポリシー例追加、MSW モック戦略セクション追加、staging 環境バリデーション動作明確化、MUST/SHOULD 整合性修正 |
+| 2026-04-10 | Codex（AI 生成） | **要レビュー** | v3：multipart progress 二重カウントバグ修正、WebSocket URL 生成を URL オブジェクト化、Identity Pool ID のハードコード除去、Subscription ID を UUID 化、S3/CloudFront 有効期限テーブル分離、isRetry フラグ追加による 401 ループ防止、KA タイムアウト検出実装、multipart 同時 PUT 数制限（p-limit）、Blob 展開前サイズ判定、RFC 2119 準拠明記、AppSync 採用判断フロー追加、セキュリティチェック頻度追加、双方向クロスリファレンス追加 |

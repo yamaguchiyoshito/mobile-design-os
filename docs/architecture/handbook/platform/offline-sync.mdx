@@ -1,0 +1,577 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Platform/Offline Sync" />
+
+# オフライン・バックグラウンド同期方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: オフライン対応・バックグラウンドフェッチ・ローカル永続化  
+> **依存**: 03_Data_and_State（React Query）、08_API_Communication（httpClient）
+
+---
+
+## 1. 方針
+
+### オフライン対応の 3 レベル
+
+<table>
+  <thead>
+    <tr>
+      <th>レベル</th>
+      <th>内容</th>
+      <th>採用要件</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>L1: キャッシュ表示</strong></td>
+      <td>オフライン時に React Query キャッシュを表示し、操作は制限</td>
+      <td><strong>全機能に適用</strong>（<code>networkMode: &#39;offlineFirst&#39;</code>）</td>
+    </tr>
+    <tr>
+      <td><strong>L2: 楽観的更新</strong></td>
+      <td>Mutation をオフラインでもローカルに適用し、再接続時に同期</td>
+      <td>即時フィードバックが重要な操作</td>
+    </tr>
+    <tr>
+      <td><strong>L3: ローカル DB</strong></td>
+      <td><code>expo-sqlite</code> で全データをローカルに持ち完全オフライン動作</td>
+      <td>要件として明示されている場合のみ</td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: まず L1 を全機能に適用し、L2 は UX 要件に応じて個別追加する  
+🔴 **MUST NOT**: L3（expo-sqlite）を UX 要件の確認なしに採用しない（実装コストが大きい）
+
+---
+
+## 2. L1: React Query キャッシュ永続化（全機能）
+
+03_Data_and_State で定義済みの設定を再掲し、詳細を補足する。
+
+```ts
+// src/lib/queryPersister.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { createAsyncStoragePersister } from '@tanstack/query-async-storage-persister';
+import { persistQueryClient }           from '@tanstack/react-query-persist-client';
+import { queryClient }                  from '@/lib/queryClient';
+
+export const asyncStoragePersister = createAsyncStoragePersister({
+  storage:      AsyncStorage,
+  throttleTime: 1000,  // 1 秒ごとに書き込み（頻繁な write を防ぐ）
+  key:          'rq-cache',
+  serialize:    JSON.stringify,
+  deserialize:  JSON.parse,
+});
+
+export function setupQueryPersistence() {
+  persistQueryClient({
+    queryClient,
+    persister:  asyncStoragePersister,
+    maxAge:     1000 * 60 * 60 * 24,  // 24 時間
+    buster:     process.env.EXPO_PUBLIC_APP_VERSION ?? '',
+    // buster が変わるとキャッシュを全破棄する（アプリ更新時のデータ整合）
+  });
+}
+```
+
+```ts
+// src/lib/queryClient.ts
+import { QueryClient } from '@tanstack/react-query';
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      networkMode:  'offlineFirst',  // キャッシュがあればオフラインでも表示
+      staleTime:    1000 * 60 * 5,   // 5 分
+      gcTime:       1000 * 60 * 60,  // 1 時間
+      retry:        (failureCount, error) => {
+        // 認証エラー・404 はリトライしない
+        if (error instanceof HttpError && [401, 403, 404].includes(error.status)) {
+          return false;
+        }
+        return failureCount < 2;
+      },
+    },
+    mutations: {
+      networkMode: 'offlineFirst',
+    },
+  },
+});
+```
+
+```tsx
+// app/_layout.tsx — アプリ起動時に永続化を初期化
+import { setupQueryPersistence } from '@/lib/queryPersister';
+setupQueryPersistence();
+```
+
+---
+
+## 3. ネットワーク状態の監視
+
+```ts
+// src/hooks/useNetworkStatus.ts
+import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
+import { useEffect, useState }   from 'react';
+import { queryClient }           from '@/lib/queryClient';
+
+export type NetworkStatus = {
+  isOnline:    boolean;
+  type:        string | null;     // 'wifi' | 'cellular' | null
+  isExpensive: boolean;           // モバイルデータ通信かどうか
+};
+
+export function useNetworkStatus(): NetworkStatus {
+  const [status, setStatus] = useState<NetworkStatus>({
+    isOnline:    true,
+    type:        null,
+    isExpensive: false,
+  });
+
+  useEffect(() => {
+    return NetInfo.addEventListener((state: NetInfoState) => {
+      const isOnline = state.isConnected ?? false;
+      setStatus({
+        isOnline,
+        type:        state.type,
+        isExpensive: state.details?.isConnectionExpensive ?? false,
+      });
+
+      // 再接続時に古くなったクエリを自動再フェッチ
+      if (isOnline) {
+        queryClient.resumePausedMutations();
+        queryClient.invalidateQueries({
+          predicate: (query) => query.isStale(),
+        });
+      }
+    });
+  }, []);
+
+  return status;
+}
+```
+
+### オフラインバナー（09_Message_Display と連携）
+
+```tsx
+// src/components/providers/NetworkStatusProvider.tsx
+export function NetworkStatusProvider({ children }: { children: React.ReactNode }) {
+  const { isOnline } = useNetworkStatus();
+  const { t }        = useTranslation();
+
+  return (
+    <>
+      {children}
+      {!isOnline && (
+        <Banner
+          type="warning"
+          message={t('common.offline')}  // 'オフラインです。一部の機能が制限されます'
+        />
+      )}
+    </>
+  );
+}
+```
+
+🟡 **SHOULD**: 再接続時に `resumePausedMutations()` を呼び、オフライン中に溜まった Mutation を再実行する
+
+---
+
+## 4. L2: 楽観的更新（Optimistic Update）
+
+ネットワーク往復を待たずにローカルで先に更新を適用する。
+失敗時にはロールバックする。
+
+### 基本パターン
+
+```ts
+// features/order/hooks/useToggleFavorite.ts
+export function useToggleFavorite() {
+  return useMutation({
+    mutationFn: ({ orderId, isFav }: { orderId: string; isFav: boolean }) =>
+      httpClient.patch(`/orders/${orderId}/favorite`, { isFav }, favoriteResponseSchema),
+
+    // ─── 楽観的更新 ───────────────────────────────────────────────────
+    onMutate: async ({ orderId, isFav }) => {
+      // 進行中の再フェッチをキャンセルして競合を防ぐ
+      await queryClient.cancelQueries({ queryKey: queryKeys.orders.detail(orderId) });
+
+      // 現在のキャッシュを保存（ロールバック用）
+      const snapshot = queryClient.getQueryData<Order>(queryKeys.orders.detail(orderId));
+
+      // キャッシュを楽観的に更新
+      queryClient.setQueryData<Order>(queryKeys.orders.detail(orderId), (old) =>
+        old ? { ...old, isFavorite: isFav } : old,
+      );
+
+      return { snapshot };  // context として onError に渡す
+    },
+
+    onError: (_err, { orderId }, context) => {
+      // エラー時にスナップショットへロールバック
+      if (context?.snapshot) {
+        queryClient.setQueryData(queryKeys.orders.detail(orderId), context.snapshot);
+      }
+      notify.error('お気に入りの更新に失敗しました');
+    },
+
+    onSettled: (_data, _err, { orderId }) => {
+      // 成功・失敗問わずサーバーと同期する
+      queryClient.invalidateQueries({ queryKey: queryKeys.orders.detail(orderId) });
+    },
+  });
+}
+```
+
+🔴 **MUST**: 楽観的更新では必ず `onMutate` でスナップショットを保存し、`onError` でロールバックする  
+🔴 **MUST**: `cancelQueries` で楽観的更新と進行中の再フェッチの競合を防ぐ  
+🟡 **SHOULD**: `onSettled` でサーバーとの最終同期を行い、楽観的更新の誤差を修正する
+
+---
+
+## 5. Mutation のオフラインキューイング
+
+`networkMode: 'offlineFirst'` 設定により、React Query は
+オフライン時の Mutation を自動でキューに積み、再接続時に再実行する。
+
+```ts
+// Mutation のオフラインキュー設定
+useMutation({
+  mutationFn:  submitOrder,
+  networkMode: 'offlineFirst',  // queryClient のデフォルト設定から継承
+
+  onMutate: async (variables) => {
+    // オフライン中でも楽観的更新を適用する
+  },
+
+  onError: (error) => {
+    if (error instanceof NetworkError) {
+      // オフラインによる失敗はユーザーに通知しない（再接続時に自動リトライ）
+      return;
+    }
+    notify.error('送信に失敗しました');
+  },
+});
+```
+
+```tsx
+// 再接続時の自動再実行をフックに統合
+export function useResumeOnReconnect() {
+  const { isOnline } = useNetworkStatus();
+
+  useEffect(() => {
+    if (isOnline) {
+      queryClient.resumePausedMutations().then(() => {
+        // 再実行後にリストを最新化
+        queryClient.invalidateQueries();
+      });
+    }
+  }, [isOnline]);
+}
+```
+
+---
+
+## 6. バックグラウンドフェッチ（expo-background-fetch）
+
+アプリが非アクティブな状態でデータを定期的に更新する。
+
+```bash
+expo install expo-background-fetch expo-task-manager
+```
+
+```ts
+// src/lib/backgroundSync.ts
+import * as BackgroundFetch from 'expo-background-fetch';
+import * as TaskManager     from 'expo-task-manager';
+
+const BACKGROUND_SYNC_TASK = 'background-sync';
+const SYNC_INTERVAL_MIN    = 15;  // 最小 15 分（OS の制限）
+
+// ─── タスク定義 ───────────────────────────────────────────────────────────
+TaskManager.defineTask(BACKGROUND_SYNC_TASK, async () => {
+  try {
+    // バックグラウンドでは httpClient を直接呼ぶ（React Query 不使用）
+    const token = await getAuthToken();
+    if (!token) return BackgroundFetch.BackgroundFetchResult.NoData;
+
+    const orders = await httpClient.get('/orders/recent', ordersSchema);
+
+    // AsyncStorage に保存（React Query キャッシュに直接書けないため）
+    await AsyncStorage.setItem(
+      'bg-sync-orders',
+      JSON.stringify({ data: orders, updatedAt: Date.now() }),
+    );
+
+    // アプリがフォアグラウンドに戻ったときに React Query キャッシュを更新する
+    // → App State Change リスナー（後述）が担う
+
+    return BackgroundFetch.BackgroundFetchResult.NewData;
+  } catch {
+    return BackgroundFetch.BackgroundFetchResult.Failed;
+  }
+});
+
+// ─── バックグラウンドフェッチの登録 ─────────────────────────────────────
+export async function registerBackgroundSync() {
+  const status = await BackgroundFetch.getStatusAsync();
+
+  if (
+    status === BackgroundFetch.BackgroundFetchStatus.Restricted ||
+    status === BackgroundFetch.BackgroundFetchStatus.Denied
+  ) {
+    logger.warn('Background fetch is not available');
+    return;
+  }
+
+  await BackgroundFetch.registerTaskAsync(BACKGROUND_SYNC_TASK, {
+    minimumInterval: SYNC_INTERVAL_MIN * 60,  // 秒
+    stopOnTerminate: false,  // アプリ終了後もタスクを継続
+    startOnBoot:     false,  // 端末再起動時は起動しない
+  });
+}
+
+export async function unregisterBackgroundSync() {
+  const isRegistered = await TaskManager.isTaskRegisteredAsync(BACKGROUND_SYNC_TASK);
+  if (isRegistered) {
+    await BackgroundFetch.unregisterTaskAsync(BACKGROUND_SYNC_TASK);
+  }
+}
+```
+
+### フォアグラウンド復帰時のキャッシュ反映
+
+```tsx
+// app/_layout.tsx
+import { AppState } from 'react-native';
+
+export default function RootLayout() {
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', async (nextState) => {
+      if (nextState === 'active') {
+        // バックグラウンド同期のデータを React Query に取り込む
+        const raw = await AsyncStorage.getItem('bg-sync-orders');
+        if (raw) {
+          const { data, updatedAt } = JSON.parse(raw);
+          const isRecent = Date.now() - updatedAt < 1000 * 60 * 5;  // 5 分以内
+          if (isRecent) {
+            queryClient.setQueryData(queryKeys.orders.all(), data);
+          }
+          await AsyncStorage.removeItem('bg-sync-orders');
+        }
+
+        // 加えてアクティブなクエリを再フェッチ
+        queryClient.invalidateQueries({ refetchType: 'active' });
+      }
+    });
+    return () => sub.remove();
+  }, []);
+}
+```
+
+🟡 **SHOULD**: バックグラウンドフェッチは認証が必要なデータのみ登録し、不要な場合は登録しない  
+🔴 **MUST**: バックグラウンドタスク内での UI 操作（`notify` / `router.push`）は禁止
+
+---
+
+## 7. expo-sqlite によるローカル DB（L3・要件確認後のみ）
+
+L3 が必要な場合のパターン。要件が確定するまで実装しない。
+
+```ts
+// src/lib/localDb.ts
+import * as SQLite from 'expo-sqlite';
+
+const db = SQLite.openDatabaseSync('app.db');
+
+// ─── スキーマ初期化 ───────────────────────────────────────────────────────
+export function initializeLocalDb() {
+  db.execSync(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id          TEXT PRIMARY KEY,
+      data        TEXT NOT NULL,  -- JSON
+      synced_at   INTEGER,
+      dirty       INTEGER DEFAULT 0  -- 0: synced, 1: pending sync
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_queue (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation   TEXT NOT NULL,  -- 'CREATE' | 'UPDATE' | 'DELETE'
+      table_name  TEXT NOT NULL,
+      record_id   TEXT NOT NULL,
+      payload     TEXT,
+      created_at  INTEGER NOT NULL
+    );
+  `);
+}
+
+// ─── CRUD ─────────────────────────────────────────────────────────────────
+export function upsertOrder(order: Order) {
+  db.runSync(
+    'INSERT OR REPLACE INTO orders (id, data, synced_at, dirty) VALUES (?, ?, ?, ?)',
+    order.id, JSON.stringify(order), Date.now(), 0,
+  );
+}
+
+export function getOrders(): Order[] {
+  const rows = db.getAllSync<{ data: string }>('SELECT data FROM orders ORDER BY synced_at DESC');
+  return rows.map((r) => JSON.parse(r.data));
+}
+
+// ─── 同期キュー ───────────────────────────────────────────────────────────
+export function enqueueSync(
+  operation: 'CREATE' | 'UPDATE' | 'DELETE',
+  tableName: string,
+  recordId:  string,
+  payload?:  unknown,
+) {
+  db.runSync(
+    'INSERT INTO sync_queue (operation, table_name, record_id, payload, created_at) VALUES (?, ?, ?, ?, ?)',
+    operation, tableName, recordId, payload ? JSON.stringify(payload) : null, Date.now(),
+  );
+}
+
+export function getPendingSyncItems() {
+  return db.getAllSync<SyncQueueItem>(
+    'SELECT * FROM sync_queue ORDER BY created_at ASC LIMIT 50',
+  );
+}
+
+export function deleteSyncQueueItem(id: number) {
+  db.runSync('DELETE FROM sync_queue WHERE id = ?', id);
+}
+```
+
+### 同期処理
+
+```ts
+// src/lib/syncEngine.ts
+export async function syncPendingItems() {
+  const items = localDb.getPendingSyncItems();
+  if (items.length === 0) return;
+
+  for (const item of items) {
+    try {
+      switch (item.operation) {
+        case 'CREATE':
+          await httpClient.post(`/${item.table_name}`, JSON.parse(item.payload!), z.unknown());
+          break;
+        case 'UPDATE':
+          await httpClient.patch(`/${item.table_name}/${item.record_id}`, JSON.parse(item.payload!), z.unknown());
+          break;
+        case 'DELETE':
+          await httpClient.delete(`/${item.table_name}/${item.record_id}`, z.unknown());
+          break;
+      }
+      localDb.deleteSyncQueueItem(item.id);
+    } catch (err) {
+      if (err instanceof NetworkError) break;  // オフライン → 残りはスキップ
+      logger.error('Sync failed', { item, err });
+      // HTTP エラーはキューから削除して次へ（無限リトライを避ける）
+      localDb.deleteSyncQueueItem(item.id);
+    }
+  }
+
+  // 同期完了後に React Query を更新
+  queryClient.invalidateQueries();
+}
+```
+
+🔴 **MUST**: L3 を採用する場合は同期コンフリクト（サーバーとローカルの競合）の解決方針を事前に決める  
+🟡 **SHOULD**: 同期キューは最大件数（例: 500 件）を設けて無制限の蓄積を防ぐ
+
+---
+
+## 8. テスト実装規約
+
+```ts
+// src/hooks/__tests__/useNetworkStatus.test.ts
+jest.mock('@react-native-community/netinfo');
+import NetInfo from '@react-native-community/netinfo';
+import { renderHook, act } from '@testing-library/react-native';
+import { useNetworkStatus } from '@/hooks/useNetworkStatus';
+
+test('オフライン → オンラインで resumePausedMutations が呼ばれる', async () => {
+  const resumeMock = jest.spyOn(queryClient, 'resumePausedMutations')
+    .mockResolvedValue(undefined);
+
+  let listener: ((state: unknown) => void) | null = null;
+  (NetInfo.addEventListener as jest.Mock).mockImplementation((cb) => {
+    listener = cb;
+    return jest.fn();
+  });
+
+  renderHook(() => useNetworkStatus(), { wrapper: createWrapper() });
+
+  await act(async () => {
+    listener?.({ isConnected: false, type: 'none', details: null });
+    listener?.({ isConnected: true,  type: 'wifi', details: { isConnectionExpensive: false } });
+  });
+
+  expect(resumeMock).toHaveBeenCalled();
+});
+```
+
+---
+
+## 9. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>影響</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>staleTime: 0</code>（デフォルト）のまま</td>
+      <td>画面フォーカスのたびに全 API を再フェッチ</td>
+      <td>データ特性に合わせて設定（最低 60 秒）</td>
+    </tr>
+    <tr>
+      <td>楽観的更新で <code>cancelQueries</code> を省略</td>
+      <td>進行中の再フェッチが楽観的更新を上書きする</td>
+      <td><code>onMutate</code> の冒頭で必ず <code>cancelQueries</code></td>
+    </tr>
+    <tr>
+      <td>ロールバック未実装</td>
+      <td>エラー時に画面がおかしい状態のまま固まる</td>
+      <td><code>onError</code> でスナップショットを復元</td>
+    </tr>
+    <tr>
+      <td>バックグラウンドタスクで <code>notify</code> を呼ぶ</td>
+      <td>バックグラウンドでは UI 操作が不可。エラーになる</td>
+      <td>タスク内では AsyncStorage への書き込みのみ</td>
+    </tr>
+    <tr>
+      <td><code>buster</code> 未設定でアプリ更新後も古いキャッシュが残る</td>
+      <td>旧スキーマのデータが新バージョンに混入する</td>
+      <td>アプリバージョンを <code>buster</code> に設定する</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 10. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

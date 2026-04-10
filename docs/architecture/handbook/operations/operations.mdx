@@ -1,0 +1,368 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Operations/Operations" />
+
+# 運用・配布方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: CI/CD・バージョニング・リリース・OTA・監視・deprecation
+
+---
+
+## 1. CI/CD 全体フロー
+
+```
+Push / MR
+    │
+    ▼
+GitLab CI（Static + Unit + Story tests）
+    │ Pass
+    ▼
+EAS Build（Dev Build / Staging）
+    │
+    ▼
+Maestro E2E（EAS Workflows）
+    │ Pass
+    ▼
+EAS Submit（App Store / Google Play）または EAS Update（OTA）
+```
+
+### 役割分担
+
+<table>
+  <thead>
+    <tr>
+      <th>処理</th>
+      <th>担当</th>
+      <th>理由</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Static / Unit / Storybook テスト</td>
+      <td>GitLab CI</td>
+      <td>高速フィードバック。ネイティブビルド不要</td>
+    </tr>
+    <tr>
+      <td>iOS / Android ビルド</td>
+      <td>EAS Build</td>
+      <td>コード署名・証明書管理を EAS に委譲</td>
+    </tr>
+    <tr>
+      <td>E2E テスト</td>
+      <td>EAS Workflows + Maestro</td>
+      <td>実機 / エミュレータが必要</td>
+    </tr>
+    <tr>
+      <td>OTA 配信</td>
+      <td>EAS Update</td>
+      <td>native コード変更なし時の即時配信</td>
+    </tr>
+    <tr>
+      <td>App Store / Play Store 提出</td>
+      <td>EAS Submit</td>
+      <td>提出フローを自動化</td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: GitLab CE を残しつつ、mobile 固有処理は EAS に寄せる  
+🟡 **SHOULD**: EAS と GitLab の連携は GitLab CI から EAS CLI を呼び出す形にする
+
+---
+
+## 2. GitLab CI 設定方針
+
+```yaml
+# .gitlab-ci.yml（抜粋）
+stages:
+  - lint
+  - test
+  - build
+  - e2e
+
+lint:
+  stage: lint
+  script:
+    - pnpm typecheck
+    - pnpm lint
+
+unit-test:
+  stage: test
+  script:
+    - pnpm test --ci --coverage
+
+storybook-test:
+  stage: test
+  script:
+    - pnpm storybook:build:web
+    - pnpm test:storybook   # addon-vitest
+
+eas-build-staging:
+  stage: build
+  script:
+    - eas build --platform all --profile staging --non-interactive
+  only:
+    - main
+
+eas-e2e:
+  stage: e2e
+  script:
+    - eas workflow:run e2e --platform android
+  only:
+    - main
+```
+
+---
+
+## 3. EAS 設定方針
+
+```json
+// eas.json
+{
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "development"
+    },
+    "staging": {
+      "distribution": "internal",
+      "channel": "staging",
+      "env": { "APP_ENV": "staging" }
+    },
+    "production": {
+      "distribution": "store",
+      "channel": "production",
+      "env": { "APP_ENV": "production" }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": { "appleId": "...", "ascAppId": "..." },
+      "android": { "serviceAccountKeyPath": "./service-account.json" }
+    }
+  }
+}
+```
+
+### ビルドプロファイルの使い分け
+
+<table>
+  <thead>
+    <tr>
+      <th>プロファイル</th>
+      <th>用途</th>
+      <th>配布先</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>development</code></td>
+      <td>Dev Build。Expo Go 非依存の開発環境</td>
+      <td>内部（Internal Distribution）</td>
+    </tr>
+    <tr>
+      <td><code>staging</code></td>
+      <td>QA・受け入れテスト</td>
+      <td>内部（TestFlight / Firebase App Distribution）</td>
+    </tr>
+    <tr>
+      <td><code>production</code></td>
+      <td>本番リリース</td>
+      <td>App Store / Google Play</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 4. OTA（EAS Update）方針
+
+### 使用可能なケース
+
+🟢 **MAY**: JS バンドルのみ変更（バグ修正・文言変更・ロジック変更）  
+🔴 **MUST NOT**: native コード変更（新 Expo module 追加・`app.json` 変更）を OTA で配信しない
+
+### チャンネル戦略
+
+```
+production ブランチ → production チャンネル（全ユーザー）
+staging ブランチ    → staging チャンネル（内部テスター）
+feature/* ブランチ  → development チャンネル（開発者のみ）
+```
+
+```bash
+# OTA 配信コマンド例
+eas update --branch production --message "Fix: 注文確認画面のクラッシュ修正"
+
+# Staged rollout（段階的配信）
+eas update --branch production --rollout-percentage 10
+```
+
+🟡 **SHOULD**: 本番 OTA は 10% → 50% → 100% の段階的 rollout を採用する  
+🟡 **SHOULD**: OTA 配信後は Sentry / Crashlytics でクラッシュ率を 24h モニタリングする
+
+---
+
+## 5. バージョニング規約
+
+### バージョン体系
+
+```
+[major].[minor].[patch]  例: 2.3.1
+
+major: 破壊的変更 / 大型機能追加
+minor: 後方互換のある機能追加
+patch: バグ修正・軽微な変更
+```
+
+### ビルド番号
+
+```json
+// app.json
+{
+  "expo": {
+    "version": "2.3.1",
+    "ios":     { "buildNumber": "231" },
+    "android": { "versionCode": 231 }
+  }
+}
+```
+
+🔴 **MUST**: `version` と `buildNumber` / `versionCode` は必ずセットで更新する  
+🟡 **SHOULD**: リリース時は Git Tag を打つ（`v2.3.1`）
+
+---
+
+## 6. 環境変数管理
+
+```
+.env.development   ← ローカル開発用（Git 管理外）
+.env.staging       ← staging 用（Git 管理外、EAS Secret から注入）
+.env.production    ← 本番用（Git 管理外、EAS Secret から注入）
+.env.example       ← 必須変数の一覧（Git 管理、値なし）
+```
+
+```bash
+# EAS Secret への登録
+eas secret:create --scope project --name API_BASE_URL --value "https://api.example.com"
+```
+
+🔴 **MUST**: API キー・シークレットを Git にコミットしない  
+🔴 **MUST**: `EXPO_PUBLIC_` プレフィックスの変数は JS バンドルに含まれることを意識する  
+🟡 **SHOULD**: シークレットは EAS Secret で管理し、CI 環境変数に平文で書かない
+
+---
+
+## 7. 監視・アラート方針
+
+<table>
+  <thead>
+    <tr>
+      <th>監視項目</th>
+      <th>ツール</th>
+      <th>アラート閾値（目安）</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>クラッシュ率</td>
+      <td>Sentry / Crashlytics</td>
+      <td>前日比 2 倍以上</td>
+    </tr>
+    <tr>
+      <td>JS エラー率</td>
+      <td>Sentry</td>
+      <td>セッションの 1% 以上</td>
+    </tr>
+    <tr>
+      <td>API エラー率</td>
+      <td>サーバ側 APM</td>
+      <td>5xx が 1% 以上</td>
+    </tr>
+    <tr>
+      <td>OTA 配信成功率</td>
+      <td>EAS ダッシュボード</td>
+      <td>90% 未満</td>
+    </tr>
+    <tr>
+      <td>脆弱性</td>
+      <td>pnpm audit（週次）</td>
+      <td>HIGH 以上で通知</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 8. Deprecation ポリシー
+
+### API 変更
+
+```ts
+/**
+ * @deprecated v3.0 で削除予定。useNewSearch() を使用してください。
+ * @see useNewSearch
+ */
+export function useSearch() { ... }
+```
+
+### コンポーネント変更
+
+```tsx
+// ✅ 廃止コンポーネントの移行ガイドを Story に記載する
+export const Deprecated: Story = {
+  name: '⚠️ Deprecated（v4.0 で削除）',
+  parameters: {
+    docs: {
+      description: {
+        story: '`NewButton` に移行してください。Props の対応表は `Architecture/Handbook/02_UI_System` を参照。',
+      },
+    },
+  },
+};
+```
+
+🟡 **SHOULD**: Deprecation から削除まで最低 1 マイナーバージョン（≒ 1 スプリント）の猶予を設ける  
+🟡 **SHOULD**: 廃止予定の Symbol には `@deprecated` JSDoc を必ず付ける
+
+---
+
+## 9. バンドルサイズ管理
+
+```bash
+# Metro bundle report でサイズ増分を検知
+npx react-native bundle \
+  --platform ios \
+  --dev false \
+  --entry-file index.js \
+  --bundle-output /tmp/bundle.js
+
+# カスタムスクリプトで前回比較
+node scripts/bundle-size-check.js --threshold 50kb
+```
+
+🟡 **SHOULD**: バンドルサイズ増加を CI ゲートで 50KB 増分以上の場合は警告する  
+🟡 **SHOULD**: 大型ライブラリ追加時は `pnpm why` でサイズ増分を確認する
+
+---
+
+## 10. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

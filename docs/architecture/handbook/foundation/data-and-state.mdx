@@ -1,0 +1,514 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Foundation/Data and State" />
+
+# データ・状態管理方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: API 通信・サーバ状態・クライアント状態・フォーム・スキーマ検証  
+> **依存バージョン**: React Query v5.x / Zustand v4.x / react-hook-form v7.x / Zod v3.x / MSW v2.x
+
+---
+
+## 1. 状態の種類と責務マッピング
+
+<table>
+  <thead>
+    <tr>
+      <th>状態の種類</th>
+      <th>担当技術</th>
+      <th>具体例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>サーバ状態</strong>（非同期・キャッシュ）</td>
+      <td>React Query</td>
+      <td>ユーザー情報・注文一覧・マスタデータ</td>
+    </tr>
+    <tr>
+      <td><strong>グローバル UI 状態</strong></td>
+      <td>Zustand</td>
+      <td>選択中フィルタ・通知未読数・認証情報</td>
+    </tr>
+    <tr>
+      <td><strong>フォーム状態</strong></td>
+      <td>react-hook-form</td>
+      <td>入力値・バリデーション状態・サブミット状態</td>
+    </tr>
+    <tr>
+      <td><strong>ローカル UI 状態</strong></td>
+      <td><code>useState</code> / <code>useReducer</code></td>
+      <td>モーダル開閉・アコーディオン展開</td>
+    </tr>
+    <tr>
+      <td><strong>ナビゲーション状態</strong></td>
+      <td>Expo Router</td>
+      <td>URL パラメータ・画面遷移スタック</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST**: サーバから取得したデータを Zustand に複製しない（React Query が管理する）  
+🟡 **SHOULD**: グローバル状態に入れる前に「本当に複数 Screen で必要か」を問う
+
+---
+
+## 2. API 契約と型生成パイプライン
+
+```
+OpenAPI 仕様（YAML / JSON）
+    ↓ orval（推奨） または openapi-zod-client（orval 非対応仕様のみ）
+src/api/
+  ├─ schemas/    ← Zod スキーマ（自動生成）
+  ├─ types/      ← TypeScript 型（Zod から推論）
+  └─ hooks/      ← React Query hooks（自動生成 or 手書き）
+```
+
+> **ツール選定基準**  
+> `orval` を第一選択とする。OpenAPI 3.1 の `$schema` アノテーションや webhook 定義など orval が未対応の仕様を使う場合にのみ `openapi-zod-client` を採用する。
+
+```ts
+// 自動生成例（orval）
+export const getUserSchema = z.object({
+  id:    z.string().uuid(),
+  name:  z.string(),
+  email: z.string().email(),
+});
+export type GetUserResponse = z.infer<typeof getUserSchema>;
+```
+
+🔴 **MUST**: Zod スキーマは OpenAPI 仕様から自動生成し、手書きしない  
+🔴 **MUST**: API レスポンスは必ず `safeParse` で検証する。失敗時はエラーログを出力し、呼び出し元に `null` または型付きエラーを返す（`parse` は使わない）
+
+```ts
+// ✅ safeParse の使用例
+const result = getUserSchema.safeParse(json);
+if (!result.success) {
+  logger.error('API response validation failed', { path, error: result.error });
+  throw new HttpError(res.status, path, result.error);
+}
+return result.data;
+```
+
+---
+
+## 3. httpClient 規約
+
+### 設計意図
+
+`fetch` を直書きすると認証ヘッダ・エラーハンドリング・ベース URL が散在する。
+`httpClient` に集約することで変更箇所を一点にする。
+
+### HttpError クラス
+
+```ts
+// src/lib/HttpError.ts
+export class HttpError extends Error {
+  constructor(
+    public readonly status:      number,
+    public readonly path:        string,
+    public readonly zodError?:   z.ZodError,
+  ) {
+    super(`HTTP ${status} on ${path}`);
+    this.name = 'HttpError';
+  }
+
+  /** 4xx はクライアント起因、5xx はサーバ起因と判定 */
+  get isClientError() { return this.status >= 400 && this.status < 500; }
+  get isServerError() { return this.status >= 500; }
+}
+```
+
+### buildHeaders
+
+```ts
+// src/lib/buildHeaders.ts
+import * as SecureStore from 'expo-secure-store';
+
+export async function buildHeaders(): Promise<Record<string, string>> {
+  const token = await SecureStore.getItemAsync('auth_token');
+  return {
+    'Content-Type':   'application/json',
+    'X-Request-Id':   crypto.randomUUID(),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+```
+
+### httpClient 本体
+
+```ts
+// src/lib/httpClient.ts
+import { z }           from 'zod';
+import { BASE_URL }    from '@/constants/env';
+import { buildHeaders } from './buildHeaders';
+import { HttpError }   from './HttpError';
+
+export const httpClient = {
+  async get<T>(path: string, schema: z.ZodType<T>): Promise<T> {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      headers: await buildHeaders(),
+    });
+    if (!res.ok) throw new HttpError(res.status, path);
+    const json = await res.json();
+    const result = schema.safeParse(json);
+    if (!result.success) throw new HttpError(res.status, path, result.error);
+    return result.data;
+  },
+
+  async post<T>(path: string, body: unknown, schema: z.ZodType<T>): Promise<T> {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      method:  'POST',
+      headers: await buildHeaders(),
+      body:    JSON.stringify(body),
+    });
+    if (!res.ok) throw new HttpError(res.status, path);
+    const json = await res.json();
+    const result = schema.safeParse(json);
+    if (!result.success) throw new HttpError(res.status, path, result.error);
+    return result.data;
+  },
+  // PUT / PATCH / DELETE も同様
+};
+```
+
+🔴 **MUST**: `fetch` を Feature / Screen から直接呼ばない。`httpClient` 経由のみ
+
+---
+
+## 4. React Query 使用規約
+
+### Query Key 設計
+
+```ts
+// src/api/queryKeys.ts — Query Key を一元管理
+export const queryKeys = {
+  users: {
+    all:    () => ['users'] as const,
+    detail: (id: string) => ['users', id] as const,
+    orders: (id: string) => ['users', id, 'orders'] as const,
+  },
+  products: {
+    all:    () => ['products'] as const,
+    detail: (id: string) => ['products', id] as const,
+  },
+} as const;
+```
+
+🔴 **MUST**: Query Key はすべて `queryKeys` から参照する（文字列直書き禁止）
+
+### staleTime ガイドライン
+
+<table>
+  <thead>
+    <tr>
+      <th>データ種別</th>
+      <th>staleTime</th>
+      <th>理由</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>マスタデータ（都道府県・カテゴリ等）</td>
+      <td><code>5 * 60 * 1000</code>（5分）</td>
+      <td>変更頻度が極めて低い</td>
+    </tr>
+    <tr>
+      <td>ユーザープロファイル・設定</td>
+      <td><code>60 * 1000</code>（60秒）</td>
+      <td>他端末からの更新を一定時間内に反映</td>
+    </tr>
+    <tr>
+      <td>一覧・検索結果</td>
+      <td><code>30 * 1000</code>（30秒）</td>
+      <td>ページ内操作中は再フェッチを抑制</td>
+    </tr>
+    <tr>
+      <td>通知・在庫・リアルタイム系</td>
+      <td><code>0</code></td>
+      <td>常に最新を要求</td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: グローバルデフォルト `staleTime: 0` は非推奨。`QueryClient` 生成時に `defaultOptions` でプロジェクト基準値を設定する
+
+### 基本クエリ
+
+```tsx
+// ✅ 使用例（依存クエリ: userId が null のときは発火しない）
+const { data: user, isPending, isError } = useQuery({
+  queryKey: queryKeys.users.detail(userId ?? ''),
+  queryFn:  () => httpClient.get(`/users/${userId}`, getUserSchema),
+  enabled:  userId != null,
+  staleTime: 60 * 1000,
+});
+```
+
+🔴 **MUST**: 前段データに依存するクエリは `enabled` オプションで発火条件を明示する
+
+### ローディング・エラー状態の処理方針
+
+```tsx
+// ✅ Screen レベルで処理（Feature 内コンポーネントは data を受け取るだけ）
+if (isPending) return <FullScreenSpinner />;
+if (isError)   return <ErrorView onRetry={() => refetch()} />;
+
+// ✅ Suspense + QueryErrorResetBoundary を使う場合（推奨）
+<QueryErrorResetBoundary>
+  {({ reset }) => (
+    <ErrorBoundary onReset={reset} FallbackComponent={ErrorFallback}>
+      <Suspense fallback={<FullScreenSpinner />}>
+        <UserDetailFeature userId={userId} />
+      </Suspense>
+    </ErrorBoundary>
+  )}
+</QueryErrorResetBoundary>
+```
+
+🟡 **SHOULD**: ローディング・エラー処理は Screen または境界コンポーネントで行う。Feature 内に分散させない
+
+### ページネーション（useInfiniteQuery）
+
+```tsx
+// ✅ FlatList と組み合わせた無限スクロール
+const {
+  data,
+  fetchNextPage,
+  hasNextPage,
+  isFetchingNextPage,
+} = useInfiniteQuery({
+  queryKey: queryKeys.products.all(),
+  queryFn:  ({ pageParam }) =>
+    httpClient.get(`/products?cursor=${pageParam}`, productListSchema),
+  initialPageParam: '',
+  getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+  staleTime: 30 * 1000,
+});
+
+const items = data?.pages.flatMap((p) => p.items) ?? [];
+
+<FlatList
+  data={items}
+  onEndReached={() => { if (hasNextPage) fetchNextPage(); }}
+  ListFooterComponent={isFetchingNextPage ? <Spinner /> : null}
+/>
+```
+
+🔴 **MUST**: 一覧系画面は `useQuery` でなく `useInfiniteQuery` を使う
+
+### Mutation（通常・楽観的更新）
+
+```tsx
+// ✅ 通常の Mutation
+const { mutate: createOrder } = useMutation({
+  mutationFn: (body: CreateOrderRequest) =>
+    httpClient.post('/orders', body, createOrderResponseSchema),
+  onSuccess: () => {
+    queryClient.invalidateQueries({ queryKey: queryKeys.users.orders(userId) });
+    notify.success('注文を受け付けました');
+  },
+  onError: (error) => {
+    notify.error('注文に失敗しました');
+  },
+});
+
+// ✅ 楽観的更新（モバイル UX 優先シナリオ）
+const { mutate: toggleLike } = useMutation({
+  mutationFn: (productId: string) =>
+    httpClient.post(`/products/${productId}/like`, {}, likeResponseSchema),
+
+  onMutate: async (productId) => {
+    await queryClient.cancelQueries({ queryKey: queryKeys.products.detail(productId) });
+    const previous = queryClient.getQueryData(queryKeys.products.detail(productId));
+    queryClient.setQueryData(queryKeys.products.detail(productId), (old: Product) => ({
+      ...old,
+      liked: !old.liked,
+    }));
+    return { previous };
+  },
+
+  onError: (_err, productId, context) => {
+    // ロールバック
+    queryClient.setQueryData(queryKeys.products.detail(productId), context?.previous);
+  },
+
+  onSettled: (_, __, productId) => {
+    queryClient.invalidateQueries({ queryKey: queryKeys.products.detail(productId) });
+  },
+});
+```
+
+🟡 **SHOULD**: Mutation 成功後は関連 Query を `invalidateQueries` で再検証する  
+🟡 **SHOULD**: ネットワーク遅延が体感できるシナリオには楽観的更新（`onMutate` + rollback）を採用する
+
+---
+
+## 5. Zustand 使用規約
+
+### Store 設計
+
+```ts
+// src/stores/authStore.ts
+import { create }       from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
+import * as SecureStore from 'expo-secure-store';
+
+type AuthState = {
+  userId:     string | null;
+  isLoggedIn: boolean;
+  login:  (userId: string) => void;
+  logout: () => void;
+};
+
+/** SecureStore アダプタ（expo-secure-store は同期 API 非対応のため AsyncStorage 相当で実装） */
+const secureStorage = {
+  getItem:    (key: string) => SecureStore.getItemAsync(key),
+  setItem:    (key: string, value: string) => SecureStore.setItemAsync(key, value),
+  removeItem: (key: string) => SecureStore.deleteItemAsync(key),
+};
+
+export const useAuthStore = create<AuthState>()(
+  persist(
+    (set) => ({
+      userId:     null,
+      isLoggedIn: false,
+      login:  (userId) => set({ userId, isLoggedIn: true }),
+      logout: ()       => set({ userId: null, isLoggedIn: false }),
+    }),
+    {
+      name:    'auth',
+      storage: createJSONStorage(() => secureStorage),
+    },
+  ),
+);
+```
+
+🔴 **MUST**: Store ファイルは `src/stores/` 配下に集約する  
+🔴 **MUST**: `authStore` など機密情報を含む Store は `persist` + SecureStore で永続化する  
+🟡 **SHOULD**: Store を 1 ファイルに詰め込まない（関心事ごとに分割する）  
+🟡 **SHOULD**: `immer` middleware は複雑なネスト更新でのみ使う
+
+---
+
+## 6. フォーム管理規約
+
+```tsx
+// ✅ react-hook-form + Zod resolver
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+
+const loginSchema = z.object({
+  email:    z.string().email('メールアドレスの形式が正しくありません'),
+  password: z.string().min(8, '8文字以上入力してください'),
+});
+type LoginFormValues = z.infer<typeof loginSchema>;
+
+export function LoginForm() {
+  const { control, handleSubmit, reset, formState: { errors, isSubmitting } } =
+    useForm<LoginFormValues>({
+      resolver:      zodResolver(loginSchema),
+      defaultValues: { email: '', password: '' }, // 必須：undefined 混入防止
+    });
+
+  const { mutate: login } = useMutation({
+    mutationFn: (data: LoginFormValues) =>
+      httpClient.post('/auth/login', data, loginResponseSchema),
+    onSuccess: () => {
+      reset();           // ✅ 送信成功後にフォームをリセット
+      router.push('/home');
+    },
+  });
+
+  return (
+    <FormField
+      control={control}
+      name="email"
+      error={errors.email?.message}
+    />
+  );
+}
+```
+
+🔴 **MUST**: フォームバリデーションスキーマは Zod で書く  
+🔴 **MUST**: `Controller` または `useController` 経由で RN コンポーネントを接続する  
+🔴 **MUST**: `defaultValues` は必ず指定する（undefined の混入防止）  
+🟡 **SHOULD**: Mutation `onSuccess` でフォームを `reset()` する。エラー時はリセットしない
+
+---
+
+## 7. MSW によるモック設計
+
+### モックの共有範囲
+
+```
+src/mocks/
+  ├─ handlers/       ← API エンドポイントごとのハンドラ
+  │    ├─ userHandlers.ts
+  │    └─ orderHandlers.ts
+  ├─ factories/      ← Zod スキーマ準拠のテストデータ Factory
+  │    ├─ userFactory.ts
+  │    └─ orderFactory.ts
+  ├─ server.ts       ← Jest / Node 用（React Native）
+  └─ browser.ts      ← Storybook web 用
+```
+
+### Factory 設計（Zod スキーマとの整合性保証）
+
+```ts
+// factories/userFactory.ts
+import { faker } from '@faker-js/faker';
+import { getUserSchema, type GetUserResponse } from '@/api/schemas';
+
+/**
+ * Factory の戻り値を Zod スキーマで parse することで、
+ * スキーマ変更時にコンパイルエラーではなく実行時エラーとして検出する。
+ */
+export const createUser = (
+  overrides?: Partial<GetUserResponse>,
+): GetUserResponse =>
+  getUserSchema.parse({
+    id:    faker.string.uuid(),
+    name:  faker.person.fullName(),
+    email: faker.internet.email(),
+    ...overrides,
+  });
+```
+
+🔴 **MUST**: Jest・Storybook・E2E で同じ MSW ハンドラを共有する  
+🔴 **MUST**: モックデータは Factory 経由で生成する（オブジェクトリテラル直書き禁止）  
+🔴 **MUST**: Factory は `schema.parse()` を通して生成する（スキーマ乖離を実行時に検出するため）
+
+---
+
+## 8. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-04</td>
+      <td>
+        HttpError クラス追加 / buildHeaders 実装例追加 / safeParse に統一 /
+        staleTime ガイドライン追加 / useInfiniteQuery パターン追加 /
+        楽観的更新パターン追加 / enabled オプション規約追加 /
+        Suspense + QueryErrorResetBoundary パターン追加 /
+        persist + SecureStore パターン追加 / Factory の Zod 整合性保証追加 /
+        orval 選定基準明記 / 依存バージョン明記
+      </td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,527 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Platform/File and Media" />
+
+# ファイル・メディア操作方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: ファイル選択・画像選択・カメラ撮影・ダウンロード・共有の実装規約  
+> **依存**: 08_API_Communication（fileUpload / fileDownload）、14_Device_Permissions（cameraService / mediaLibraryService）
+
+---
+
+## 1. 責務の分離
+
+<table>
+  <thead>
+    <tr>
+      <th>責務</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>権限取得・デバイス API 呼び出し</td>
+      <td><code>src/lib/permissions/cameraService.ts</code> / <code>mediaLibraryService.ts</code>（14 参照）</td>
+    </tr>
+    <tr>
+      <td>ファイルアップロード送信</td>
+      <td><code>src/lib/fileUpload.ts</code>（08 参照）</td>
+    </tr>
+    <tr>
+      <td>ファイルダウンロード・共有</td>
+      <td><code>src/lib/fileDownload.ts</code>（08 参照）</td>
+    </tr>
+    <tr>
+      <td>ファイル選択 UX・バリデーション</td>
+      <td><code>src/lib/filePicker.ts</code>（本書で定義）</td>
+    </tr>
+    <tr>
+      <td>一時ファイル・キャッシュ管理</td>
+      <td><code>src/lib/fileCache.ts</code>（本書で定義）</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST**: Feature / Screen からの `expo-image-picker` / `expo-document-picker` 直呼び禁止
+
+---
+
+## 2. filePicker — 統合ファイル選択
+
+```ts
+// src/lib/filePicker.ts
+import * as ImagePicker    from 'expo-image-picker';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem     from 'expo-file-system';
+import { cameraService, mediaLibraryService } from '@/lib/permissions';
+
+// ─── 選択ファイルの共通型 ────────────────────────────────────────────────
+export type PickedFile = {
+  uri:      string;
+  name:     string;
+  mimeType: string;
+  size:     number;      // bytes
+  width?:   number;      // 画像のみ
+  height?:  number;      // 画像のみ
+};
+
+// ─── バリデーション設定 ──────────────────────────────────────────────────
+export type FilePickerConfig = {
+  maxSizeBytes?:   number;     // デフォルト: 10MB
+  allowedMimeTypes?: string[]; // デフォルト: 制限なし
+  allowedExtensions?: string[];
+};
+
+const DEFAULT_CONFIG: Required<FilePickerConfig> = {
+  maxSizeBytes:      10 * 1024 * 1024,  // 10MB
+  allowedMimeTypes:  [],
+  allowedExtensions: [],
+};
+
+// ─── バリデーション ──────────────────────────────────────────────────────
+function validateFile(
+  file: PickedFile,
+  config: Required<FilePickerConfig>,
+): string | null {
+  if (file.size > config.maxSizeBytes) {
+    const maxMB = Math.round(config.maxSizeBytes / (1024 * 1024));
+    return `ファイルサイズは ${maxMB}MB 以下にしてください（現在: ${Math.round(file.size / (1024 * 1024))}MB）`;
+  }
+  if (
+    config.allowedMimeTypes.length > 0 &&
+    !config.allowedMimeTypes.includes(file.mimeType)
+  ) {
+    return `このファイル形式（${file.mimeType}）は対応していません`;
+  }
+  return null;
+}
+
+// ─── カメラで撮影 ────────────────────────────────────────────────────────
+export async function pickFromCamera(
+  config?: FilePickerConfig,
+): Promise<{ file: PickedFile | null; error: string | null }> {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+
+  const status = await cameraService.getStatus();
+  if (status !== 'granted') {
+    const result = await cameraService.request();
+    if (result !== 'granted') return { file: null, error: 'カメラへのアクセスが許可されていません' };
+  }
+
+  const media = await cameraService.launchCamera();
+  if (!media) return { file: null, error: null };  // キャンセル
+
+  // ファイルサイズ取得
+  const info = await FileSystem.getInfoAsync(media.uri, { size: true });
+  const size = (info as FileSystem.FileInfo & { size?: number }).size ?? 0;
+
+  const file: PickedFile = {
+    uri:      media.uri,
+    name:     `photo_${Date.now()}.jpg`,
+    mimeType: media.mimeType,
+    size,
+    width:    media.width,
+    height:   media.height,
+  };
+
+  const error = validateFile(file, cfg);
+  return { file: error ? null : file, error };
+}
+
+// ─── フォトライブラリから選択 ────────────────────────────────────────────
+export async function pickFromLibrary(
+  config?: FilePickerConfig & { multiple?: boolean },
+): Promise<{ files: PickedFile[]; errors: string[] }> {
+  const cfg      = { ...DEFAULT_CONFIG, ...config };
+  const multiple = config?.multiple ?? false;
+
+  const status = await mediaLibraryService.getStatus();
+  if (status === 'denied') {
+    return { files: [], errors: ['フォトライブラリへのアクセスが許可されていません'] };
+  }
+  if (status === 'undetermined') {
+    const result = await mediaLibraryService.request();
+    if (result === 'denied') {
+      return { files: [], errors: ['フォトライブラリへのアクセスが許可されていません'] };
+    }
+  }
+
+  const assets = await cameraService.launchImageLibrary({ allowsMultipleSelection: multiple });
+  if (!assets) return { files: [], errors: [] };  // キャンセル
+
+  const files: PickedFile[] = [];
+  const errors: string[]    = [];
+
+  for (const asset of assets) {
+    const info = await FileSystem.getInfoAsync(asset.uri, { size: true });
+    const size = (info as FileSystem.FileInfo & { size?: number }).size ?? 0;
+    const file: PickedFile = {
+      uri:      asset.uri,
+      name:     asset.uri.split('/').pop() ?? `image_${Date.now()}.jpg`,
+      mimeType: asset.mimeType,
+      size,
+      width:    asset.width,
+      height:   asset.height,
+    };
+    const err = validateFile(file, cfg);
+    if (err) errors.push(err);
+    else files.push(file);
+  }
+
+  return { files, errors };
+}
+
+// ─── ドキュメント選択（PDF / Excel / Word 等）──────────────────────────
+export async function pickDocument(
+  config?: FilePickerConfig & { multiple?: boolean },
+): Promise<{ files: PickedFile[]; errors: string[] }> {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+
+  const result = await DocumentPicker.getDocumentAsync({
+    type:     cfg.allowedMimeTypes.length > 0 ? cfg.allowedMimeTypes : '*/*',
+    multiple: config?.multiple ?? false,
+    copyToCacheDirectory: true,  // キャッシュにコピーしてアクセス可能にする
+  });
+
+  if (result.canceled) return { files: [], errors: [] };
+
+  const files: PickedFile[] = [];
+  const errors: string[]    = [];
+
+  for (const asset of result.assets) {
+    const file: PickedFile = {
+      uri:      asset.uri,
+      name:     asset.name,
+      mimeType: asset.mimeType ?? 'application/octet-stream',
+      size:     asset.size ?? 0,
+    };
+    const err = validateFile(file, cfg);
+    if (err) errors.push(`${asset.name}: ${err}`);
+    else files.push(file);
+  }
+
+  return { files, errors };
+}
+```
+
+---
+
+## 3. 一時ファイル・キャッシュ管理
+
+```ts
+// src/lib/fileCache.ts
+import * as FileSystem from 'expo-file-system';
+
+const CACHE_DIR = `${FileSystem.cacheDirectory}app-uploads/`;
+
+// ─── キャッシュディレクトリの初期化 ──────────────────────────────────────
+export async function ensureCacheDir() {
+  const info = await FileSystem.getInfoAsync(CACHE_DIR);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(CACHE_DIR, { intermediates: true });
+  }
+}
+
+// ─── ファイルをキャッシュにコピー（元の URI へのアクセス権が消えた後も使えるように）
+export async function copyToCache(uri: string, filename: string): Promise<string> {
+  await ensureCacheDir();
+  const dest = `${CACHE_DIR}${filename}`;
+  await FileSystem.copyAsync({ from: uri, to: dest });
+  return dest;
+}
+
+// ─── アップロード済みファイルのキャッシュを削除 ──────────────────────────
+export async function deleteFromCache(uri: string) {
+  const info = await FileSystem.getInfoAsync(uri);
+  if (info.exists) {
+    await FileSystem.deleteAsync(uri, { idempotent: true });
+  }
+}
+
+// ─── キャッシュを全クリア（ログアウト時等）──────────────────────────────
+export async function clearCache() {
+  const info = await FileSystem.getInfoAsync(CACHE_DIR);
+  if (info.exists) {
+    await FileSystem.deleteAsync(CACHE_DIR, { idempotent: true });
+  }
+}
+```
+
+🟡 **SHOULD**: ログアウト時に `fileCache.clearCache()` を呼ぶ  
+🟡 **SHOULD**: アップロード完了後は `deleteFromCache()` で一時ファイルを削除する
+
+---
+
+## 4. アップロード付き選択フロー（Feature パターン）
+
+```tsx
+// features/documents/components/DocumentUploadButton.tsx
+import { filePicker }    from '@/lib/filePicker';
+import { uploadFile }    from '@/lib/fileUpload';
+import { fileCache }     from '@/lib/fileCache';
+
+const ALLOWED_TYPES  = ['application/pdf', 'image/jpeg', 'image/png'];
+const MAX_SIZE_BYTES = 20 * 1024 * 1024;  // 20MB
+
+export function DocumentUploadButton({ onUploaded }: { onUploaded: (url: string) => void }) {
+  const { t } = useTranslation();
+  const [progress, setProgress] = useState<number | null>(null);
+  const [error,    setError]    = useState<string | null>(null);
+
+  const handlePick = async () => {
+    setError(null);
+
+    const { files, errors } = await filePicker.pickDocument({
+      allowedMimeTypes: ALLOWED_TYPES,
+      maxSizeBytes:     MAX_SIZE_BYTES,
+    });
+
+    if (errors.length > 0) {
+      setError(errors[0]);
+      return;
+    }
+    if (files.length === 0) return;  // キャンセル
+
+    const file    = files[0];
+    const cached  = await fileCache.copyToCache(file.uri, file.name);
+
+    try {
+      const result = await uploadFile(cached, '/documents', {
+        onProgress: setProgress,
+      });
+
+      await fileCache.deleteFromCache(cached);
+      onUploaded(result.url);
+      notify.success(t('document.uploadSuccess'));
+    } catch (err) {
+      await fileCache.deleteFromCache(cached);
+      setProgress(null);
+      notify.error(t('document.uploadError'));
+    } finally {
+      setProgress(null);
+    }
+  };
+
+  return (
+    <View>
+      <Button
+        label={t('document.selectFile')}
+        variant="secondary"
+        onPress={handlePick}
+        disabled={progress !== null}
+        loading={progress !== null}
+      />
+
+      {progress !== null && (
+        <View
+          accessibilityLiveRegion="polite"
+          accessibilityLabel={`アップロード中 ${Math.round(progress * 100)}%`}
+        >
+          <ProgressBar value={progress} />
+          <Text className="text-body-sm text-content-secondary">
+            {Math.round(progress * 100)}%
+          </Text>
+        </View>
+      )}
+
+      {error && (
+        <FieldError message={error} />
+      )}
+    </View>
+  );
+}
+```
+
+---
+
+## 5. 画像プレビューとリサイズ
+
+```tsx
+// components/ui/ImagePreview/ImagePreview.tsx
+import { Image }    from 'expo-image';
+import * as ImageManipulator from 'expo-image-manipulator';
+
+type ImagePreviewProps = {
+  uri:         string;
+  onRemove?:   () => void;
+  maxWidth?:   number;
+  maxHeight?:  number;
+};
+
+export function ImagePreview({ uri, onRemove, maxWidth = 400, maxHeight = 400 }: ImagePreviewProps) {
+  return (
+    <View className="relative">
+      <Image
+        source={{ uri }}
+        style={{ width: maxWidth, height: maxHeight }}
+        contentFit="contain"
+        cachePolicy="memory"
+        accessible={true}
+        accessibilityLabel="選択した画像のプレビュー"
+      />
+      {onRemove && (
+        <Pressable
+          className="absolute top-2 right-2 bg-surface-overlay rounded-full p-1"
+          onPress={onRemove}
+          accessibilityRole="button"
+          accessibilityLabel="画像を削除"
+        >
+          <Icon name="x" size={16} accessible={false} />
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+// ─── 送信前にリサイズ・圧縮する ─────────────────────────────────────────
+export async function resizeImage(
+  uri: string,
+  options: { maxWidth?: number; maxHeight?: number; quality?: number } = {},
+): Promise<string> {
+  const { maxWidth = 1200, maxHeight = 1200, quality = 0.8 } = options;
+
+  const result = await ImageManipulator.manipulateAsync(
+    uri,
+    [{ resize: { width: maxWidth, height: maxHeight } }],
+    { compress: quality, format: ImageManipulator.SaveFormat.JPEG },
+  );
+  return result.uri;
+}
+```
+
+🟡 **SHOULD**: サーバー送信前に `resizeImage` で最大 1200px・品質 0.8 に圧縮する  
+🟡 **SHOULD**: プレビューはアップロード前に必ず表示し、ユーザーが確認できるようにする
+
+---
+
+## 6. ファイル選択のアクセシビリティ
+
+```tsx
+// ✅ ファイル選択ボタンに操作結果を伝える
+<Pressable
+  accessibilityRole="button"
+  accessibilityLabel="ファイルを選択する"
+  accessibilityHint="PDF、JPEG、PNG（最大 20MB）を選択できます"
+  onPress={handlePick}
+>
+  <Text>ファイルを選択</Text>
+</Pressable>
+
+// ✅ 選択後の状態変化をライブリージョンで通知
+<View accessibilityLiveRegion="polite">
+  {selectedFile && (
+    <Text accessibilityLabel={`${selectedFile.name} を選択しました`}>
+      {selectedFile.name}
+    </Text>
+  )}
+</View>
+```
+
+---
+
+## 7. テスト実装規約
+
+```ts
+// src/lib/__tests__/filePicker.test.ts
+jest.mock('expo-image-picker');
+jest.mock('expo-document-picker');
+jest.mock('expo-file-system');
+jest.mock('@/lib/permissions/cameraService');
+jest.mock('@/lib/permissions/mediaLibraryService');
+
+import * as DocumentPicker from 'expo-document-picker';
+import { filePicker }       from '@/lib/filePicker';
+
+describe('pickDocument', () => {
+  test('キャンセル時は空配列を返す', async () => {
+    (DocumentPicker.getDocumentAsync as jest.Mock).mockResolvedValue({ canceled: true });
+    const { files, errors } = await filePicker.pickDocument();
+    expect(files).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+  });
+
+  test('サイズ超過ファイルは errors に含まれる', async () => {
+    (DocumentPicker.getDocumentAsync as jest.Mock).mockResolvedValue({
+      canceled: false,
+      assets: [{ uri: 'file://large.pdf', name: 'large.pdf', mimeType: 'application/pdf', size: 30 * 1024 * 1024 }],
+    });
+
+    const { files, errors } = await filePicker.pickDocument({ maxSizeBytes: 10 * 1024 * 1024 });
+    expect(files).toHaveLength(0);
+    expect(errors[0]).toMatch(/10MB/);
+  });
+
+  test('許可 MIME タイプ外はエラーになる', async () => {
+    (DocumentPicker.getDocumentAsync as jest.Mock).mockResolvedValue({
+      canceled: false,
+      assets: [{ uri: 'file://doc.exe', name: 'doc.exe', mimeType: 'application/exe', size: 1024 }],
+    });
+
+    const { errors } = await filePicker.pickDocument({ allowedMimeTypes: ['application/pdf'] });
+    expect(errors[0]).toMatch(/対応していません/);
+  });
+});
+```
+
+---
+
+## 8. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>リスク / 結果</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>expo-image-picker</code> を Feature から直接呼ぶ</td>
+      <td>権限チェック・バリデーションが散在</td>
+      <td><code>filePicker</code> 経由のみ</td>
+    </tr>
+    <tr>
+      <td>アップロード後に一時ファイルを残す</td>
+      <td>ディスクを圧迫する</td>
+      <td><code>deleteFromCache()</code> をアップロード完了後に必ず呼ぶ</td>
+    </tr>
+    <tr>
+      <td>バリデーションをサーバーに任せる</td>
+      <td>大容量ファイルを送信してユーザーを待たせる</td>
+      <td>クライアント側で事前チェック</td>
+    </tr>
+    <tr>
+      <td>EXIF が含まれたまま画像を送信</td>
+      <td>位置情報が漏洩する</td>
+      <td><code>cameraService.launchCamera</code> の <code>exif: false</code> （14 で設定済み）</td>
+    </tr>
+    <tr>
+      <td>進捗表示なし</td>
+      <td>ユーザーがフリーズと誤解する</td>
+      <td>10MB 超のファイルは <code>onProgress</code> を必ず実装</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 9. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,748 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Platform/Push Notifications" />
+
+# プッシュ通知・ローカル通知方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: React Native mobile（Expo）アプリのプッシュ通知・ローカル通知全般  
+> **依存**: 08_API_Communication（httpClient）、09_Message_Display（notify）、15_Deep_Link（通知タップからの遷移）
+
+---
+
+## 1. 方針
+
+### 通知の 2 分類
+
+<table>
+  <thead>
+    <tr>
+      <th>種別</th>
+      <th>配信元</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>プッシュ通知</strong>（Remote）</td>
+      <td>APNs / FCM 経由でサーバーから配信</td>
+      <td>注文ステータス変化・メッセージ受信・マーケティング</td>
+    </tr>
+    <tr>
+      <td><strong>ローカル通知</strong>（Local）</td>
+      <td>端末内で <code>expo-notifications</code> がスケジュール</td>
+      <td>リマインダー・オフライン通知・カウントダウン</td>
+    </tr>
+  </tbody>
+</table>
+
+### 採用ライブラリ
+
+```bash
+expo install expo-notifications expo-device expo-constants
+```
+
+🔴 **MUST**: プッシュ通知は `expo-notifications` 一択。Firebase SDK（`react-native-firebase`）を直接追加しない  
+🔴 **MUST**: Expo の EAS Build 環境では `expo-notifications` が FCM / APNs を内部で束ねる
+
+---
+
+## 2. 通知フロー全体像
+
+```
+サーバー
+  ↓ Expo Push API（https://exp.host/--/api/v2/push/send）
+  ↓ または APNs / FCM に直接配信
+APNs / FCM
+  ↓
+端末 OS
+  ↓
+expo-notifications
+  ├─ フォアグラウンド → NotificationHandler で処理
+  ├─ バックグラウンド → OS が通知センターに表示
+  └─ タップ → lastNotificationResponse で Deep Link へ遷移
+```
+
+---
+
+## 3. 権限取得
+
+### 権限取得の原則
+
+🔴 **MUST**: アプリ起動直後に権限ダイアログを表示しない  
+🔴 **MUST**: 権限が必要な文脈（初回通知設定画面・注文確定後）で要求する  
+🔴 **MUST**: 一度拒否された場合はシステムダイアログを再表示しない（OS 仕様上不可）。設定アプリへの誘導に切り替える  
+🔴 **MUST NOT**: `expo-notifications` を画面コンポーネントから直接呼ばない。`notificationService` wrapper 経由のみ
+
+```ts
+// src/lib/notificationService.ts
+import * as Notifications from 'expo-notifications';
+import * as Device        from 'expo-device';
+import { Platform, Linking } from 'react-native';
+import { logger }         from '@/lib/logger';
+
+export type PermissionStatus =
+  | 'granted'
+  | 'denied'        // ユーザーが拒否
+  | 'undetermined'  // まだ尋ねていない
+  | 'unavailable';  // シミュレーター / 物理デバイス以外
+
+// ─── 現在の権限状態を取得（ダイアログを出さない）──────────────────────────
+export async function getPermissionStatus(): Promise<PermissionStatus> {
+  if (!Device.isDevice) return 'unavailable';
+
+  const { status } = await Notifications.getPermissionsAsync();
+  return status as PermissionStatus;
+}
+
+// ─── 権限を要求する ────────────────────────────────────────────────────────
+export async function requestPermission(): Promise<PermissionStatus> {
+  if (!Device.isDevice) return 'unavailable';
+
+  const current = await getPermissionStatus();
+
+  // 既に拒否済み → システムダイアログは出せないので設定画面へ
+  if (current === 'denied') {
+    return 'denied';
+  }
+
+  const { status } = await Notifications.requestPermissionsAsync({
+    ios: {
+      allowAlert:  true,
+      allowBadge:  true,
+      allowSound:  true,
+      allowProvisional: false,  // iOS 仮承認は使わない
+    },
+  });
+
+  logger.info('Push notification permission result', { status });
+  return status as PermissionStatus;
+}
+
+// ─── 拒否後の設定アプリ誘導 ───────────────────────────────────────────────
+export async function openNotificationSettings() {
+  if (Platform.OS === 'ios') {
+    await Linking.openURL('app-settings:');
+  } else {
+    await Linking.openSettings();
+  }
+}
+
+// ─── Expo Push Token を取得 ────────────────────────────────────────────────
+export async function getExpoPushToken(): Promise<string | null> {
+  const status = await getPermissionStatus();
+  if (status !== 'granted') return null;
+
+  try {
+    const token = await Notifications.getExpoPushTokenAsync({
+      projectId: Constants.expoConfig?.extra?.eas?.projectId,
+    });
+    return token.data;
+  } catch (err) {
+    logger.error('Failed to get Expo push token', { err });
+    return null;
+  }
+}
+
+// ─── ネイティブ Push Token を取得（サーバーが APNs / FCM に直接送る場合）──
+export async function getNativePushToken(): Promise<string | null> {
+  const status = await getPermissionStatus();
+  if (status !== 'granted') return null;
+
+  try {
+    const token = await Notifications.getDevicePushTokenAsync();
+    return token.data as string;
+  } catch (err) {
+    logger.error('Failed to get native push token', { err });
+    return null;
+  }
+}
+```
+
+### 権限要求 UI パターン
+
+```tsx
+// features/notifications/components/NotificationPermissionPrompt.tsx
+import { notificationService } from '@/lib/notificationService';
+import { notify }              from '@/lib/notify';
+
+export function NotificationPermissionPrompt() {
+  const { t }    = useTranslation();
+  const [status, setStatus] = useState<PermissionStatus | null>(null);
+
+  useEffect(() => {
+    notificationService.getPermissionStatus().then(setStatus);
+  }, []);
+
+  const handleRequest = async () => {
+    const result = await notificationService.requestPermission();
+    setStatus(result);
+
+    if (result === 'denied') {
+      // 拒否された → 設定アプリへの誘導 Dialog
+      notify.dialog({
+        title:        t('notification.deniedTitle'),   // '通知が許可されていません'
+        message:      t('notification.deniedMessage'), // '設定アプリから通知を有効にしてください'
+        confirmLabel: t('notification.openSettings'), // '設定を開く'
+        cancelLabel:  t('common.cancel'),
+        onConfirm:    () => notificationService.openNotificationSettings(),
+      });
+    }
+  };
+
+  // 既に granted なら何も表示しない
+  if (status === 'granted' || status === 'unavailable') return null;
+
+  return (
+    <Banner
+      type="info"
+      message={t('notification.enablePrompt')}   // '通知を有効にすると注文状況をお知らせします'
+      action={{ label: t('notification.enable'), onPress: handleRequest }}
+    />
+  );
+}
+```
+
+🔴 **MUST**: 拒否後は `requestPermissionsAsync` を再呼び出ししない  
+🟡 **SHOULD**: 権限要求の前に「何のために通知を使うか」を説明するプリプロンプト UI を設ける  
+🟡 **SHOULD**: 権限状態は `useQuery` でキャッシュし、毎回 `getPermissionsAsync` を呼ばない
+
+---
+
+## 4. Push Token の登録・管理
+
+```ts
+// src/lib/notificationService.ts（続き）
+
+// ─── トークンをサーバーに登録する ─────────────────────────────────────────
+export async function registerPushToken(): Promise<void> {
+  const token = await getExpoPushToken();
+  if (!token) return;
+
+  await httpClient.post(
+    '/users/me/push-tokens',
+    {
+      token,
+      platform: Platform.OS,
+      deviceId: await Device.getDeviceTypeAsync(),
+    },
+    registerPushTokenResponseSchema,
+  );
+}
+
+// ─── トークンをサーバーから削除（ログアウト時）────────────────────────────
+export async function unregisterPushToken(): Promise<void> {
+  const token = await getExpoPushToken();
+  if (!token) return;
+
+  await httpClient.delete(
+    `/users/me/push-tokens/${encodeURIComponent(token)}`,
+    z.object({ success: z.boolean() }),
+  ).catch((err) => {
+    // ログアウト時のエラーはサイレントに扱う
+    logger.warn('Failed to unregister push token', { err });
+  });
+}
+```
+
+### トークン登録のタイミング
+
+```tsx
+// app/_layout.tsx — ログイン完了後にトークン登録
+export default function RootLayout() {
+  const isLoggedIn = useAuthStore((s) => s.isLoggedIn);
+
+  useEffect(() => {
+    if (isLoggedIn) {
+      notificationService.registerPushToken();
+    }
+  }, [isLoggedIn]);
+
+  // ...
+}
+```
+
+🔴 **MUST**: ログアウト時に `unregisterPushToken()` を呼びトークンを削除する  
+🟡 **SHOULD**: トークンは `expo-secure-store` に保存してサーバー登録の冪等性を保つ  
+🟡 **SHOULD**: アプリ起動のたびにトークンを再登録する（OS 側でトークンが更新される場合があるため）
+
+---
+
+## 5. フォアグラウンド受信ハンドリング
+
+アプリが前面にあるとき、プッシュ通知をどう扱うかを一元設定する。
+
+```ts
+// src/lib/notificationHandler.ts
+import * as Notifications from 'expo-notifications';
+
+// ─── フォアグラウンド表示ポリシー ─────────────────────────────────────────
+// デフォルトはフォアグラウンドでも OS バナーを表示しない。
+// アプリ内通知（09_Message_Display）で代替する。
+Notifications.setNotificationHandler({
+  handleNotification: async (notification) => {
+    const data = notification.request.content.data as NotificationData;
+
+    // カテゴリに応じて表示可否を切り替える
+    const shouldAlert = data?.category === 'critical';  // 緊急のみ OS バナー表示
+
+    return {
+      shouldShowAlert: shouldAlert,
+      shouldPlaySound: shouldAlert,
+      shouldSetBadge:  true,
+    };
+  },
+});
+```
+
+```tsx
+// app/_layout.tsx — 受信リスナーを Root で設定する
+export default function RootLayout() {
+  useEffect(() => {
+    // フォアグラウンド受信リスナー
+    const receiveSub = Notifications.addNotificationReceivedListener((notification) => {
+      const data = notification.request.content.data as NotificationData;
+      handleForegroundNotification(data);
+    });
+
+    return () => receiveSub.remove();
+  }, []);
+
+  return ( /* ... */ );
+}
+
+function handleForegroundNotification(data: NotificationData) {
+  switch (data.category) {
+    case 'order_status':
+      notify.info(data.body ?? '注文ステータスが更新されました');
+      // React Query を invalidate してデータを最新化
+      queryClient.invalidateQueries({ queryKey: queryKeys.orders.all() });
+      break;
+
+    case 'message':
+      notify.snackbar(data.body ?? '新しいメッセージがあります', {
+        action: { label: '確認', onPress: () => router.push('/messages') },
+      });
+      break;
+
+    case 'critical':
+      // OS バナーに委ねる（setNotificationHandler で shouldShowAlert: true）
+      break;
+  }
+}
+```
+
+🔴 **MUST**: フォアグラウンド受信リスナーは `app/_layout.tsx` の Root に 1 か所だけ設定する  
+🟡 **SHOULD**: フォアグラウンド時は OS バナーより `notify`（09_Message_Display）を優先する
+
+---
+
+## 6. タップハンドリングと Deep Link 遷移
+
+バックグラウンド・終了状態からの通知タップで画面を開く処理。
+
+```tsx
+// app/_layout.tsx
+
+export default function RootLayout() {
+  // ─── 通知タップリスナー（バックグラウンドからの復帰）────────────────────
+  useEffect(() => {
+    const tapSub = Notifications.addNotificationResponseReceivedListener(
+      (response) => {
+        handleNotificationTap(response.notification.request.content.data);
+      },
+    );
+    return () => tapSub.remove();
+  }, []);
+
+  // ─── アプリ終了状態からのタップ（コールドスタート）──────────────────────
+  useEffect(() => {
+    Notifications.getLastNotificationResponseAsync().then((response) => {
+      if (response) {
+        handleNotificationTap(response.notification.request.content.data);
+      }
+    });
+  }, []);
+
+  return ( /* ... */ );
+}
+
+function handleNotificationTap(data: NotificationData) {
+  if (!data?.deepLink) return;
+
+  // Deep Link の解決は 15_Deep_Link の deepLinkResolver に委譲
+  deepLinkResolver.navigate(data.deepLink);
+}
+```
+
+### 通知 payload の型定義
+
+```ts
+// src/types/notification.ts
+import { z } from 'zod';
+
+export const notificationDataSchema = z.object({
+  category:  z.enum(['order_status', 'message', 'promotion', 'critical']),
+  deepLink:  z.string().optional(),   // 例: 'myapp://order/order-001'
+  body:      z.string().optional(),
+  imageUrl:  z.string().url().optional(),
+});
+
+export type NotificationData = z.infer<typeof notificationDataSchema>;
+
+// ─── サーバーが送る payload の仕様 ────────────────────────────────────────
+// {
+//   "to": "ExponentPushToken[...]",
+//   "title": "注文ステータスが変わりました",
+//   "body": "ご注文が発送されました",
+//   "data": {
+//     "category": "order_status",
+//     "deepLink": "myapp://order/order-001"
+//   }
+// }
+```
+
+🔴 **MUST**: 通知 payload の `data` フィールドは Zod で検証してから使う  
+🔴 **MUST**: コールドスタート時の `getLastNotificationResponseAsync` は Root の `useEffect` で処理する  
+🟡 **SHOULD**: `deepLink` フィールドを統一し、遷移先は 15_Deep_Link の `deepLinkResolver` に委譲する
+
+---
+
+## 7. ローカル通知
+
+```ts
+// src/lib/localNotificationService.ts
+import * as Notifications from 'expo-notifications';
+
+// ─── 即時ローカル通知 ─────────────────────────────────────────────────────
+export async function scheduleImmediateNotification({
+  title,
+  body,
+  data,
+}: {
+  title: string;
+  body:  string;
+  data?: NotificationData;
+}): Promise<string> {
+  return Notifications.scheduleNotificationAsync({
+    content: { title, body, data, sound: true },
+    trigger: null,   // null = 即時
+  });
+}
+
+// ─── 時刻指定ローカル通知 ─────────────────────────────────────────────────
+export async function scheduleLocalNotification({
+  title,
+  body,
+  scheduledAt,
+  data,
+}: {
+  title:       string;
+  body:        string;
+  scheduledAt: Date;
+  data?:       NotificationData;
+}): Promise<string> {
+  return Notifications.scheduleNotificationAsync({
+    content: { title, body, data, sound: true },
+    trigger: {
+      type:    Notifications.SchedulableTriggerInputTypes.DATE,
+      date:    scheduledAt,
+    },
+  });
+}
+
+// ─── 通知のキャンセル ─────────────────────────────────────────────────────
+export async function cancelLocalNotification(id: string): Promise<void> {
+  await Notifications.cancelScheduledNotificationAsync(id);
+}
+
+export async function cancelAllLocalNotifications(): Promise<void> {
+  await Notifications.cancelAllScheduledNotificationsAsync();
+}
+
+// ─── バッジ管理 ───────────────────────────────────────────────────────────
+export async function setBadgeCount(count: number): Promise<void> {
+  await Notifications.setBadgeCountAsync(count);
+}
+
+export async function clearBadge(): Promise<void> {
+  await Notifications.setBadgeCountAsync(0);
+}
+```
+
+🟡 **SHOULD**: アプリがフォアグラウンドになったタイミングで `clearBadge()` を呼ぶ  
+🔴 **MUST**: `scheduleNotificationAsync` を Feature / Screen から直接呼ばない。`localNotificationService` 経由のみ
+
+---
+
+## 8. 通知カテゴリとアクションボタン（iOS）
+
+iOS の通知に「承認」「拒否」等のアクションボタンを付ける。
+
+```ts
+// src/lib/notificationService.ts（初期化時に設定）
+export async function setupNotificationCategories() {
+  await Notifications.setNotificationCategoryAsync('order_approval', [
+    {
+      identifier: 'APPROVE',
+      buttonTitle: '承認する',
+      options:    { isDestructive: false, isAuthenticationRequired: false },
+    },
+    {
+      identifier: 'REJECT',
+      buttonTitle: '却下する',
+      options:    { isDestructive: true,  isAuthenticationRequired: true },
+    },
+  ]);
+}
+```
+
+```tsx
+// アクションボタンのタップ処理
+const tapSub = Notifications.addNotificationResponseReceivedListener((response) => {
+  const actionId = response.actionIdentifier;
+  const data     = response.notification.request.content.data as NotificationData;
+
+  if (actionId === 'APPROVE') {
+    // 承認 API を呼ぶ
+    httpClient.post(`/approvals/${data.approvalId}/approve`, {}, approvalSchema);
+    notify.success('承認しました');
+  } else if (actionId === 'REJECT') {
+    router.push(`/approvals/${data.approvalId}/reject`);
+  } else {
+    // デフォルト（通知本体タップ）
+    handleNotificationTap(data);
+  }
+});
+```
+
+🟡 **SHOULD**: カテゴリ設定は `app/_layout.tsx` の初期化時に 1 回だけ実行する
+
+---
+
+## 9. Android チャンネル設定
+
+Android 8.0 以降は通知チャンネルが必須。
+
+```ts
+// src/lib/notificationService.ts
+export async function setupAndroidChannels() {
+  if (Platform.OS !== 'android') return;
+
+  await Notifications.setNotificationChannelAsync('order', {
+    name:        '注文通知',
+    description: '注文ステータスの変化をお知らせします',
+    importance:  Notifications.AndroidImportance.HIGH,
+    vibrationPattern: [0, 250, 250, 250],
+    lightColor:  '#FF6B35',
+  });
+
+  await Notifications.setNotificationChannelAsync('message', {
+    name:        'メッセージ',
+    description: '新着メッセージをお知らせします',
+    importance:  Notifications.AndroidImportance.DEFAULT,
+  });
+
+  await Notifications.setNotificationChannelAsync('promotion', {
+    name:        'キャンペーン・お知らせ',
+    description: 'キャンペーン情報をお知らせします',
+    importance:  Notifications.AndroidImportance.LOW,
+  });
+}
+```
+
+🔴 **MUST**: Android チャンネルはアプリ初期化時に設定する  
+🟡 **SHOULD**: チャンネル ID はサーバー送信の payload の `channelId` フィールドと一致させる
+
+---
+
+## 10. app.json / app.config.ts 設定
+
+```json
+{
+  "expo": {
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "icon":            "./assets/notification-icon.png",
+          "color":           "#FF6B35",
+          "defaultChannel":  "order",
+          "sounds":          ["./assets/sounds/notification.wav"]
+        }
+      ]
+    ],
+    "ios": {
+      "bundleIdentifier": "com.example.myapp",
+      "infoPlist": {
+        "NSUserNotificationUsageDescription":
+          "注文状況やメッセージをお知らせするために通知を使用します。"
+      }
+    },
+    "android": {
+      "package":           "com.example.myapp",
+      "googleServicesFile": "./google-services.json",
+      "permissions": [
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.VIBRATE"
+      ]
+    }
+  }
+}
+```
+
+🔴 **MUST**: iOS `NSUserNotificationUsageDescription` に具体的な用途を記述する（App Store 審査要件）  
+🔴 **MUST**: `google-services.json` を Git に含めない（`.gitignore` に追加し EAS Secret で管理）
+
+---
+
+## 11. テスト実装規約
+
+### 単体テスト
+
+```ts
+// src/lib/__tests__/notificationService.test.ts
+jest.mock('expo-notifications');
+jest.mock('expo-device', () => ({
+  isDevice: true,
+  getDeviceTypeAsync: jest.fn().mockResolvedValue('PHONE'),
+}));
+
+import * as Notifications from 'expo-notifications';
+import { getPermissionStatus, requestPermission } from '@/lib/notificationService';
+
+describe('requestPermission', () => {
+  test('granted のとき granted を返す', async () => {
+    (Notifications.getPermissionsAsync as jest.Mock)
+      .mockResolvedValue({ status: 'granted' });
+    (Notifications.requestPermissionsAsync as jest.Mock)
+      .mockResolvedValue({ status: 'granted' });
+
+    expect(await requestPermission()).toBe('granted');
+  });
+
+  test('denied のとき requestPermissionsAsync を呼ばない', async () => {
+    (Notifications.getPermissionsAsync as jest.Mock)
+      .mockResolvedValue({ status: 'denied' });
+
+    const result = await requestPermission();
+    expect(result).toBe('denied');
+    expect(Notifications.requestPermissionsAsync).not.toHaveBeenCalled();
+  });
+
+  test('Device.isDevice が false のとき unavailable を返す', async () => {
+    jest.resetModules();
+    jest.doMock('expo-device', () => ({ isDevice: false }));
+    const { requestPermission: req } = require('@/lib/notificationService');
+    expect(await req()).toBe('unavailable');
+  });
+});
+```
+
+### 統合テスト（通知タップのナビゲーション）
+
+```tsx
+// app/__tests__/notification-tap.test.tsx
+import * as Notifications from 'expo-notifications';
+import { renderRouter }   from 'expo-router/testing-library';
+
+test('通知タップで注文詳細画面に遷移する', async () => {
+  (Notifications.getLastNotificationResponseAsync as jest.Mock)
+    .mockResolvedValue({
+      notification: {
+        request: {
+          content: {
+            data: {
+              category: 'order_status',
+              deepLink:  'myapp://order/order-001',
+            },
+          },
+        },
+      },
+    });
+
+  const { findByText } = renderRouter(
+    {
+      'index':          require('@/app/index').default,
+      '(main)/order/[id]': require('@/app/(main)/order/[id]').default,
+    },
+    { initialUrl: '/' },
+  );
+
+  // Deep Link 遷移後に注文詳細が表示される
+  server.use(...orderHandlers.detail(createOrder({ id: 'order-001' })));
+  expect(await findByText('注文番号: order-001')).toBeTruthy();
+});
+```
+
+---
+
+## 12. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>リスク / 結果</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>起動直後に権限要求</td>
+      <td>App Store リジェクト・ユーザーの即拒否率が上がる</td>
+      <td>文脈のある場面まで遅らせる</td>
+    </tr>
+    <tr>
+      <td>拒否後も <code>requestPermissionsAsync</code> を再呼び出し</td>
+      <td>iOS は無視、Android は二度目のダイアログが表示されることがある</td>
+      <td><code>getPermissionStatus</code> で <code>denied</code> を確認してから分岐</td>
+    </tr>
+    <tr>
+      <td><code>google-services.json</code> を Git にコミット</td>
+      <td>FCM プロジェクトキーの漏洩</td>
+      <td>EAS Secret で管理し <code>.gitignore</code> に追加</td>
+    </tr>
+    <tr>
+      <td>ログアウト時にトークン削除しない</td>
+      <td>他ユーザーの端末に通知が届く</td>
+      <td>ログアウトフックで <code>unregisterPushToken()</code> を必ず呼ぶ</td>
+    </tr>
+    <tr>
+      <td>Android チャンネル未設定</td>
+      <td>Android 8.0 以降で通知が表示されない</td>
+      <td>初期化時に <code>setupAndroidChannels()</code> を呼ぶ</td>
+    </tr>
+    <tr>
+      <td>コールドスタート時の通知タップを未処理</td>
+      <td>アプリ終了状態からのタップでトップ画面に飛ぶ</td>
+      <td><code>getLastNotificationResponseAsync</code> を Root で処理する</td>
+    </tr>
+    <tr>
+      <td>payload を無検証で使う</td>
+      <td>不正な deepLink でクラッシュ</td>
+      <td><code>notificationDataSchema.safeParse</code> で検証する</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 13. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,590 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Quality/Animation" />
+
+# アニメーション・ジェスチャー設計標準
+
+> **ステータス**: `APPROVED`  
+> **対象**: react-native-reanimated / react-native-gesture-handler の実装規約  
+> **依存**: 01_Principles（採用技術）、16_Performance（パフォーマンス）
+
+---
+
+## 1. 方針
+
+### 技術選択の原則
+
+<table>
+  <thead>
+    <tr>
+      <th>用途</th>
+      <th>採用</th>
+      <th>理由</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>すべてのアニメーション</td>
+      <td><code>react-native-reanimated</code></td>
+      <td>JS スレッドをブロックせず 60fps を維持できる</td>
+    </tr>
+    <tr>
+      <td>すべてのジェスチャー</td>
+      <td><code>react-native-gesture-handler</code></td>
+      <td>ネイティブスレッドでジェスチャーを処理する</td>
+    </tr>
+    <tr>
+      <td>レイアウトアニメーション</td>
+      <td><code>Reanimated Layout Animations</code></td>
+      <td>要素の出現・消去・リサイズを宣言的に記述できる</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST NOT**: `Animated`（React Native コア）を新規実装に使わない  
+🔴 **MUST NOT**: `PanResponder` を新規実装に使わない  
+🔴 **MUST**: `GestureHandlerRootView` を `app/_layout.tsx` の最外周に配置する（01_Principles で定義済み）
+
+### `useReducedMotion` との統合
+
+すべてのアニメーションは `useReducedMotion` を確認し、有効な場合は動きを最小化する。
+
+```ts
+// src/hooks/useReducedMotion.ts
+import { useEffect, useState } from 'react';
+import { AccessibilityInfo }   from 'react-native';
+
+export function useReducedMotion(): boolean {
+  const [reduceMotion, setReduceMotion] = useState(false);
+
+  useEffect(() => {
+    AccessibilityInfo.isReduceMotionEnabled().then(setReduceMotion);
+    const sub = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduceMotion);
+    return () => sub.remove();
+  }, []);
+
+  return reduceMotion;
+}
+```
+
+---
+
+## 2. Reanimated の基本パターン
+
+### shared value と animated style
+
+```tsx
+import Animated, {
+  useSharedValue, useAnimatedStyle, withSpring, withTiming,
+} from 'react-native-reanimated';
+
+// ✅ 基本パターン: useSharedValue → useAnimatedStyle → Animated.View
+export function FadeInCard({ children }: { children: React.ReactNode }) {
+  const opacity   = useSharedValue(0);
+  const translateY = useSharedValue(16);
+
+  useEffect(() => {
+    opacity.value    = withTiming(1,  { duration: 200 });
+    translateY.value = withSpring(0,  { damping: 20, stiffness: 300 });
+  }, []);
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    opacity:   opacity.value,
+    transform: [{ translateY: translateY.value }],
+  }));
+
+  return (
+    <Animated.View style={animatedStyle}>
+      {children}
+    </Animated.View>
+  );
+}
+```
+
+### `withTiming` vs `withSpring` の使い分け
+
+<table>
+  <thead>
+    <tr>
+      <th>アニメーション</th>
+      <th>推奨</th>
+      <th>理由</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>フェードイン・フェードアウト</td>
+      <td><code>withTiming</code></td>
+      <td>線形・イージングが自然</td>
+    </tr>
+    <tr>
+      <td>要素の出現・位置変化</td>
+      <td><code>withSpring</code></td>
+      <td>物理ベースで自然な弾力感</td>
+    </tr>
+    <tr>
+      <td>進捗バー・ゲージ</td>
+      <td><code>withTiming</code></td>
+      <td>指定時間で完了する必要がある</td>
+    </tr>
+    <tr>
+      <td>ドラッグ追従</td>
+      <td><code>withSpring</code></td>
+      <td>指を離した後の収束が自然</td>
+    </tr>
+    <tr>
+      <td>モーダルのスライドイン</td>
+      <td><code>withTiming</code> + <code>Easing.out</code></td>
+      <td>制御された滑らかさ</td>
+    </tr>
+  </tbody>
+</table>
+
+```tsx
+import { Easing } from 'react-native-reanimated';
+
+// モーダルのスライドアップ
+const translateY = useSharedValue(300);
+translateY.value = withTiming(0, {
+  duration: 300,
+  easing:   Easing.out(Easing.cubic),
+});
+```
+
+---
+
+## 3. レイアウトアニメーション
+
+要素の出現・消去・高さ変化に `entering` / `exiting` / `layout` を使う。
+
+```tsx
+import Animated, {
+  FadeIn, FadeOut, SlideInDown, SlideOutDown,
+  LinearTransition,
+} from 'react-native-reanimated';
+
+// ✅ アイテムの追加・削除アニメーション
+export function AnimatedList({ items }: { items: Item[] }) {
+  return (
+    <View>
+      {items.map((item) => (
+        <Animated.View
+          key={item.id}
+          entering={FadeIn.duration(200)}
+          exiting={FadeOut.duration(150)}
+          layout={LinearTransition}   // 他のアイテムが滑らかに移動する
+        >
+          <ItemCard item={item} />
+        </Animated.View>
+      ))}
+    </View>
+  );
+}
+
+// ✅ モーダル・ボトムシートの出現
+export function BottomSheet({ visible, children }: BottomSheetProps) {
+  if (!visible) return null;
+  return (
+    <Animated.View
+      entering={SlideInDown.springify().damping(20)}
+      exiting={SlideOutDown.duration(200)}
+    >
+      {children}
+    </Animated.View>
+  );
+}
+```
+
+### `useReducedMotion` との統合パターン
+
+```tsx
+import { FadeIn, FadeOut } from 'react-native-reanimated';
+import { useReducedMotion }  from '@/hooks/useReducedMotion';
+
+export function AnimatedCard({ children }: { children: React.ReactNode }) {
+  const reduceMotion = useReducedMotion();
+
+  // モーションが制限されている場合はスライドをフェードに置き換える
+  const entering = reduceMotion
+    ? FadeIn.duration(100)
+    : SlideInDown.springify().damping(20);
+
+  const exiting = reduceMotion
+    ? FadeOut.duration(100)
+    : SlideOutDown.duration(200);
+
+  return (
+    <Animated.View entering={entering} exiting={exiting}>
+      {children}
+    </Animated.View>
+  );
+}
+```
+
+🟡 **SHOULD**: スライド・バウンスアニメーションは `useReducedMotion` が true のときフェードに置き換える
+
+---
+
+## 4. ジェスチャーハンドラ
+
+### Tap（ボタン代替）
+
+```tsx
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue, useAnimatedStyle, withSpring,
+} from 'react-native-reanimated';
+
+export function PressableCard({ onPress, children }: PressableCardProps) {
+  const scale = useSharedValue(1);
+
+  const tap = Gesture.Tap()
+    .onBegin(() => { scale.value = withSpring(0.96, { damping: 20 }); })
+    .onFinalize(() => { scale.value = withSpring(1,    { damping: 20 }); })
+    .onEnd(() => { runOnJS(onPress)(); });
+    // ⚠️ onPress は JS 関数なので runOnJS でラップする
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    transform: [{ scale: scale.value }],
+  }));
+
+  return (
+    <GestureDetector gesture={tap}>
+      <Animated.View
+        style={animatedStyle}
+        accessible={true}
+        accessibilityRole="button"
+      >
+        {children}
+      </Animated.View>
+    </GestureDetector>
+  );
+}
+```
+
+### Pan（ドラッグ）
+
+```tsx
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue, useAnimatedStyle,
+  withSpring, runOnJS,
+} from 'react-native-reanimated';
+
+const DISMISS_THRESHOLD = 120;  // px。この距離を超えたら dismiss
+
+export function SwipeToDismissCard({ onDismiss, children }: SwipeProps) {
+  const translateX = useSharedValue(0);
+  const opacity    = useSharedValue(1);
+
+  const pan = Gesture.Pan()
+    .onUpdate((e) => {
+      translateX.value = e.translationX;
+      opacity.value    = 1 - Math.abs(e.translationX) / 300;
+    })
+    .onEnd((e) => {
+      if (Math.abs(e.translationX) > DISMISS_THRESHOLD) {
+        // 閾値超え → 画面外へ飛ばしてから dismiss を呼ぶ
+        translateX.value = withSpring(
+          e.translationX > 0 ? 500 : -500,
+          {},
+          (finished) => { if (finished) runOnJS(onDismiss)(); },
+        );
+      } else {
+        // 閾値未満 → 元の位置に戻す
+        translateX.value = withSpring(0);
+        opacity.value    = withSpring(1);
+      }
+    });
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: translateX.value }],
+    opacity:   opacity.value,
+  }));
+
+  return (
+    <GestureDetector gesture={pan}>
+      <Animated.View style={animatedStyle}>{children}</Animated.View>
+    </GestureDetector>
+  );
+}
+```
+
+🔴 **MUST**: Reanimated worklet（`useAnimatedStyle` / `onUpdate` 等）内から JS 関数を呼ぶときは `runOnJS` を使う  
+🔴 **MUST NOT**: worklet 内でコンポーネントの state を直接変更しない（`setState` は JS スレッドの操作）
+
+### ジェスチャーの競合解決
+
+```tsx
+// スクロールとスワイプが競合する場合
+const pan    = Gesture.Pan().activeOffsetX([-10, 10]);   // X 方向 10px 以上でアクティブ
+const scroll = Gesture.Native();                          // ScrollView / FlatList のネイティブジェスチャー
+
+// 同時認識（scroll が優先）
+const composed = Gesture.Simultaneous(scroll, pan);
+
+// pan が成立したら scroll をキャンセル
+const exclusive = Gesture.Exclusive(pan, scroll);
+```
+
+🟡 **SHOULD**: `ScrollView` / `FlatList` 内でドラッグジェスチャーを使う場合は `Gesture.Simultaneous` か `Exclusive` で競合を明示的に解決する
+
+---
+
+## 5. 共通アニメーションコンポーネント
+
+繰り返し使うアニメーションパターンは Design System に共通化する。
+
+```tsx
+// src/components/ui/Animated/FadeView.tsx
+type FadeViewProps = {
+  visible:  boolean;
+  duration?: number;
+  children: React.ReactNode;
+  style?:   ViewStyle;
+};
+
+export function FadeView({ visible, duration = 200, children, style }: FadeViewProps) {
+  const reduceMotion = useReducedMotion();
+  const opacity      = useSharedValue(visible ? 1 : 0);
+
+  useEffect(() => {
+    opacity.value = withTiming(visible ? 1 : 0, {
+      duration: reduceMotion ? 0 : duration,
+    });
+  }, [visible, duration, reduceMotion]);
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    opacity: opacity.value,
+  }));
+
+  return (
+    <Animated.View style={[animatedStyle, style]}>
+      {children}
+    </Animated.View>
+  );
+}
+```
+
+```tsx
+// src/components/ui/Animated/SkeletonPulse.tsx
+// ローディングのスケルトンパルスアニメーション
+export function SkeletonPulse({ style }: { style?: ViewStyle }) {
+  const reduceMotion = useReducedMotion();
+  const opacity      = useSharedValue(1);
+
+  useEffect(() => {
+    if (reduceMotion) return;
+    opacity.value = withRepeat(
+      withTiming(0.3, { duration: 700, easing: Easing.inOut(Easing.ease) }),
+      -1,   // 無限ループ
+      true, // reverse
+    );
+  }, [reduceMotion]);
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    opacity: opacity.value,
+  }));
+
+  return (
+    <Animated.View
+      style={[{ backgroundColor: colors['surface-secondary'] }, animatedStyle, style]}
+      accessible={false}
+    />
+  );
+}
+```
+
+---
+
+## 6. スクロール連動アニメーション
+
+```tsx
+// ヘッダーがスクロールに応じて縮小するパターン
+import Animated, {
+  useScrollViewOffset, useAnimatedStyle, interpolate, Extrapolation,
+} from 'react-native-reanimated';
+
+const HEADER_MAX_HEIGHT = 200;
+const HEADER_MIN_HEIGHT = 60;
+
+export function AnimatedHeaderScreen() {
+  const scrollRef    = useAnimatedRef<Animated.ScrollView>();
+  const scrollOffset = useScrollViewOffset(scrollRef);
+
+  const headerStyle = useAnimatedStyle(() => {
+    const height = interpolate(
+      scrollOffset.value,
+      [0, HEADER_MAX_HEIGHT - HEADER_MIN_HEIGHT],
+      [HEADER_MAX_HEIGHT, HEADER_MIN_HEIGHT],
+      Extrapolation.CLAMP,
+    );
+    return { height };
+  });
+
+  const titleOpacity = useAnimatedStyle(() => ({
+    opacity: interpolate(
+      scrollOffset.value,
+      [0, 50, 100],
+      [1, 0.5, 0],
+      Extrapolation.CLAMP,
+    ),
+  }));
+
+  return (
+    <View style={{ flex: 1 }}>
+      <Animated.View style={[styles.header, headerStyle]}>
+        <Animated.Text style={[styles.title, titleOpacity]}>
+          画面タイトル
+        </Animated.Text>
+      </Animated.View>
+
+      <Animated.ScrollView ref={scrollRef}>
+        {/* コンテンツ */}
+      </Animated.ScrollView>
+    </View>
+  );
+}
+```
+
+🟡 **SHOULD**: スクロール連動アニメーションは `useScrollViewOffset` を使う（`onScroll` で JS スレッドを介さない）
+
+---
+
+## 7. worklet ルール
+
+```tsx
+// ✅ worklet 内で使えるもの
+useAnimatedStyle(() => {
+  'worklet';
+  return {
+    opacity:    opacity.value,          // shared value の読み取り ✅
+    transform:  [{ scale: scale.value }], // 演算 ✅
+  };
+});
+
+// ❌ worklet 内で使えないもの
+useAnimatedStyle(() => {
+  'worklet';
+  console.log('debug');      // ❌ console はワーカースレッドで使えない
+  setState(opacity.value);   // ❌ setState はJSスレッドの操作
+  someJSFunction();          // ❌ 通常のJS関数 → runOnJS(someJSFunction)() に変換
+});
+```
+
+### `runOnJS` / `runOnUI` の使い分け
+
+```tsx
+// runOnJS: UI スレッド → JS スレッドへの呼び出し
+pan.onEnd(() => {
+  runOnJS(router.push)('/next-screen');  // ✅ ナビゲーションは JS スレッド
+  runOnJS(setIsOpen)(false);             // ✅ setState は JS スレッド
+});
+
+// runOnUI: JS スレッド → UI スレッドへの呼び出し（通常は worklet 内自動変換で不要）
+runOnUI(() => {
+  'worklet';
+  opacity.value = withTiming(0);
+})();
+```
+
+---
+
+## 8. テスト
+
+```tsx
+// アニメーションのテストは Reanimated のモックを使う
+// jest.config.ts に設定済みの場合は自動でモックされる
+
+// src/components/ui/Animated/__tests__/FadeView.test.tsx
+import { render, act } from '@testing-library/react-native';
+import { FadeView }    from '../FadeView';
+
+// Reanimated v3 はテスト環境でアニメーション値を即時解決する
+jest.mock('react-native-reanimated', () =>
+  require('react-native-reanimated/mock'),
+);
+
+test('visible=false のとき opacity が 0 になる', async () => {
+  const { getByTestId, rerender } = render(
+    <FadeView visible={true} testID="fade">
+      <Text>コンテンツ</Text>
+    </FadeView>,
+  );
+
+  rerender(<FadeView visible={false} testID="fade"><Text>コンテンツ</Text></FadeView>);
+
+  // Reanimated mock は値を即時設定するため、withTiming の完了を待つ必要がない
+  const view = getByTestId('fade');
+  expect(view.props.style).toMatchObject({ opacity: 0 });
+});
+```
+
+🟡 **SHOULD**: アニメーションのテストは値の最終状態のみ確認する（中間フレームのテストは不要）
+
+---
+
+## 9. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>影響</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>Animated</code>（RN コア）を使う</td>
+      <td>JS スレッドで実行され、フレームドロップが発生する</td>
+      <td><code>react-native-reanimated</code> に移行</td>
+    </tr>
+    <tr>
+      <td>worklet 内で <code>setState</code> を直接呼ぶ</td>
+      <td>実行時エラー / 意図しない挙動</td>
+      <td><code>runOnJS(setState)(value)</code> に変換</td>
+    </tr>
+    <tr>
+      <td><code>GestureHandlerRootView</code> がない</td>
+      <td>ジェスチャーが一切認識されない</td>
+      <td><code>app/_layout.tsx</code> の最外周に配置</td>
+    </tr>
+    <tr>
+      <td><code>onPress</code> を worklet 内で直接呼ぶ</td>
+      <td>実行時エラー</td>
+      <td><code>runOnJS(onPress)()</code></td>
+    </tr>
+    <tr>
+      <td><code>useReducedMotion</code> 未対応</td>
+      <td>アクセシビリティ設定が無視される</td>
+      <td>全アニメーションで確認を入れる</td>
+    </tr>
+    <tr>
+      <td><code>withRepeat</code> の cleanup なし</td>
+      <td>アンマウント後もアニメーションが継続しメモリリーク</td>
+      <td><code>cancelAnimation(value)</code> を cleanup で呼ぶ</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 10. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

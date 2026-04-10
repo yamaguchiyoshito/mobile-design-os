@@ -1,0 +1,922 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Quality/Storybook Guide" />
+
+# Storybook 追加手順ガイド
+
+> **ステータス**: `APPROVED`  
+> **対象**: プロジェクト参加者全員。新規 Story・Docs の追加・更新時  
+> **前提**: 05_Quality（二系統構成・採用 addon）・11_Test_Strategy（Play 関数）・24_Dev_Environment（MCP 設定）を読んでいること
+
+---
+
+## 1. Story を追加する前に読む
+
+### この分冊の目的
+
+05_Quality と 11_Test_Strategy は「何を使うか・なぜ使うか」を定義した。  
+本書は「**どう書くか・どこに置くか**」の実務手順を定義する。
+
+### 二系統の役割を再確認する
+
+<table>
+  <thead>
+    <tr>
+      <th>系統</th>
+      <th>ファイル設定</th>
+      <th>確認できること</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>on-device</strong></td>
+      <td><code>.rnstorybook/main.ts</code></td>
+      <td>実機 / simulator でのピクセル精度・ジェスチャー・フォント</td>
+    </tr>
+    <tr>
+      <td><strong>web</strong></td>
+      <td><code>.storybook/main.ts</code></td>
+      <td>Docs・インタラクション・a11y・VRT</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST**: Story ファイルは 1 つ書けば両系統で共有される。系統ごとにファイルを分けない  
+🔴 **MUST**: on-device でしか確認できないこと（Dynamic Type・実機レンダリング）は web の Story を「正」とみなさない
+
+---
+
+## 2. ファイル配置ルール
+
+### 配置場所の判断基準
+
+```
+コンポーネントの種類                      配置先
+─────────────────────────────────────────────────────────
+Design System（components/ui/）        コンポーネントと同階層
+Feature コンポーネント（features/*/）   コンポーネントと同階層
+画面全体（app/）                        __stories__/ ディレクトリ（任意）
+共通レイアウト（components/templates/）コンポーネントと同階層
+```
+
+```
+src/
+  components/
+    ui/
+      Button/
+        Button.tsx
+        Button.stories.tsx      ← ✅ 同階層
+        Button.test.tsx
+        index.ts
+      Card/
+        Card.tsx
+        Card.stories.tsx        ← ✅ 同階層
+
+  features/
+    order/
+      components/
+        OrderCard.tsx
+        OrderCard.stories.tsx   ← ✅ 同階層
+```
+
+🔴 **MUST**: Story ファイルはコンポーネントと同じディレクトリに置く  
+🔴 **MUST NOT**: `src/stories/` のような集中管理ディレクトリに置かない  
+（コンポーネントと Story が離れるとリネーム時に片方が取り残される）
+
+---
+
+## 3. `title` の命名規則
+
+```
+[カテゴリ]/[サブカテゴリ?]/[コンポーネント名]
+```
+
+### カテゴリ定義
+
+<table>
+  <thead>
+    <tr>
+      <th>カテゴリ</th>
+      <th>対象</th>
+      <th>例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>UI</code></td>
+      <td>Design System の Primitive / Composite</td>
+      <td><code>UI/Button</code>, <code>UI/FormField</code></td>
+    </tr>
+    <tr>
+      <td><code>UI/Form</code></td>
+      <td>フォーム関連コンポーネント</td>
+      <td><code>UI/Form/TextInput</code>, <code>UI/Form/Select</code></td>
+    </tr>
+    <tr>
+      <td><code>UI/Feedback</code></td>
+      <td>メッセージ・通知系</td>
+      <td><code>UI/Feedback/Toast</code>, <code>UI/Feedback/ErrorState</code></td>
+    </tr>
+    <tr>
+      <td><code>UI/Navigation</code></td>
+      <td>ナビゲーション関連</td>
+      <td><code>UI/Navigation/TabBar</code></td>
+    </tr>
+    <tr>
+      <td><code>UI/Layout</code></td>
+      <td>レイアウト・コンテナ</td>
+      <td><code>UI/Layout/Card</code>, <code>UI/Layout/Section</code></td>
+    </tr>
+    <tr>
+      <td><code>Feature</code></td>
+      <td>業務機能コンポーネント</td>
+      <td><code>Feature/Order/OrderCard</code></td>
+    </tr>
+    <tr>
+      <td><code>Screen</code></td>
+      <td>画面全体</td>
+      <td><code>Screen/OrderDetail</code></td>
+    </tr>
+    <tr>
+      <td><code>Docs</code></td>
+      <td>MDX ドキュメント</td>
+      <td><code>Docs/ColorTokens</code></td>
+    </tr>
+  </tbody>
+</table>
+
+```tsx
+// ✅ 正解
+const meta: Meta<typeof Button> = {
+  title: 'UI/Button',
+};
+
+const meta: Meta<typeof OrderCard> = {
+  title: 'Feature/Order/OrderCard',
+};
+
+// ❌ 禁止 — カテゴリなし
+const meta: Meta<typeof Button> = {
+  title: 'Button',
+};
+
+// ❌ 禁止 — 実装詳細をタイトルに入れない
+const meta: Meta<typeof Button> = {
+  title: 'UI/PressableWithAnimation/Button',
+};
+```
+
+---
+
+## 4. Meta オブジェクトの書き方
+
+```tsx
+// src/components/ui/Button/Button.stories.tsx
+import type { Meta, StoryObj } from '@storybook/react';
+import { Button }              from './Button';
+
+const meta: Meta<typeof Button> = {
+  title:     'UI/Button',
+  component: Button,
+
+  // ── Figma 連携（Figma MCP で URL を取得して貼る）──────────────────
+  parameters: {
+    design: {
+      type: 'figma',
+      url:  'https://www.figma.com/design/XXXX/MyApp?node-id=1-23',
+    },
+  },
+
+  // ── args のデフォルト値 ───────────────────────────────────────────
+  args: {
+    label:   'ボタン',
+    variant: 'primary',
+    size:    'md',
+    onPress: () => {},
+  },
+
+  // ── Controls パネルの設定 ─────────────────────────────────────────
+  argTypes: {
+    variant: {
+      control: 'select',
+      options: ['primary', 'secondary', 'destructive'],
+      description: 'ボタンの見た目のバリエーション',
+    },
+    size: {
+      control: 'select',
+      options: ['sm', 'md', 'lg'],
+    },
+    disabled: {
+      control: 'boolean',
+    },
+    loading: {
+      control: 'boolean',
+    },
+    onPress: {
+      action: 'pressed',  // Actions パネルに記録される
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof Button>;
+```
+
+### `parameters.design` の URL 取得方法（Figma MCP）
+
+```bash
+# Claude Code のターミナルで:
+# 「Button コンポーネントの Figma URL を教えて」
+# → Figma MCP が対応するノードの URL を返す
+# → Story の parameters.design.url に貼り付ける
+```
+
+🟡 **SHOULD**: `parameters.design.url` は全 Design System コンポーネントに設定する  
+🟡 **SHOULD**: `argTypes` の `description` は日本語で書く（Docs タブに表示される）  
+🔴 **MUST**: `onPress` 等のコールバックは `action:` で定義し、`jest.fn()` を直書きしない
+
+---
+
+## 5. Story バリエーションの網羅方針
+
+### 網羅すべき 5 軸
+
+```
+1. バリアント      → Figma の variant 定義を全カバー
+2. サイズ          → sm / md / lg 等の全サイズ
+3. 状態            → デフォルト / hover / active / disabled / loading / error
+4. コンテンツ長    → 短いテキスト / 長いテキスト / 空 / 改行含む
+5. データパターン  → 正常 / 空 / エラー / ローディング（API 連携の場合）
+```
+
+```tsx
+// ── 1. バリアント ──────────────────────────────────────────────────
+export const Primary: Story = {
+  args: { variant: 'primary', label: '確認する' },
+};
+export const Secondary: Story = {
+  args: { variant: 'secondary', label: 'キャンセル' },
+};
+export const Destructive: Story = {
+  args: { variant: 'destructive', label: '削除する' },
+};
+
+// ── 2. サイズ ──────────────────────────────────────────────────────
+export const Small: Story  = { args: { size: 'sm', label: '小' } };
+export const Medium: Story = { args: { size: 'md', label: '中' } };
+export const Large: Story  = { args: { size: 'lg', label: '大' } };
+
+// ── 3. 状態 ───────────────────────────────────────────────────────
+export const Disabled: Story = {
+  args: { disabled: true, label: '送信できません' },
+};
+export const Loading: Story = {
+  args: { loading: true, label: '送信中' },
+};
+
+// ── 4. コンテンツ長 ────────────────────────────────────────────────
+export const LongLabel: Story = {
+  args: { label: '非常に長いボタンラベルのテキストが入った場合の表示確認' },
+};
+
+// ── 5. アイコン付き ────────────────────────────────────────────────
+export const WithIcon: Story = {
+  args: {
+    label:       'カートに追加',
+    iconLeft:    'shopping-cart',
+  },
+};
+```
+
+### Feature コンポーネントのデータパターン
+
+API データを持つ Feature コンポーネントは MSW で状態を制御する（後述 Section 8）。
+
+```tsx
+export const Default:  Story = { /* 正常データ */ };
+export const Empty:    Story = { /* データが 0 件 */ };
+export const Loading:  Story = { /* フェッチ中 */ };
+export const Error:    Story = { /* API エラー */ };
+```
+
+🔴 **MUST**: Figma で定義された variant を Story で全カバーする  
+🔴 **MUST**: `disabled` / `loading` / `error` の状態 Story を必ず作成する  
+🟡 **SHOULD**: コンテンツ長バリエーションを Design System コンポーネントに追加する
+
+---
+
+## 6. Story 名の命名規則
+
+```tsx
+// ✅ 正解 — 状態・文脈を明示する英語 PascalCase
+export const Primary:       Story = { ... };
+export const Disabled:      Story = { ... };
+export const Loading:       Story = { ... };
+export const WithIcon:      Story = { ... };
+export const LongLabel:     Story = { ... };
+export const ErrorState:    Story = { ... };
+export const EmptyState:    Story = { ... };
+
+// ✅ 業務コンテキストを持つ Feature Story
+export const PendingOrder:   Story = { ... };
+export const CancelledOrder: Story = { ... };
+
+// ❌ 禁止 — 意味のない名前
+export const Default2: Story = { ... };
+export const Test:     Story = { ... };
+export const Story1:   Story = { ... };
+
+// ❌ 禁止 — 実装詳細
+export const WithRedBorder: Story = { ... };
+```
+
+🟡 **SHOULD**: Story 名は「ユーザーが認識する状態」で名付ける。内部実装の名前を避ける  
+🟡 **SHOULD**: 最初の Story（デフォルト表示）は `Default` または最も代表的なバリアント名にする
+
+---
+
+## 7. Docs の書き方
+
+### コンポーネント Docs（自動生成 + 手動補完）
+
+```tsx
+// Button.stories.tsx — JSDoc でコンポーネント説明を付ける
+/**
+ * Button はユーザーのアクションを起動するための基本コンポーネントです。
+ *
+ * ## 使い分け
+ * - `primary` — メインアクション（1 画面に 1 つまで）
+ * - `secondary` — サブアクション・キャンセル
+ * - `destructive` — 取り消しできない破壊的操作
+ *
+ * ## 注意事項
+ * - `disabled` と `loading` を同時に設定しない
+ * - ラベルは 20 文字以内を推奨
+ */
+const meta: Meta<typeof Button> = {
+  title:     'UI/Button',
+  component: Button,
+  // ...
+};
+```
+
+### MDX による設計ドキュメント（tokens・patterns 等）
+
+```mdx
+{/* src/components/ui/ColorTokens.mdx */}
+import { Meta, ColorPalette, ColorItem } from '@storybook/addon-docs/blocks';
+
+<Meta title="Docs/ColorTokens" />
+
+# カラートークン
+
+Figma Variables から生成されたカラートークンの一覧です。
+トークンを直接変更せず、Figma 側で変更してパイプラインを再実行してください。
+
+## Surface
+
+<ColorPalette>
+  <ColorItem
+    title="surface-primary"
+    subtitle="ページ・カードの背景"
+    colors={{ Light: '#FFFFFF', Dark: '#1A1A1A' }}
+  />
+  <ColorItem
+    title="surface-secondary"
+    subtitle="入力フィールド・タグの背景"
+    colors={{ Light: '#F5F5F5', Dark: '#2A2A2A' }}
+  />
+</ColorPalette>
+```
+
+🟡 **SHOULD**: Design System の全コンポーネントに JSDoc コメントを書く  
+🟡 **SHOULD**: デザイントークン・パターン・インタラクション設計は MDX で書く
+
+---
+
+## 8. MSW によるモック統合
+
+Feature コンポーネントが API データを必要とする場合、MSW ハンドラを Story に組み込む。
+
+### 基本パターン
+
+```tsx
+// src/features/order/components/OrderList.stories.tsx
+import type { Meta, StoryObj }     from '@storybook/react';
+import { http, HttpResponse, delay } from 'msw';
+import { OrderList }               from './OrderList';
+import { createOrderList }         from '@/mocks/factories/orderFactory';
+
+const BASE = process.env.EXPO_PUBLIC_API_BASE_URL;
+
+const meta: Meta<typeof OrderList> = {
+  title:     'Feature/Order/OrderList',
+  component: OrderList,
+  // web Storybook の msw-storybook-addon が有効なことが前提
+};
+export default meta;
+type Story = StoryObj<typeof OrderList>;
+
+// ── 正常系 ────────────────────────────────────────────────────────
+export const Default: Story = {
+  parameters: {
+    msw: {
+      handlers: [
+        http.get(`${BASE}/orders`, () =>
+          HttpResponse.json({
+            items:      createOrderList(5),
+            nextCursor: null,
+            hasMore:    false,
+          }),
+        ),
+      ],
+    },
+  },
+};
+
+// ── 空の状態 ─────────────────────────────────────────────────────
+export const Empty: Story = {
+  parameters: {
+    msw: {
+      handlers: [
+        http.get(`${BASE}/orders`, () =>
+          HttpResponse.json({ items: [], nextCursor: null, hasMore: false }),
+        ),
+      ],
+    },
+  },
+};
+
+// ── ローディング（遅延レスポンス）────────────────────────────────
+export const Loading: Story = {
+  parameters: {
+    msw: {
+      handlers: [
+        http.get(`${BASE}/orders`, async () => {
+          await delay('infinite');    // 永久にローディング状態を維持
+          return HttpResponse.json({});
+        }),
+      ],
+    },
+  },
+};
+
+// ── API エラー ────────────────────────────────────────────────────
+export const NetworkError: Story = {
+  parameters: {
+    msw: {
+      handlers: [
+        http.get(`${BASE}/orders`, () => HttpResponse.error()),
+      ],
+    },
+  },
+};
+
+export const ServerError: Story = {
+  parameters: {
+    msw: {
+      handlers: [
+        http.get(`${BASE}/orders`, () =>
+          HttpResponse.json({ message: 'Internal Server Error' }, { status: 500 }),
+        ),
+      ],
+    },
+  },
+};
+```
+
+### QueryClientProvider のデコレーター
+
+```tsx
+// .storybook/preview.ts（web 系）
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { initialize, mswLoader }            from 'msw-storybook-addon';
+
+initialize();
+
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { retry: false, staleTime: 0 } },
+});
+
+export const decorators = [
+  (Story) => (
+    <QueryClientProvider client={queryClient}>
+      <Story />
+    </QueryClientProvider>
+  ),
+];
+
+export const loaders = [mswLoader];
+```
+
+🔴 **MUST**: API 依存の Feature Story には正常系・空・ローディング・エラーの 4 パターンを用意する  
+🔴 **MUST**: Story に MSW ハンドラを書く場合は `parameters.msw.handlers` に定義する（グローバルハンドラを Story 内で上書きしない）  
+🟡 **SHOULD**: `delay('infinite')` でローディング状態を再現し、Skeleton の表示を確認する
+
+---
+
+## 9. i18n の統合
+
+### web Storybook での i18n 設定
+
+```ts
+// .storybook/preview.ts
+import { I18nextProvider } from 'react-i18next';
+import i18n                from '@/lib/i18n';   // アプリと同じ初期化済み i18n インスタンス
+
+export const decorators = [
+  (Story) => (
+    <I18nextProvider i18n={i18n}>
+      <Story />
+    </I18nextProvider>
+  ),
+];
+```
+
+### ロケール切替 Toolbar の追加（任意）
+
+```ts
+// .storybook/preview.ts
+export const globalTypes = {
+  locale: {
+    description: '表示言語',
+    defaultValue: 'ja',
+    toolbar: {
+      icon:  'globe',
+      items: [
+        { value: 'ja', title: '日本語' },
+        { value: 'en', title: 'English' },
+      ],
+      dynamicTitle: true,
+    },
+  },
+};
+
+export const decorators = [
+  (Story, context) => {
+    const locale = context.globals.locale;
+    useEffect(() => { i18n.changeLanguage(locale); }, [locale]);
+    return (
+      <I18nextProvider i18n={i18n}>
+        <Story />
+      </I18nextProvider>
+    );
+  },
+];
+```
+
+🟡 **SHOULD**: 文言が長くなりやすいコンポーネント（ボタン・エラーメッセージ）は
+ロケール切替で英語・日本語どちらも確認する
+
+---
+
+## 10. アクセシビリティの確認手順
+
+### addon-a11y による自動チェック（web Storybook）
+
+```ts
+// .storybook/preview.ts — a11y のグローバル設定
+export const parameters = {
+  a11y: {
+    config: {
+      rules: [
+        // プロジェクト全体で有効にする追加ルール
+        { id: 'color-contrast',      enabled: true },
+        { id: 'button-name',         enabled: true },
+        { id: 'image-alt',           enabled: true },
+      ],
+    },
+  },
+};
+```
+
+```tsx
+// Story レベルの a11y 設定（特定ルールを無効化する場合のみ）
+export const DisabledState: Story = {
+  args: { disabled: true, label: '送信できません' },
+  parameters: {
+    a11y: {
+      config: {
+        rules: [
+          // disabled 状態はコントラスト比が低くても意図的なため除外
+          { id: 'color-contrast', enabled: false },
+        ],
+      },
+    },
+  },
+};
+```
+
+### a11y チェックの手順
+
+```
+1. web Storybook を起動（pnpm storybook:web）
+2. 確認したい Story を開く
+3. 下部の「Accessibility」タブを開く
+4. 「Violations」が 0 件になることを確認する
+5. PR マージ前に全 Story で 0 件を維持する（CI で自動チェック済み）
+```
+
+### Story に含めるべき a11y 確認項目
+
+```tsx
+// ✅ accessibilityRole の確認が取れる Story を必ず作る
+export const AsButton: Story = {
+  args: { label: '送信する', onPress: () => {} },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // role="button" で取得できることを確認
+    expect(canvas.getByRole('button', { name: '送信する' })).toBeInTheDocument();
+  },
+};
+
+// ✅ disabled 状態の accessibilityState 確認
+export const DisabledA11y: Story = {
+  args: { label: '送信する', disabled: true },
+  play: async ({ canvasElement }) => {
+    const canvas  = within(canvasElement);
+    const button  = canvas.getByRole('button');
+    expect(button).toHaveAttribute('aria-disabled', 'true');
+  },
+};
+```
+
+🔴 **MUST**: 全 Story で addon-a11y の Violations が 0 件であること  
+🟡 **SHOULD**: インタラクティブコンポーネントの Story に Play 関数で `getByRole` 確認を追加する
+
+---
+
+## 11. Play 関数（インタラクションテスト）
+
+### 書くべき場面
+
+<table>
+  <thead>
+    <tr>
+      <th>場面</th>
+      <th>Play 関数を書く</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>ボタン押下後の状態変化</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>フォーム入力 → バリデーションエラー表示</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>モーダルの開閉</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>単純な表示確認のみ</td>
+      <td>❌ 不要</td>
+    </tr>
+    <tr>
+      <td>スタイルの確認</td>
+      <td>❌ VRT で代替</td>
+    </tr>
+  </tbody>
+</table>
+
+### テンプレート
+
+```tsx
+import { expect, userEvent, within } from '@storybook/test';
+
+export const ShowsValidationError: Story = {
+  args: {
+    label:        'メールアドレス',
+    value:        '',
+    onChangeText: () => {},
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const input  = canvas.getByLabelText('メールアドレス');
+
+    // ── ユーザー操作を再現する ─────────────────────────────────────
+    await userEvent.type(input, 'invalid-email');
+    await userEvent.tab();   // blur でバリデーション発火
+
+    // ── 結果を確認する ─────────────────────────────────────────────
+    await expect(canvas.getByRole('alert')).toBeVisible();
+    await expect(canvas.getByText('正しいメールアドレスを入力してください')).toBeVisible();
+  },
+};
+
+export const ClearsErrorOnValidInput: Story = {
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const input  = canvas.getByLabelText('メールアドレス');
+
+    await userEvent.type(input, 'valid@example.com');
+    await userEvent.tab();
+
+    // エラーが消えることを確認
+    await expect(canvas.queryByRole('alert')).not.toBeInTheDocument();
+  },
+};
+```
+
+🟡 **SHOULD**: フォームコンポーネントの全 Story に Play 関数を追加する  
+🟡 **SHOULD**: Play 関数は `userEvent` を使い、`fireEvent` を避ける（より実際のユーザー操作に近い）
+
+---
+
+## 12. on-device Storybook への追加手順
+
+web Storybook と同じ `.stories.tsx` ファイルを読み込むため、
+基本的に追加作業は不要。ただし on-device 固有の設定が必要な場合がある。
+
+### on-device でのデコレーター
+
+```ts
+// .rnstorybook/preview.ts（on-device 系）
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { I18nextProvider }                  from 'react-i18next';
+import i18n                                 from '@/lib/i18n';
+
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { retry: false } },
+});
+
+export const decorators = [
+  (Story) => (
+    <QueryClientProvider client={queryClient}>
+      <I18nextProvider i18n={i18n}>
+        <Story />
+      </I18nextProvider>
+    </QueryClientProvider>
+  ),
+];
+```
+
+### on-device と web で挙動が異なる場合
+
+```tsx
+// Platform 分岐が必要な Story
+import { Platform } from 'react-native';
+
+export const Default: Story = {
+  args: {
+    // on-device では実際のアイコンフォントが使われる
+    // web では React Native Web のフォールバックが使われる場合がある
+    icon: Platform.OS === 'web' ? undefined : 'checkmark',
+  },
+};
+```
+
+🟡 **SHOULD**: on-device で確認すべき項目（Dynamic Type・ジェスチャー・フォント）は
+Story に `// on-device 確認必須` コメントを残す
+
+---
+
+## 13. Story 追加のステップバイステップ
+
+新しいコンポーネントに Story を追加する際の作業順序。
+
+```
+Step 1: Figma で仕様確認（Figma MCP）
+  └─ Claude Code: 「この Figma URL のコンポーネント仕様を教えて」
+  └─ variant・size・状態・props を把握する
+
+Step 2: Meta オブジェクトを書く
+  └─ title（カテゴリ/コンポーネント名）
+  └─ argTypes（Controls 設定）
+  └─ parameters.design.url（Figma URL）
+
+Step 3: 必須 Story を追加する（最低限）
+  └─ デフォルト状態
+  └─ 全 variant
+  └─ disabled / loading / error 状態
+
+Step 4: 追加 Story を追加する（推奨）
+  └─ コンテンツ長バリエーション
+  └─ アイコン付き / なし
+  └─ API データパターン（Feature コンポーネントのみ）
+
+Step 5: Play 関数を追加する（インタラクションがある場合）
+  └─ ユーザー操作フロー
+  └─ バリデーションエラーの表示・消去
+
+Step 6: web Storybook で確認する
+  └─ pnpm storybook:web
+  └─ Controls タブで全バリアントを手動確認
+  └─ Accessibility タブで Violations = 0 を確認
+  └─ Docs タブで自動生成された説明を確認・補足
+
+Step 7: on-device Storybook で確認する（Design System コンポーネントのみ必須）
+  └─ EXPO_PUBLIC_STORYBOOK_ENABLED=true pnpm start
+  └─ Dynamic Type 最大サイズで崩れないことを確認
+
+Step 8: CI で確認する（PR 時自動実行）
+  └─ addon-vitest（Play 関数テスト）
+  └─ addon-a11y（Violations チェック）
+```
+
+---
+
+## 14. Claude Code + MCP を使った Story 自動生成
+
+### Storybook MCP + Figma MCP の組み合わせ
+
+```bash
+# Claude Code のターミナルで以下を入力:
+
+「次の条件で Button コンポーネントの Story ファイルを生成して:
+  - Figma URL: https://www.figma.com/design/XXXX?node-id=1-23
+  - 既存の Card コンポーネントの Story（src/components/ui/Card/Card.stories.tsx）
+    を命名規則の参考にする
+  - MSW モックは不要
+  - Play 関数は onPress のテストを含める」
+```
+
+### 生成後のチェックポイント
+
+```
+□ title が命名規則に従っている（UI/Button）
+□ argTypes が全 props を網羅している
+□ Figma URL が parameters.design.url に設定されている
+□ disabled / loading / error の Story がある
+□ onPress が action: 'pressed' で定義されている
+□ Play 関数が getByRole を使っている（getByTestId ではない）
+```
+
+---
+
+## 15. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>影響</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>title</code> にカテゴリがない（<code>title: &#39;Button&#39;</code>）</td>
+      <td>サイドバーが平坦になり探せない</td>
+      <td>必ず <code>UI/Button</code> 形式にする</td>
+    </tr>
+    <tr>
+      <td><code>args.onPress</code> に <code>jest.fn()</code> を直書き</td>
+      <td>Actions パネルに記録されない</td>
+      <td><code>argTypes</code> の <code>action:</code> で定義する</td>
+    </tr>
+    <tr>
+      <td><code>parameters.design.url</code> 未設定</td>
+      <td>Figma との対応関係が不明になる</td>
+      <td>全 Design System コンポーネントに設定する</td>
+    </tr>
+    <tr>
+      <td>ローディング状態の Story がない</td>
+      <td>Skeleton の表示を確認できない</td>
+      <td><code>delay(&#39;infinite&#39;)</code> の MSW ハンドラを追加する</td>
+    </tr>
+    <tr>
+      <td>error 状態の Story がない</td>
+      <td>エラー UI がレビューされない</td>
+      <td><code>HttpResponse.error()</code> のハンドラを追加する</td>
+    </tr>
+    <tr>
+      <td>Story がコンポーネントと別ディレクトリにある</td>
+      <td>リネーム時に Story が取り残される</td>
+      <td>コンポーネントと同階層に配置する</td>
+    </tr>
+    <tr>
+      <td>Play 関数で <code>fireEvent</code> を使う</td>
+      <td>実際のユーザー操作と乖離する</td>
+      <td><code>userEvent</code> に統一する</td>
+    </tr>
+    <tr>
+      <td>a11y Violations を放置してマージする</td>
+      <td>CI ゲートで後から弾かれる</td>
+      <td>Story 作成時に即確認して修正する</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 16. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

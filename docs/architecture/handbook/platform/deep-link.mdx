@@ -1,0 +1,639 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Platform/Deep Link" />
+
+# Deep Link・Universal Link 方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: カスタム URL スキーム・iOS Universal Links・Android App Links・Expo Router との統合  
+> **依存**: 01_Principles（Expo Router を正とする）、12_WebView（WebView からの遷移）、13_Push_Notifications（通知タップからの遷移）
+
+---
+
+## 1. 方針
+
+### Deep Link の 3 形式
+
+<table>
+  <thead>
+    <tr>
+      <th>形式</th>
+      <th>例</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>カスタム URL スキーム</strong></td>
+      <td><code>myapp://order/order-001</code></td>
+      <td>アプリ間連携・開発・テスト。OS に登録が必要</td>
+    </tr>
+    <tr>
+      <td><strong>Universal Links</strong>（iOS）</td>
+      <td><code>https://example.com/order/order-001</code></td>
+      <td>Web → アプリへのシームレスな遷移。フォールバックが Web になる</td>
+    </tr>
+    <tr>
+      <td><strong>App Links</strong>（Android）</td>
+      <td><code>https://example.com/order/order-001</code></td>
+      <td>iOS Universal Links の Android 版</td>
+    </tr>
+  </tbody>
+</table>
+
+### 採用方針
+
+🟡 **SHOULD**: 本番環境では Universal Links / App Links を優先する  
+（カスタムスキームは別アプリにハイジャックされるリスクがある）  
+🟡 **SHOULD**: カスタムスキームはアプリ間連携・社内開発・テスト用途に限定する  
+🔴 **MUST**: Deep Link の解決はすべて `deepLinkResolver` に集約する。`router.push` を各所に散在させない
+
+---
+
+## 2. Expo Router との統合
+
+### Expo Router が Deep Link を自動処理する仕組み
+
+Expo Router は `app/` のファイル構造と URL を自動でマッピングする。
+`app.json` に scheme / intentFilters を設定すれば、OS からの Deep Link が
+Expo Router のルーティングに直接降ってくる。
+
+```json
+// app.json
+{
+  "expo": {
+    "scheme": "myapp",
+    "ios": {
+      "associatedDomains": [
+        "applinks:example.com",
+        "applinks:staging.example.com"
+      ]
+    },
+    "android": {
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            { "scheme": "https", "host": "example.com",         "pathPrefix": "/" },
+            { "scheme": "https", "host": "staging.example.com", "pathPrefix": "/" }
+          ],
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ]
+    }
+  }
+}
+```
+
+### URL マッピング規約
+
+```
+Deep Link URL                         → Expo Router ファイル
+─────────────────────────────────────────────────────────────
+myapp://order/order-001               → app/(main)/order/[id].tsx
+https://example.com/order/order-001   → 同上（Universal Link）
+myapp://search?q=coffee               → app/(main)/search/index.tsx
+myapp://profile                       → app/(main)/profile/index.tsx
+myapp://notifications                 → app/(main)/notifications/index.tsx
+myapp://auth/verify?token=xxx         → app/(auth)/verify.tsx
+```
+
+🔴 **MUST**: Deep Link の URL パス構造と `app/` のファイル構造を一致させる  
+🔴 **MUST**: Deep Link の追加・変更時は URL マッピングテーブル（本書）を更新する
+
+---
+
+## 3. deepLinkResolver — 一元解決モジュール
+
+外部（通知・WebView・他アプリ）から `deepLink` 文字列が届いたとき、
+すべてここを通して Expo Router へ変換する。
+
+```ts
+// src/lib/deepLinkResolver.ts
+import { router }     from 'expo-router';
+import { Linking }    from 'react-native';
+import { z }          from 'zod';
+import { logger }     from '@/lib/logger';
+import { useAuthStore } from '@/stores/authStore';
+
+// ─── 対応スキーム ─────────────────────────────────────────────────────────
+const APP_SCHEMES = ['myapp://', 'https://example.com', 'https://staging.example.com'] as const;
+
+// ─── ルート定義（URL → Expo Router path へのマッピング）──────────────────
+type RouteRule = {
+  pattern:  RegExp;
+  toPath:   (match: RegExpMatchArray) => string;
+  requiresAuth?: boolean;
+};
+
+const ROUTE_RULES: RouteRule[] = [
+  // 注文詳細
+  {
+    pattern:      /^\/order\/([^/?]+)/,
+    toPath:       (m) => `/(main)/order/${m[1]}`,
+    requiresAuth: true,
+  },
+  // 注文一覧
+  {
+    pattern:      /^\/orders\/?/,
+    toPath:       () => '/(main)/orders',
+    requiresAuth: true,
+  },
+  // 検索（クエリパラメータ付き）
+  {
+    pattern:      /^\/search/,
+    toPath:       (_m, params) => `/(main)/search?${params}`,
+    requiresAuth: false,
+  },
+  // プロフィール
+  {
+    pattern:      /^\/profile/,
+    toPath:       () => '/(main)/profile',
+    requiresAuth: true,
+  },
+  // メール認証
+  {
+    pattern:      /^\/auth\/verify/,
+    toPath:       (_m, params) => `/(auth)/verify?${params}`,
+    requiresAuth: false,
+  },
+  // キャンペーンページ（WebView で開く）
+  {
+    pattern:      /^\/campaign\/([^/?]+)/,
+    toPath:       (m) => `/(main)/campaign/${m[1]}`,
+    requiresAuth: false,
+  },
+];
+
+// ─── URL を正規化してパスを抽出 ───────────────────────────────────────────
+function extractPath(url: string): { path: string; params: string } | null {
+  try {
+    // カスタムスキームを https に変換して URL パースする
+    const normalized = url
+      .replace('myapp://', 'https://myapp.internal/')
+      .replace('https://example.com', 'https://myapp.internal')
+      .replace('https://staging.example.com', 'https://myapp.internal');
+
+    const parsed = new URL(normalized);
+    return {
+      path:   parsed.pathname,
+      params: parsed.searchParams.toString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Deep Link を解決して遷移する ─────────────────────────────────────────
+export async function navigate(url: string): Promise<boolean> {
+  const extracted = extractPath(url);
+  if (!extracted) {
+    logger.warn('deepLinkResolver: cannot extract path', { url });
+    return false;
+  }
+
+  const { path, params } = extracted;
+
+  for (const rule of ROUTE_RULES) {
+    const match = path.match(rule.pattern);
+    if (!match) continue;
+
+    const targetPath = rule.toPath(match, params);
+
+    // 認証が必要なルートで未ログインの場合 → ログイン後にリダイレクト
+    if (rule.requiresAuth && !useAuthStore.getState().isLoggedIn) {
+      // ログイン後の遷移先を保持
+      pendingDeepLink.set(url);
+      router.replace('/(auth)/login');
+      return true;
+    }
+
+    router.push(targetPath as Parameters<typeof router.push>[0]);
+    return true;
+  }
+
+  // 未定義のパスは外部ブラウザへ
+  if (url.startsWith('https://')) {
+    await Linking.openURL(url);
+    return true;
+  }
+
+  logger.warn('deepLinkResolver: unmatched path', { url, path });
+  return false;
+}
+
+// ─── ログイン後の保留 Deep Link を処理する ────────────────────────────────
+export function consumePendingDeepLink(): void {
+  const url = pendingDeepLink.get();
+  if (url) {
+    pendingDeepLink.clear();
+    navigate(url);
+  }
+}
+
+// ─── 保留 Deep Link の簡易ストア ─────────────────────────────────────────
+const pendingDeepLink = {
+  key:   'pendingDeepLink',
+  get:   () => sessionStorage[pendingDeepLink.key] ?? null,
+  set:   (url: string) => { sessionStorage[pendingDeepLink.key] = url; },
+  clear: () => { delete sessionStorage[pendingDeepLink.key]; },
+};
+
+// ── React Native では sessionStorage が使えないため SecureStore を使う ───
+import * as SecureStore from 'expo-secure-store';
+const pendingDeepLink = {
+  key:   'pending_deep_link',
+  get:   () => SecureStore.getItemAsync(pendingDeepLink.key),
+  set:   (url: string) => SecureStore.setItemAsync(pendingDeepLink.key, url),
+  clear: () => SecureStore.deleteItemAsync(pendingDeepLink.key),
+};
+
+export const deepLinkResolver = { navigate, consumePendingDeepLink };
+```
+
+🔴 **MUST**: Deep Link の遷移は `deepLinkResolver.navigate()` 経由のみとする  
+🔴 **MUST**: 認証が必要なルートへの未ログインアクセスは、ログイン後に元の URL へ遷移する
+
+---
+
+## 4. 入口の統合
+
+Deep Link が届く入口は 4 つある。すべて `deepLinkResolver` に集約する。
+
+```tsx
+// app/_layout.tsx — 全入口の統合
+export default function RootLayout() {
+
+  // ─── 入口 1: アプリ起動時の初期 URL ──────────────────────────────────────
+  // Expo Router が自動処理するため、通常は追加実装不要
+  // カスタム処理が必要な場合のみ:
+  useEffect(() => {
+    Linking.getInitialURL().then((url) => {
+      if (url) deepLinkResolver.navigate(url);
+    });
+  }, []);
+
+  // ─── 入口 2: フォアグラウンドで受信した Linking イベント ─────────────────
+  useEffect(() => {
+    const sub = Linking.addEventListener('url', ({ url }) => {
+      deepLinkResolver.navigate(url);
+    });
+    return () => sub.remove();
+  }, []);
+
+  // ─── 入口 3: プッシュ通知タップ（13_Push_Notifications より）────────────
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
+      const data = response.notification.request.content.data as NotificationData;
+      if (data?.deepLink) deepLinkResolver.navigate(data.deepLink);
+    });
+    return () => sub.remove();
+  }, []);
+
+  // ─── 入口 4: コールドスタート時の通知タップ ──────────────────────────────
+  useEffect(() => {
+    Notifications.getLastNotificationResponseAsync().then((response) => {
+      const data = response?.notification.request.content.data as NotificationData;
+      if (data?.deepLink) deepLinkResolver.navigate(data.deepLink);
+    });
+  }, []);
+
+  // ─── ログイン完了後の保留 Deep Link を処理 ────────────────────────────────
+  const isLoggedIn = useAuthStore((s) => s.isLoggedIn);
+  useEffect(() => {
+    if (isLoggedIn) deepLinkResolver.consumePendingDeepLink();
+  }, [isLoggedIn]);
+
+  return ( /* ... */ );
+}
+```
+
+---
+
+## 5. iOS Universal Links の設定
+
+### AASA ファイル（Apple App Site Association）
+
+Web サーバーの `/.well-known/apple-app-site-association` に配置する。
+
+```json
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["TEAM_ID.com.example.myapp"],
+        "components": [
+          { "/": "/order/*",    "comment": "注文詳細" },
+          { "/": "/orders",     "comment": "注文一覧" },
+          { "/": "/search*",    "comment": "検索" },
+          { "/": "/profile",    "comment": "プロフィール" },
+          { "/": "/campaign/*", "comment": "キャンペーン" },
+          {
+            "/": "/auth/*",
+            "comment": "認証フロー",
+            "exclude": true      // Web ブラウザで開く（アプリで開かない）
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### AASA 配信要件
+
+```nginx
+# nginx 設定例
+location /.well-known/apple-app-site-association {
+  default_type application/json;
+  add_header Cache-Control "max-age=3600";
+}
+```
+
+🔴 **MUST**: AASA ファイルは `Content-Type: application/json` で配信する  
+🔴 **MUST**: AASA ファイルはリダイレクトなしで返す（iOS はリダイレクトに従わない）  
+🟡 **SHOULD**: CDN キャッシュを短く設定し、変更が迅速に反映されるようにする
+
+---
+
+## 6. Android App Links の設定
+
+### assetlinks.json
+
+Web サーバーの `/.well-known/assetlinks.json` に配置する。
+
+```json
+[
+  {
+    "relation":  ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace":           "android_app",
+      "package_name":        "com.example.myapp",
+      "sha256_cert_fingerprints": [
+        "AA:BB:CC:..."
+      ]
+    }
+  }
+]
+```
+
+### 証明書フィンガープリントの取得
+
+```bash
+# EAS Build の署名証明書から取得
+eas credentials --platform android
+
+# または keytool で取得（ローカル keystore の場合）
+keytool -list -v -keystore release.keystore -alias myapp
+```
+
+🔴 **MUST**: `sha256_cert_fingerprints` は EAS の本番署名証明書のものを使う  
+🔴 **MUST**: 開発用・ステージング用と本番用で証明書が異なる場合はそれぞれ配列に追加する
+
+---
+
+## 7. 開発・テスト環境での確認
+
+### カスタムスキームでのテスト
+
+```bash
+# iOS Simulator
+xcrun simctl openurl booted "myapp://order/order-001"
+
+# Android Emulator
+adb shell am start \
+  -W -a android.intent.action.VIEW \
+  -d "myapp://order/order-001" \
+  com.example.myapp
+
+# Expo Go（開発中）
+npx uri-scheme open "myapp://order/order-001" --ios
+npx uri-scheme open "myapp://order/order-001" --android
+```
+
+### Universal Links のテスト（実機）
+
+```bash
+# iOS — Safari で URL を開き「アプリで開く」が出るか確認
+# または:
+xcrun simctl openurl booted "https://example.com/order/order-001"
+```
+
+### CI でのルート網羅テスト
+
+```ts
+// src/lib/__tests__/deepLinkResolver.test.ts
+import { deepLinkResolver } from '@/lib/deepLinkResolver';
+import { router }           from 'expo-router';
+
+jest.mock('expo-router', () => ({
+  router: { push: jest.fn(), replace: jest.fn() },
+}));
+jest.mock('@/stores/authStore', () => ({
+  useAuthStore: { getState: () => ({ isLoggedIn: true }) },
+}));
+
+describe('deepLinkResolver.navigate', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  // URL マッピングテーブルを全パターンカバー
+  test.each([
+    // カスタムスキーム
+    ['myapp://order/order-001',            '/(main)/order/order-001'],
+    ['myapp://orders',                     '/(main)/orders'],
+    ['myapp://search?q=coffee',            '/(main)/search?q=coffee'],
+    ['myapp://profile',                    '/(main)/profile'],
+    ['myapp://auth/verify?token=abc',      '/(auth)/verify?token=abc'],
+    // Universal Link
+    ['https://example.com/order/order-001', '/(main)/order/order-001'],
+    ['https://example.com/search?q=tea',   '/(main)/search?q=tea'],
+  ])('%s → %s に遷移する', async (url, expectedPath) => {
+    await deepLinkResolver.navigate(url);
+    expect(router.push).toHaveBeenCalledWith(expectedPath);
+  });
+
+  test('未定義の https URL は外部ブラウザに委譲する', async () => {
+    const { Linking } = require('react-native');
+    jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
+
+    await deepLinkResolver.navigate('https://unknown.example.com/page');
+    expect(Linking.openURL).toHaveBeenCalledWith('https://unknown.example.com/page');
+  });
+
+  test('未ログイン時の認証必須ルートはログイン画面に遷移する', async () => {
+    jest.resetModules();
+    jest.doMock('@/stores/authStore', () => ({
+      useAuthStore: { getState: () => ({ isLoggedIn: false }) },
+    }));
+    const { deepLinkResolver: dr } = require('@/lib/deepLinkResolver');
+
+    await dr.navigate('myapp://order/order-001');
+    expect(router.replace).toHaveBeenCalledWith('/(auth)/login');
+  });
+});
+```
+
+🔴 **MUST**: URL マッピングテーブルの全パターンを `test.each` で CI カバーする  
+🟡 **SHOULD**: AASA / assetlinks.json の変更時は Staging 環境で実機検証してからデプロイする
+
+---
+
+## 8. Expo Go と Dev Build の違い
+
+<table>
+  <thead>
+    <tr>
+      <th>環境</th>
+      <th>カスタムスキーム</th>
+      <th>Universal Links</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Expo Go</strong></td>
+      <td><code>exp://</code> スキームが使われる。<code>myapp://</code> は機能しない</td>
+      <td>機能しない</td>
+    </tr>
+    <tr>
+      <td><strong>Dev Build</strong></td>
+      <td><code>myapp://</code> が機能する</td>
+      <td>実機 + 証明書設定で機能する</td>
+    </tr>
+    <tr>
+      <td><strong>本番ビルド</strong></td>
+      <td>同上</td>
+      <td>同上</td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: Deep Link の E2E テストは Dev Build で行い、Expo Go では行わない
+
+---
+
+## 9. Universal Links のフォールバック（Web ページ）
+
+Universal Links に対応した Web ページには、アプリが未インストールの場合の
+フォールバック実装を用意する。これはサーバーサイドの責務だが、
+URL 設計時に Mobile チームと Web チームが調整する必要がある。
+
+```html
+<!-- Web 側のフォールバックページ（例）-->
+<meta name="apple-itunes-app" content="app-id=1234567890">
+<script>
+  // アプリが開かなかった場合は App Store / Play Store へリダイレクト
+  const timer = setTimeout(() => {
+    window.location.href = 'https://apps.apple.com/app/id1234567890';
+  }, 2000);
+
+  window.addEventListener('blur', () => clearTimeout(timer));
+</script>
+```
+
+🟡 **SHOULD**: Universal Links の landing URL は Web チームと合意したフォールバックページを用意する
+
+---
+
+## 10. セキュリティ考慮
+
+### URL インジェクション対策
+
+```ts
+// deepLinkResolver 内での検証
+function isValidDeepLinkUrl(url: string): boolean {
+  try {
+    const parsed = new URL(
+      url.replace('myapp://', 'https://myapp.internal/'),
+    );
+    // 想定外のホストは弾く
+    const allowedHosts = ['myapp.internal', 'example.com', 'staging.example.com'];
+    return allowedHosts.includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+```
+
+### 認証トークンを URL に含めない
+
+```
+❌ 禁止: myapp://auth/callback?access_token=eyJhbGc...
+✅ 正解: myapp://auth/callback?code=one_time_code_here
+```
+
+🔴 **MUST**: アクセストークン・リフレッシュトークンを Deep Link の URL パラメータに含めない  
+🔴 **MUST**: 認証コールバックは短命のワンタイムコードを使い、サーバーでトークン交換する  
+🟡 **SHOULD**: Deep Link の URL を処理する前にホスト名を検証する
+
+---
+
+## 11. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>リスク / 結果</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>router.push</code> を通知 / WebView から直接呼ぶ</td>
+      <td>認証チェック・保留処理が漏れる</td>
+      <td><code>deepLinkResolver.navigate()</code> を必ず経由する</td>
+    </tr>
+    <tr>
+      <td>AASA ファイルがリダイレクトを返す</td>
+      <td>iOS が Universal Links を無効化する</td>
+      <td>リダイレクトなしで直接 JSON を返す</td>
+    </tr>
+    <tr>
+      <td>証明書フィンガープリントが開発用のまま</td>
+      <td>本番 App Links が機能しない</td>
+      <td>EAS の本番署名証明書の値を使う</td>
+    </tr>
+    <tr>
+      <td>アクセストークンを URL に含める</td>
+      <td>URL がログ・履歴に記録され漏洩する</td>
+      <td>ワンタイムコードを使いサーバーでトークン交換</td>
+    </tr>
+    <tr>
+      <td>Expo Go でテストして動いたと判断する</td>
+      <td><code>myapp://</code> は Expo Go では機能しない</td>
+      <td>Dev Build で検証する</td>
+    </tr>
+    <tr>
+      <td>未定義ルートをエラーにする</td>
+      <td>将来のサーバー変更で通知タップがクラッシュする</td>
+      <td>未定義ルートは外部ブラウザにフォールバックする</td>
+    </tr>
+    <tr>
+      <td>ログイン後の保留 Deep Link を未実装</td>
+      <td>ログインを促した後に元の画面に戻れない</td>
+      <td><code>consumePendingDeepLink()</code> をログイン完了後に呼ぶ</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 12. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

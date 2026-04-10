@@ -1,0 +1,1049 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Integrations/Firebase" />
+
+# Firebase 利用ガイド
+
+> **ステータス**: `APPROVED`  
+> **対象**: Expo アプリにおける Firebase サービスの採用範囲・統合実装・運用方針  
+> **依存**: 13_Push_Notifications（FCM / expo-notifications）、19_Observability（Sentry）、23_Feature_Flags（Remote Config）
+
+---
+
+## 1. 採用方針と責務マップ
+
+### Firebase サービスの採用範囲
+
+Firebase は多機能プラットフォームであるが、すでに専用の実装方針を持つ領域と競合する。
+「Firebase で何でもやる」ではなく、最適なツールを役割ごとに選ぶ。
+
+| Firebase サービス | 採用 | 担当ツール | 理由 |
+|-----------------|------|-----------|------|
+| **FCM**（Cloud Messaging） | ✅ 基盤として利用 | `expo-notifications` が内部で使用 | Expo が FCM を透過的に扱う。直接呼び出し禁止 |
+| **Analytics** | ✅ 採用 | `@react-native-firebase/analytics` | ユーザー行動の計測・ファネル分析 |
+| **Crashlytics** | ✅ 補完採用 | `@react-native-firebase/crashlytics` | ネイティブクラッシュ（Sentry が取れない層）を補完 |
+| **Remote Config** | ✅ 採用 | `@react-native-firebase/remote-config` | 動的フィーチャーフラグのバックエンド（23_Feature_Flags の実装先） |
+| **App Distribution** | ✅ 採用 | Firebase CLI | 社内 QA 配布（EAS Internal Distribution の補完） |
+| **Performance Monitoring** | 🟡 任意 | `@react-native-firebase/perf` | Sentry Performance で不足する場合のみ（判断基準はセクション8参照） |
+| **Authentication** | ❌ 不採用 | サーバー側 Auth（SSO / JWT） | 認証はサーバー責務。Firebase Auth を追加すると認証フローが二重管理になる |
+| **Firestore / Realtime DB** | ❌ 不採用 | 独自 API（httpClient） | データ層は自社 API に統一。Firebase DB を混在させない |
+| **Cloud Functions** | ❌ 不採用 | 自社バックエンド | ビジネスロジックをサーバー側に集約する |
+| **Hosting** | ❌ 不採用 | EAS / CDN | モバイル専用のため不要 |
+
+### 既存ツールとの境界
+
+```
+クラッシュ監視
+  └─ JS / TS 層のエラー     → Sentry（19_Observability）
+  └─ Native 層のクラッシュ  → Firebase Crashlytics（本書）
+
+フィーチャーフラグ
+  └─ 静的フラグ（ビルド時）   → EXPO_PUBLIC_FEATURE_*（23_Feature_Flags）
+  └─ 動的フラグ（実行時）     → Firebase Remote Config（本書 + 23_Feature_Flags）
+        └─ フラグキー名の定義責務 → 23_Feature_Flags に集約する
+        └─ Remote Config のバックエンド実装 → 本書
+
+プッシュ通知
+  └─ 配信基盤（FCM）          → firebase が内部処理（直接呼び出し禁止）
+  └─ アプリ側の受信処理        → expo-notifications（13_Push_Notifications）
+
+ユーザー行動計測
+  └─ エラー・パフォーマンス   → Sentry
+  └─ 行動・コンバージョン     → Firebase Analytics（本書）
+```
+
+---
+
+## 2. セットアップ
+
+### ⚠️ Expo Go では動作しない
+
+`@react-native-firebase` はネイティブモジュールに依存するため、**Expo Go では動作しない**。
+必ず Development Build を使うこと。
+
+```bash
+# Development Build の作成
+eas build --profile development --platform all
+```
+
+開発中に Expo Go を使っている場合は、Firebase SDK の全呼び出しを `__DEV__` フラグでガードするか、
+Development Build への移行を先に完了させてからセットアップを進めること。
+
+### ライブラリのインストール
+
+Expo と `@react-native-firebase` は `expo-build-properties` を通じてネイティブ設定を管理する。
+
+```bash
+# 基盤（必須）
+expo install @react-native-firebase/app
+
+# 採用するサービスのみ追加する
+expo install @react-native-firebase/analytics
+expo install @react-native-firebase/crashlytics
+expo install @react-native-firebase/remote-config
+
+# Expo ネイティブビルドへの組み込み
+expo install expo-build-properties
+```
+
+### app.config.ts の設定
+
+```ts
+// app.config.ts
+import { ExpoConfig } from 'expo/config';
+
+const config: ExpoConfig = {
+  name:   'MyApp',
+  slug:   'myapp',
+  plugins: [
+    [
+      'expo-build-properties',
+      {
+        ios: {
+          useFrameworks: 'static',   // react-native-firebase は static framework が必要
+        },
+      },
+    ],
+    '@react-native-firebase/app',
+    '@react-native-firebase/crashlytics',
+  ],
+};
+
+export default config;
+```
+
+🔴 **MUST**: `expo-build-properties` で `useFrameworks: 'static'` を設定する（iOS ビルドが失敗する）  
+🔴 **MUST**: 設定変更後は必ず `eas build` でネイティブビルドを再実行する（OTA では反映されない）  
+🔴 **MUST**: Expo Go ではなく Development Build を使う
+
+### iOS — dSYM のアップロード設定
+
+Crashlytics でネイティブクラッシュのスタックトレースをシンボル化するには、ビルドごとに dSYM をアップロードする必要がある。
+
+```yaml
+# eas.json — EAS Build の postBuildCommand で dSYM をアップロードする
+{
+  "build": {
+    "production": {
+      "ios": {
+        "postBuildCommand": "npx @react-native-firebase/crashlytics upload-symbols --dsym"
+      }
+    }
+  }
+}
+```
+
+EAS Build 外（ローカルビルド等）では Xcode の Build Phase に以下を追加する。
+
+```bash
+# Xcode Build Phase — Run Script
+"${PODS_ROOT}/FirebaseCrashlytics/run"
+```
+
+🔴 **MUST**: 本番ビルドでは dSYM のアップロードを必ず設定する（未設定だと Native クラッシュのスタックトレースが難読化されたまま）
+
+### Android — ProGuard の設定
+
+ProGuard を有効にしている場合、難読化によって Crashlytics のスタックトレースからクラス名が消える。
+`app/proguard-rules.pro` に以下を追加する。
+
+```proguard
+# Firebase Crashlytics
+-keepattributes SourceFile,LineNumberTable
+-keep public class * extends java.lang.Exception
+-keep class com.google.firebase.crashlytics.** { *; }
+```
+
+🔴 **MUST**: `minifyEnabled true` の場合は ProGuard ルールを追加する
+
+### 認証情報ファイルの管理
+
+```
+google-services.json       ← Android 用（Git 管理外）
+GoogleService-Info.plist   ← iOS 用（Git 管理外）
+```
+
+```bash
+# .gitignore に追加済みであることを確認
+cat .gitignore | grep -E "google-services|GoogleService"
+```
+
+```bash
+# EAS Build では Secret Files として管理する
+eas secret:create \
+  --scope project \
+  --name GOOGLE_SERVICES_JSON \
+  --type file \
+  --value ./google-services.json
+
+eas secret:create \
+  --scope project \
+  --name GOOGLE_SERVICE_INFO_PLIST \
+  --type file \
+  --value ./GoogleService-Info.plist
+```
+
+```json
+// eas.json — Secret Files をビルド時に配置する
+{
+  "build": {
+    "staging": {
+      "android": { "googleServicesFile": "./google-services.json" },
+      "ios":     { "googleServicesFile": "./GoogleService-Info.plist" }
+    },
+    "production": {
+      "android": { "googleServicesFile": "./google-services.json" },
+      "ios":     { "googleServicesFile": "./GoogleService-Info.plist" }
+    }
+  }
+}
+```
+
+🔴 **MUST**: `google-services.json` / `GoogleService-Info.plist` を Git にコミットしない  
+🔴 **MUST**: EAS Secret Files で管理し、ローカルの `.gitignore` に追記する  
+🟡 **SHOULD**: 開発用・ステージング用・本番用で Firebase プロジェクトを分ける
+
+### 環境ごとの Firebase プロジェクト構成
+
+```
+Firebase Projects
+  ├─ myapp-dev        ← 開発環境（ローカル + dev ビルド）
+  ├─ myapp-staging    ← ステージング環境
+  └─ myapp-production ← 本番環境
+```
+
+```json
+// eas.json — 環境ごとに認証情報を切り替える
+{
+  "build": {
+    "development": {
+      "android": { "googleServicesFile": "./google-services.dev.json" },
+      "ios":     { "googleServicesFile": "./GoogleService-Info.dev.plist" }
+    },
+    "staging": {
+      "android": { "googleServicesFile": "./google-services.staging.json" },
+      "ios":     { "googleServicesFile": "./GoogleService-Info.staging.plist" }
+    },
+    "production": {
+      "android": { "googleServicesFile": "./google-services.json" },
+      "ios":     { "googleServicesFile": "./GoogleService-Info.plist" }
+    }
+  }
+}
+```
+
+### `EXPO_PUBLIC_APP_VERSION` の設定
+
+Remote Config のバージョンチェック（セクション5）は `EXPO_PUBLIC_APP_VERSION` を参照する。
+`app.config.ts` の `extra` で EAS ビルド変数から注入する。
+
+```ts
+// app.config.ts
+const config: ExpoConfig = {
+  // ...
+  extra: {
+    appVersion: process.env.APP_VERSION ?? '0.0.0',
+  },
+};
+```
+
+```bash
+# eas.json — 環境変数として渡す
+{
+  "build": {
+    "production": {
+      "env": {
+        "APP_VERSION": "1.2.0",
+        "EXPO_PUBLIC_APP_VERSION": "1.2.0"
+      }
+    }
+  }
+}
+```
+
+---
+
+## 3. Firebase Analytics
+
+### 初期化と wrapper
+
+```ts
+// src/lib/analytics.ts
+import analytics from '@react-native-firebase/analytics';
+import { logger } from '@/lib/logger'; // 19_Observability で定義したロガー
+
+// ─── PII フィルタリング ──────────────────────────────────────────────────
+// Analytics に送るプロパティから個人情報を除外する
+const PII_KEYS = ['email', 'name', 'phone', 'address', 'birth_date'] as const;
+
+type AllowedParamValue = string | number | boolean;
+
+function isAllowedParamValue(value: unknown): value is AllowedParamValue {
+  return typeof value === 'string'
+    || typeof value === 'number'
+    || typeof value === 'boolean';
+}
+
+function sanitizeParams(
+  params: Record<string, unknown>,
+): Record<string, AllowedParamValue> {
+  return Object.fromEntries(
+    Object.entries(params)
+      .filter(([key]) => !(PII_KEYS as readonly string[]).includes(key))
+      .filter(([, value]) => isAllowedParamValue(value))
+      .map(([key, value]) => [key, value as AllowedParamValue]),
+  );
+}
+
+// ─── イベント型定義 ──────────────────────────────────────────────────────
+export type AnalyticsEventMap = {
+  // 画面表示
+  screen_view:    { screen_name: string; screen_class?: string };
+  // 注文
+  view_item:      { item_id: string; item_name: string; price: number; currency: string };
+  add_to_cart:    { item_id: string; item_name: string; quantity: number };
+  begin_checkout: { cart_value: number; currency: string; item_count: number };
+  purchase:       { transaction_id: string; value: number; currency: string };
+  // 認証
+  login:          { method: 'email' | 'sso' | 'biometric' };
+  sign_up:        { method: 'email' | 'sso' };
+  // 機能使用
+  search:         { search_term: string; result_count: number };
+  share:          { content_type: string; item_id: string };
+  // エラー
+  error:          { error_type: string; screen_name: string };
+};
+
+// ─── Analytics wrapper（型安全・PII フィルタ済み）──────────────────────
+export const analyticsService = {
+  // ユーザー ID の設定（PII なし。内部 ID のみ）
+  setUserId: (userId: string | null): Promise<void> =>
+    analytics().setUserId(userId),
+
+  // ユーザープロパティ（PII 禁止）
+  setUserProperty: (name: string, value: string): Promise<void> =>
+    analytics().setUserProperty(name, value),
+
+  // カスタムイベント（型付き）
+  logEvent: <K extends keyof AnalyticsEventMap>(
+    event:  K,
+    params: AnalyticsEventMap[K],
+  ): Promise<void> =>
+    analytics().logEvent(event, sanitizeParams(params as Record<string, unknown>)),
+
+  // 画面遷移の記録
+  logScreenView: (screenName: string, screenClass?: string): Promise<void> =>
+    analytics().logScreenView({
+      screen_name:  screenName,
+      screen_class: screenClass ?? screenName,
+    }),
+
+  // Analytics の有効 / 無効（ユーザーの同意に基づく）
+  setEnabled: (enabled: boolean): Promise<void> =>
+    analytics().setAnalyticsCollectionEnabled(enabled),
+};
+```
+
+### Expo Router との自動画面計測
+
+```tsx
+// app/_layout.tsx — 画面遷移を自動で Analytics に送る
+import { analyticsService } from '@/lib/analytics';
+
+export default function RootLayout() {
+  const segments = useSegments();
+
+  useEffect(() => {
+    const screenName = '/' + segments.join('/');
+    analyticsService.logScreenView(screenName).catch(() => {
+      // Analytics の失敗はアプリの動作に影響させない
+    });
+  }, [segments]);
+
+  return ( /* ... */ );
+}
+```
+
+### Feature での使用例
+
+```tsx
+// features/order/hooks/useOrderSubmit.ts
+import { analyticsService } from '@/lib/analytics';
+
+export function useOrderSubmit() {
+  return useMutation({
+    mutationFn: submitOrder,
+    onSuccess: (data, variables) => {
+      analyticsService.logEvent('purchase', {
+        transaction_id: data.orderId,
+        value:          variables.total,
+        currency:       'JPY',
+      });
+      notify.success(t('order.submitSuccess'));
+    },
+  });
+}
+```
+
+🔴 **MUST**: PII（メール・氏名・電話番号）を Analytics のパラメータに含めない  
+🔴 **MUST**: `analyticsService` 経由で呼び出す。`analytics()` を Feature から直接呼ばない  
+🟡 **SHOULD**: イベント名は `AnalyticsEventMap` に追加して型安全にする  
+🟡 **SHOULD**: ユーザーの同意取得後に `setEnabled(true)` を呼ぶ（GDPR / 個人情報保護法）
+
+---
+
+## 4. Firebase Crashlytics
+
+### Sentry との役割分担
+
+```
+エラーが発生
+  ├─ JS / TypeScript の例外    → Sentry が捕捉（19_Observability）
+  │     └─ React Error Boundary
+  │     └─ httpClient の catch
+  │     └─ React Query の onError
+  │
+  └─ Native クラッシュ（Swift / Kotlin / C++ の SIGSEGV 等）
+        → Crashlytics が捕捉（本書）
+        → Sentry は JS バンドルが動いていないと捕捉できない
+```
+
+Sentry と Crashlytics は **競合ではなく補完関係**。両方を有効にする。
+
+### 初期化
+
+```ts
+// src/lib/crashlytics.ts
+import crashlytics from '@react-native-firebase/crashlytics';
+import { logger } from '@/lib/logger'; // 19_Observability で定義したロガー
+
+export const crashlyticsService = {
+  // ユーザー ID を設定（PII なし。内部 ID のみ）
+  setUserId: (userId: string): Promise<void> =>
+    crashlytics().setUserId(userId),
+
+  // カスタムキーを付与してデバッグ情報を追加する
+  setAttributes: (attrs: Record<string, string>): Promise<void> =>
+    crashlytics().setAttributes(attrs),
+
+  // JS 例外を Crashlytics にも送る（Sentry と二重送信してよい）
+  recordError: (error: Error, context?: string): void => {
+    crashlytics().recordError(error);
+    if (context) {
+      crashlytics().log(`Context: ${context}`);
+    }
+  },
+
+  // 非致命的ログ（クラッシュにいたらない重要な操作の記録）
+  log: (message: string): void => {
+    crashlytics().log(message);
+  },
+
+  // Analytics と同期してデータ収集を有効 / 無効にする
+  // ⚠️ 有効 / 無効の切り替えはアプリ再起動後に反映される（Firebase の仕様）
+  setCrashlyticsEnabled: (enabled: boolean): Promise<void> =>
+    crashlytics().setCrashlyticsCollectionEnabled(enabled),
+};
+```
+
+```tsx
+// app/_layout.tsx — ログイン後にユーザー ID を設定する
+const isLoggedIn = useAuthStore((s) => s.isLoggedIn);
+const userId     = useAuthStore((s) => s.userId);
+
+useEffect(() => {
+  if (isLoggedIn && userId) {
+    crashlyticsService.setUserId(userId);
+    crashlyticsService.setAttributes({
+      app_env:     process.env.EXPO_PUBLIC_APP_ENV ?? 'unknown',
+      app_version: process.env.EXPO_PUBLIC_APP_VERSION ?? 'unknown',
+    });
+  } else {
+    crashlyticsService.setUserId('');
+  }
+}, [isLoggedIn, userId]);
+```
+
+### React Error Boundary との統合
+
+```tsx
+// src/components/providers/AppErrorBoundary.tsx（19_Observability より拡張）
+// ※ファイル名をコンポーネント名に合わせて AppErrorBoundary.tsx にリネームすること
+export function AppErrorBoundary({ children }: { children: React.ReactNode }) {
+  return (
+    <Sentry.ErrorBoundary
+      fallback={({ error, resetError }) => (
+        <ErrorState message="予期しないエラーが発生しました" onRetry={resetError} />
+      )}
+      onError={(error, componentStack) => {
+        // Sentry に送る（既存）
+        logger.capture(error, { componentStack });
+        // Crashlytics にも送る（JS エラーをネイティブ側でも記録）
+        crashlyticsService.recordError(
+          error instanceof Error ? error : new Error(String(error)),
+          componentStack,
+        );
+      }}
+    >
+      {children}
+    </Sentry.ErrorBoundary>
+  );
+}
+```
+
+🔴 **MUST**: Crashlytics に PII を送らない（userId は内部 ID のみ）  
+🔴 **MUST**: `setCrashlyticsEnabled` を `crashlyticsService` 内に実装し、セクション9の同意管理から呼び出す  
+🟡 **SHOULD**: Sentry と Crashlytics の両方に重大エラーを送る  
+🟡 **SHOULD**: `crashlyticsService.log()` をクリティカルな操作の前後に挟み、クラッシュ前の文脈を記録する
+
+---
+
+## 5. Firebase Remote Config
+
+### 23_Feature_Flags との統合
+
+23_Feature_Flags で定義した「動的フラグ」の**バックエンド実装**が Firebase Remote Config である。
+アプリ側のフラグ取得インタフェースは変えず、バックエンドだけを Remote Config に差し替える。
+
+**フラグキー名（`feature_new_checkout` 等）の定義責務は 23_Feature_Flags に集約する。**
+本書では Firebase 側の初期化・フェッチ・型変換のみを担当する。
+
+```
+23_Feature_Flags で定義したインタフェース
+  ↓
+Firebase Remote Config がデータを返す（本書で実装）
+```
+
+### 初期化とフェッチ
+
+```ts
+// src/lib/remoteConfig.ts
+import remoteConfig from '@react-native-firebase/remote-config';
+import { z }        from 'zod';
+import { logger }   from '@/lib/logger'; // 19_Observability で定義したロガー
+
+// ─── デフォルト値（Remote Config 未取得時のフォールバック）──────────────
+const REMOTE_CONFIG_DEFAULTS = {
+  feature_new_checkout:      'false',
+  feature_recommendations:   'false',
+  max_cart_items:            '10',
+  promo_banner_text:         '',
+  min_app_version:           '1.0.0',
+} as const;
+
+// ─── 取得値の Zod スキーマ ─────────────────────────────────────────────
+const remoteConfigSchema = z.object({
+  feature_new_checkout:      z.string().transform((v) => v === 'true'),
+  feature_recommendations:   z.string().transform((v) => v === 'true'),
+  max_cart_items:            z.string().transform(Number),
+  promo_banner_text:         z.string().nullable(),
+  min_app_version:           z.string(),
+});
+
+export type RemoteConfigValues = z.infer<typeof remoteConfigSchema>;
+
+// ─── Remote Config サービス ───────────────────────────────────────────
+export const remoteConfigService = {
+  // 初期化（アプリ起動時に 1 回だけ呼ぶ）
+  async initialize() {
+    await remoteConfig().setDefaults(REMOTE_CONFIG_DEFAULTS);
+    await remoteConfig().setConfigSettings({
+      minimumFetchIntervalMillis: __DEV__
+        ? 0              // 開発中は毎回フェッチ
+        : 1000 * 60 * 60,// 本番は 1 時間キャッシュ
+    });
+  },
+
+  // フェッチして有効化する
+  async fetchAndActivate(): Promise<boolean> {
+    try {
+      const activated = await remoteConfig().fetchAndActivate();
+      return activated;
+    } catch (err) {
+      logger.warn('Remote Config fetch failed. Using cached/default values.', { err });
+      return false;   // 失敗してもデフォルト値で動き続ける
+    }
+  },
+
+  // 値の取得（型安全）
+  getValues(): RemoteConfigValues {
+    const raw = {
+      feature_new_checkout:      remoteConfig().getValue('feature_new_checkout').asString(),
+      feature_recommendations:   remoteConfig().getValue('feature_recommendations').asString(),
+      max_cart_items:            remoteConfig().getValue('max_cart_items').asString(),
+      promo_banner_text:         remoteConfig().getValue('promo_banner_text').asString() || null,
+      min_app_version:           remoteConfig().getValue('min_app_version').asString(),
+    };
+    const parsed = remoteConfigSchema.safeParse(raw);
+    if (!parsed.success) {
+      logger.warn('Remote Config schema mismatch', { issues: parsed.error.issues });
+      // スキーマ失敗時はデフォルト値にフォールバック
+      return remoteConfigSchema.parse(REMOTE_CONFIG_DEFAULTS);
+    }
+    return parsed.data;
+  },
+};
+```
+
+### React Query との統合（23_Feature_Flags の動的フラグ実装）
+
+```ts
+// src/features/config/hooks/useRemoteFlags.ts（23_Feature_Flags の実装先）
+import { useQuery }           from '@tanstack/react-query';
+import { queryKeys }          from '@/lib/queryKeys'; // プロジェクト共通の queryKeys
+import { remoteConfigService, remoteConfigSchema, REMOTE_CONFIG_DEFAULTS }
+  from '@/lib/remoteConfig';
+
+export function useRemoteFlags() {
+  return useQuery({
+    queryKey:  queryKeys.config.featureFlags(),
+    queryFn:   async () => {
+      await remoteConfigService.fetchAndActivate();
+      return remoteConfigService.getValues();
+    },
+    staleTime:        1000 * 60 * 60,    // 1 時間
+    gcTime:           1000 * 60 * 60 * 24,
+    placeholderData:  remoteConfigSchema.parse(REMOTE_CONFIG_DEFAULTS),
+  });
+}
+```
+
+### アプリ起動時の強制アップデート確認
+
+semver のプレリリースタグ（`1.0.0-beta.1` 等）に対応するため、`semver` ライブラリを使う。
+
+```bash
+expo install semver
+```
+
+```ts
+// src/lib/remoteConfig.ts（追加）
+import semver from 'semver';
+
+export async function checkMinAppVersion(): Promise<'ok' | 'force_update'> {
+  const { min_app_version } = remoteConfigService.getValues();
+  const currentVersion = process.env.EXPO_PUBLIC_APP_VERSION ?? '0.0.0';
+
+  // semver.gte は無効なバージョン文字列で null を返す。フォールバックとして 'ok' にする
+  const current = semver.coerce(currentVersion);
+  const minimum = semver.coerce(min_app_version);
+
+  if (!current || !minimum) {
+    logger.warn('checkMinAppVersion: invalid version string', { currentVersion, min_app_version });
+    return 'ok';
+  }
+
+  return semver.gte(current, minimum) ? 'ok' : 'force_update';
+}
+```
+
+```tsx
+// app/_layout.tsx — 起動時にバージョンチェック
+useEffect(() => {
+  remoteConfigService.initialize()
+    .then(() => remoteConfigService.fetchAndActivate())
+    .then(() => checkMinAppVersion())
+    .then((result) => {
+      if (result === 'force_update') {
+        // 強制アップデートバナーを表示（Banner コンポーネント / 09_Message_Display）
+        setForceUpdate(true);
+      }
+    })
+    .catch((err) => {
+      logger.warn('Startup version check failed', { err });
+      // バージョンチェック失敗はアプリを止めない
+    });
+}, []);
+```
+
+🔴 **MUST**: Remote Config の取得失敗時はデフォルト値で動き続ける（サービス停止を防ぐ）  
+🔴 **MUST**: `remoteConfigSchema.safeParse` で型を検証してから使う  
+🔴 **MUST**: バージョン比較には `semver` を使う（独自実装はプレリリースタグで壊れる）  
+🟡 **SHOULD**: 本番環境では `minimumFetchIntervalMillis` を 3600000ms（1 時間）以上にする（quota 節約）
+
+---
+
+## 6. FCM と expo-notifications の関係
+
+### 直接触らない原則
+
+13_Push_Notifications で定義した通り、FCM を直接操作することは禁止されている。
+
+```
+❌ 禁止 — react-native-firebase で FCM を直接扱う
+import messaging from '@react-native-firebase/messaging';
+const token = await messaging().getToken();
+
+✅ 正解 — expo-notifications 経由（FCM を内部で使う）
+import { notificationService } from '@/lib/notificationService';
+const token = await notificationService.getExpoPushToken();
+```
+
+### `google-services.json` が必要な理由
+
+FCM は `google-services.json` を使って APNs への転送を設定する。
+`expo-notifications` が FCM を内部で使うため、Firebase を「直接呼ばない」場合でもこのファイルは必要になる。
+
+```
+expo-notifications
+  └─ FCM（Firebase Cloud Messaging）
+       └─ google-services.json で設定される Firebase プロジェクトと通信
+```
+
+---
+
+## 7. Firebase App Distribution
+
+社内 QA への配布を自動化する。EAS Internal Distribution の補完として使う。
+
+### 使い分け
+
+| 配布先 | 使用ツール |
+|--------|-----------|
+| 社外（TestFlight / Play Store） | EAS Submit |
+| 社内 QA（EAS 管理対象）| EAS Internal Distribution |
+| 社内 QA（Firebase 管理対象）| Firebase App Distribution |
+| 特定のテスターグループ（メール招待）| Firebase App Distribution |
+
+### GitLab CI への組み込み
+
+> **⚠️ 非推奨**: `firebase login:ci` によるトークン認証は Firebase CLI v13 以降で非推奨。  
+> **推奨**: サービスアカウントキーを使う。
+
+```bash
+# サービスアカウントキーの作成（GCP Console → IAM → サービスアカウント）
+# 必要なロール: Firebase App Distribution Admin
+gcloud iam service-accounts keys create firebase-sa.json \
+  --iam-account=firebase-app-dist@<PROJECT_ID>.iam.gserviceaccount.com
+```
+
+```yaml
+# .gitlab-ci.yml
+# ビルドとデプロイを分離する（eas build の完了待ちでタイムアウトしないようにする）
+
+stages:
+  - build
+  - deploy
+
+eas-build-staging:
+  stage: build
+  image: node:22-alpine
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  script:
+    - npm ci
+    - |
+      eas build --platform android --profile staging --non-interactive \
+        --json > build-result.json
+      # ビルド成果物の URL を artifact として次ステージに渡す
+      cat build-result.json \
+        | node -e "
+            const d = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+            const url = d.find(b => b.platform === 'ANDROID')?.artifacts?.buildUrl;
+            console.log('BUILD_URL=' + url);
+          " >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+firebase-distribute-staging:
+  stage: deploy
+  image: node:22-alpine
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  needs:
+    - job: eas-build-staging
+      artifacts: true
+  before_script:
+    - npm install -g firebase-tools
+  script:
+    - curl -o app.apk "$BUILD_URL"
+    - |
+      # サービスアカウントキーで認証（CI_TOKEN 方式は非推奨）
+      export GOOGLE_APPLICATION_CREDENTIALS="$FIREBASE_SA_KEY_PATH"
+      firebase appdistribution:distribute app.apk \
+        --app   "$FIREBASE_ANDROID_APP_ID" \
+        --groups "qa-testers" \
+        --release-notes "Branch: $CI_COMMIT_BRANCH / $CI_COMMIT_SHORT_SHA"
+  variables:
+    FIREBASE_ANDROID_APP_ID: $FIREBASE_ANDROID_APP_ID   # GitLab CI/CD Variables
+    FIREBASE_SA_KEY_PATH:    $FIREBASE_SA_KEY_PATH       # サービスアカウントキーのパス
+```
+
+🔴 **MUST**: `FIREBASE_CI_TOKEN`（非推奨）ではなくサービスアカウントキーで認証する  
+🔴 **MUST**: ビルドステージとデプロイステージを分離する（タイムアウト防止）  
+🔴 **MUST**: サービスアカウントキーを GitLab の CI/CD Variables（Masked + Protected）で管理する  
+🟡 **SHOULD**: 配布時の release notes に Git ブランチ名とコミット SHA を含める
+
+---
+
+## 8. Firebase Performance Monitoring（任意）
+
+### 採用判断の基準
+
+以下の**いずれか**に該当する場合のみ採用する。Sentry Performance で代替できる場合は追加しない。
+
+| 計測したい指標 | Sentry で取れるか | Performance Monitoring が必要か |
+|--------------|-----------------|-------------------------------|
+| JS 例外・トレース | ✅ 取れる | 不要 |
+| API レスポンスタイム（JS 層） | ✅ 取れる | 不要 |
+| アプリ起動時間（Native） | ❌ 取れない | **必要** |
+| 画面描画時間（Native） | ❌ 取れない | **必要** |
+| ネットワーク遅延（Native 層） | ❌ 取れない | **必要** |
+
+```ts
+// src/lib/firebasePerf.ts（採用時のみ作成）
+import perf   from '@react-native-firebase/perf';
+import { logger } from '@/lib/logger';
+
+// ─── HTTP トレース（httpClient と統合）──────────────────────────────────
+export async function measureHttpRequest<T>(
+  method: string,
+  url:    string,
+  fn:     () => Promise<T>,
+): Promise<T> {
+  const metric = await perf().newHttpMetric(url, method as any);
+  await metric.start();
+  try {
+    const result = await fn();
+    metric.setHttpResponseCode(200);
+    return result;
+  } catch (err) {
+    if (err instanceof HttpError) {
+      metric.setHttpResponseCode(err.status);
+    }
+    throw err;
+  } finally {
+    await metric.stop();
+  }
+}
+
+// ─── カスタムトレース ──────────────────────────────────────────────────
+export async function measureCustomTrace<T>(
+  name: string,
+  fn:   () => Promise<T>,
+): Promise<T> {
+  const trace = await perf().startTrace(name);
+  try {
+    return await fn();
+  } finally {
+    await trace.stop();
+  }
+}
+```
+
+🟢 **MAY**: 上表の「必要」に該当する計測ニーズがある場合のみ採用する  
+🟢 **MAY**: Sentry Performance で計測できている場合は Firebase Performance を追加しない（重複計測はコストと複雑さを増やす）
+
+---
+
+## 9. プライバシー・同意管理
+
+### Analytics と Crashlytics の収集同意
+
+日本の個人情報保護法・GDPR 対象ユーザーが存在する場合は、
+データ収集の同意を取得してから有効化する。
+
+```ts
+// src/lib/privacyConsent.ts
+import * as SecureStore         from 'expo-secure-store';
+import { analyticsService }     from '@/lib/analytics';
+import { crashlyticsService }   from '@/lib/crashlytics';
+
+const CONSENT_KEY = 'analytics_consent';
+
+export type ConsentStatus = 'granted' | 'denied' | 'undetermined';
+
+export async function getConsentStatus(): Promise<ConsentStatus> {
+  const stored = await SecureStore.getItemAsync(CONSENT_KEY);
+  return (stored as ConsentStatus | null) ?? 'undetermined';
+}
+
+export async function setConsent(status: 'granted' | 'denied'): Promise<void> {
+  await SecureStore.setItemAsync(CONSENT_KEY, status);
+  const enabled = status === 'granted';
+  await analyticsService.setEnabled(enabled);
+  // ⚠️ Crashlytics の有効/無効はアプリ再起動後に反映される（Firebase の仕様）
+  await crashlyticsService.setCrashlyticsEnabled(enabled);
+}
+```
+
+```tsx
+// features/onboarding/components/PrivacyConsentScreen.tsx
+export function PrivacyConsentScreen() {
+  const handleAccept = async () => {
+    await setConsent('granted');
+    router.replace('/home');
+  };
+  const handleDecline = async () => {
+    await setConsent('denied');
+    router.replace('/home');
+  };
+  // ...
+}
+```
+
+🔴 **MUST**: 初回起動時に Analytics / Crashlytics の同意を取得してから有効化する  
+🔴 **MUST**: ユーザーが同意を撤回できる設定画面を提供する  
+🟡 **SHOULD**: 同意前はデフォルト `false`（収集しない）にする
+
+---
+
+## 10. テスト実装規約
+
+```ts
+// src/lib/__tests__/analytics.test.ts
+jest.mock('@react-native-firebase/analytics', () => () => ({
+  logEvent:                       jest.fn(),
+  logScreenView:                  jest.fn(),
+  setUserId:                      jest.fn(),
+  setUserProperty:                jest.fn(),
+  setAnalyticsCollectionEnabled:  jest.fn(),
+}));
+
+import { analyticsService } from '@/lib/analytics';
+
+describe('analyticsService.logEvent', () => {
+  test('purchase イベントを送信する', () => {
+    const analytics = require('@react-native-firebase/analytics')();
+    analyticsService.logEvent('purchase', {
+      transaction_id: 'txn-001',
+      value:          1500,
+      currency:       'JPY',
+    });
+    expect(analytics.logEvent).toHaveBeenCalledWith(
+      'purchase',
+      expect.objectContaining({ transaction_id: 'txn-001', value: 1500 }),
+    );
+  });
+
+  test('PII フィールドがフィルタリングされる', () => {
+    const analytics = require('@react-native-firebase/analytics')();
+    // @ts-expect-error — 意図的に PII を含むパラメータを渡す
+    analyticsService.logEvent('login', { method: 'email', email: 'test@example.com' });
+    const callArgs = analytics.logEvent.mock.calls[0][1];
+    expect(callArgs.email).toBeUndefined();
+  });
+
+  test('object 型の値がフィルタリングされる', () => {
+    const analytics = require('@react-native-firebase/analytics')();
+    // @ts-expect-error — 意図的に不正な型を渡す
+    analyticsService.logEvent('login', { method: 'email', meta: { nested: true } });
+    const callArgs = analytics.logEvent.mock.calls[0][1];
+    expect(callArgs.meta).toBeUndefined();
+  });
+});
+```
+
+```ts
+// src/lib/__tests__/remoteConfig.test.ts
+const mockGetValue = jest.fn((key: string) => ({
+  asString: () =>
+    ({
+      feature_new_checkout:    'false',
+      feature_recommendations: 'true',
+      max_cart_items:          '10',
+      promo_banner_text:       '',
+      min_app_version:         '1.0.0',
+    }[key] ?? ''),
+}));
+
+jest.mock('@react-native-firebase/remote-config', () => () => ({
+  setDefaults:        jest.fn().mockResolvedValue(undefined),
+  setConfigSettings:  jest.fn().mockResolvedValue(undefined),
+  fetchAndActivate:   jest.fn().mockResolvedValue(true),
+  getValue:           mockGetValue,
+}));
+
+import { remoteConfigService } from '@/lib/remoteConfig';
+
+describe('remoteConfigService.getValues', () => {
+  test('正常値をパースして返す', () => {
+    const values = remoteConfigService.getValues();
+    expect(values.feature_new_checkout).toBe(false);
+    expect(values.feature_recommendations).toBe(true);
+    expect(values.max_cart_items).toBe(10);
+  });
+
+  test('スキーマ不一致時はデフォルト値にフォールバックする', () => {
+    // max_cart_items に数値変換できない値を返す
+    mockGetValue.mockImplementation((key: string) => ({
+      asString: () => key === 'max_cart_items' ? 'not-a-number' : 'false',
+    }));
+    const values = remoteConfigService.getValues();
+    // デフォルト値の '10' が Number に変換される
+    expect(values.max_cart_items).toBe(10);
+  });
+});
+
+describe('checkMinAppVersion', () => {
+  test('現在バージョンが最小バージョン以上なら ok を返す', async () => {
+    process.env.EXPO_PUBLIC_APP_VERSION = '1.2.0';
+    mockGetValue.mockImplementation((key: string) => ({
+      asString: () => key === 'min_app_version' ? '1.0.0' : 'false',
+    }));
+    const { checkMinAppVersion } = await import('@/lib/remoteConfig');
+    expect(await checkMinAppVersion()).toBe('ok');
+  });
+
+  test('現在バージョンが最小バージョン未満なら force_update を返す', async () => {
+    process.env.EXPO_PUBLIC_APP_VERSION = '0.9.0';
+    mockGetValue.mockImplementation((key: string) => ({
+      asString: () => key === 'min_app_version' ? '1.0.0' : 'false',
+    }));
+    const { checkMinAppVersion } = await import('@/lib/remoteConfig');
+    expect(await checkMinAppVersion()).toBe('force_update');
+  });
+
+  test('プレリリースタグ付きバージョンを正しく比較する', async () => {
+    process.env.EXPO_PUBLIC_APP_VERSION = '1.0.0-beta.1';
+    mockGetValue.mockImplementation((key: string) => ({
+      asString: () => key === 'min_app_version' ? '1.0.0' : 'false',
+    }));
+    const { checkMinAppVersion } = await import('@/lib/remoteConfig');
+    // semver では 1.0.0-beta.1 < 1.0.0 のため force_update
+    expect(await checkMinAppVersion()).toBe('force_update');
+  });
+
+  test('不正なバージョン文字列では ok にフォールバックする', async () => {
+    process.env.EXPO_PUBLIC_APP_VERSION = 'invalid';
+    const { checkMinAppVersion } = await import('@/lib/remoteConfig');
+    expect(await checkMinAppVersion()).toBe('ok');
+  });
+});
+```
+
+🔴 **MUST**: Firebase SDK は全てモックしてテストする（実際の Firebase プロジェクトに接続しない）  
+🔴 **MUST**: PII フィルタリングのテストを `analyticsService` に含める  
+🔴 **MUST**: `getValues()` のスキーマ検証失敗パスのテストを含める  
+🔴 **MUST**: `checkMinAppVersion` のテストにプレリリースタグ・不正文字列のエッジケースを含める
+
+---
+
+## 11. よくある実装ミスと対策
+
+| ミス | リスク / 結果 | 対策 |
+|------|--------------|------|
+| `google-services.json` を Git にコミット | Firebase プロジェクト API キーが漏洩 | `.gitignore` に追加・EAS Secret Files で管理 |
+| `react-native-firebase` の FCM を直接呼ぶ | expo-notifications との競合・トークン管理が二重になる | FCM は expo-notifications に一任し直接呼ばない |
+| `useFrameworks: 'static'` の設定漏れ | iOS ビルドが `Multiple commands produce` エラーで失敗 | `expo-build-properties` で必ず設定する |
+| Analytics に PII を送る | 個人情報保護法・GDPR 違反 | `sanitizeParams` wrapper 経由のみ使う |
+| `sanitizeParams` で型チェックなしにキャスト | object 型等の不正値が SDK に渡りサイレントエラー | `isAllowedParamValue` でランタイム型検証する |
+| 同意なしに Analytics を有効化 | 規制違反 | 初回起動時に同意取得後に `setEnabled(true)` |
+| Crashlytics と Sentry を別々に設定してクラッシュを二重管理 | 調査時にどちらを見るか混乱する | JS エラー = Sentry、Native クラッシュ = Crashlytics の役割分担を徹底 |
+| Remote Config のフェッチ失敗でアプリが止まる | ネットワークエラー時にクラッシュする | `fetchAndActivate` の失敗を `catch` してデフォルト値で継続する |
+| 開発環境と本番で同じ Firebase プロジェクトを使う | 開発中のデータが Analytics に混入する | 環境ごとにプロジェクトを分ける |
+| Expo Go で Firebase を使う | ネイティブモジュールが動かず実行時エラー | Development Build に移行する |
+| dSYM をアップロードしない | Native クラッシュのスタックトレースが読めない | EAS Build の postBuildCommand で自動アップロードする |
+| `firebase login:ci` トークンを CI に使う | Firebase CLI v13 以降で非推奨・将来の破壊的変更リスク | サービスアカウントキーに移行する |
+| バージョン比較を独自実装する | `1.0.0-beta.1` 等のプレリリースタグで NaN が返る | `semver` ライブラリを使う |
+| `setCrashlyticsEnabled` を実装せず同意管理から呼ぶ | コンパイルエラーまたは実行時エラー | `crashlyticsService` にメソッドを実装してから参照する |
+
+---
+
+## 12. 変更履歴
+
+| 日付 | 変更内容 | 担当 |
+|------|----------|------|
+| 2026-04 | Expo Go 非対応の明記、dSYM/ProGuard 設定追加、semver 対応、サービスアカウント認証移行、テスト拡充、型安全修正 | — |
+| 2026-03 | 初版作成 | — |

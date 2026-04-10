@@ -1,0 +1,569 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Quality/Observability" />
+
+# エラー監視・オブザーバビリティ方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: Sentry によるエラー監視・パフォーマンス計測・ログ設計  
+> **依存**: 08_API_Communication（httpClient）、06_Operations（CI/CD・アラート）
+
+---
+
+## 1. 方針
+
+### 監視の 3 層
+
+```
+Layer 1: クラッシュ監視  → Sentry（@sentry/react-native）
+Layer 2: エラー追跡      → Sentry（httpClient / React Query 統合）
+Layer 3: パフォーマンス  → Sentry Performance + Flashlight（CI）
+```
+
+🔴 **MUST**: PII（個人識別情報）を Sentry に送らない  
+🔴 **MUST**: 認証トークン・パスワードをイベントに含めない  
+🟡 **SHOULD**: Sentry の DSN は `EXPO_PUBLIC_SENTRY_DSN` で環境変数管理する
+
+---
+
+## 2. Sentry 初期化
+
+```bash
+expo install @sentry/react-native
+npx @sentry/wizard@latest -i reactNative
+```
+
+```ts
+// src/lib/sentry.ts
+import * as Sentry from '@sentry/react-native';
+import { routingInstrumentation } from './sentryRouting';
+
+export function initializeSentry() {
+  if (!process.env.EXPO_PUBLIC_SENTRY_DSN) return;  // DSN 未設定なら無効化
+
+  Sentry.init({
+    dsn:         process.env.EXPO_PUBLIC_SENTRY_DSN,
+    environment: process.env.EXPO_PUBLIC_APP_ENV ?? 'development',
+    release:     `${process.env.EXPO_PUBLIC_APP_VERSION}`,
+    dist:        process.env.EXPO_PUBLIC_BUILD_NUMBER,
+
+    // ── サンプリングレート ──────────────────────────────────────────
+    tracesSampleRate:        __DEV__ ? 1.0 : 0.1,   // 本番は 10% でトレース
+    profilesSampleRate:      0.1,
+    enableAutoSessionTracking: true,
+
+    // ── 統合設定 ───────────────────────────────────────────────────
+    integrations: [
+      new Sentry.ReactNativeTracing({
+        routingInstrumentation,
+        enableUserInteractionTracing: true,
+      }),
+    ],
+
+    // ── PII フィルタリング ─────────────────────────────────────────
+    beforeSend: sanitizeEvent,
+    beforeSendTransaction: sanitizeTransaction,
+
+    // ── 開発中は無効化 ─────────────────────────────────────────────
+    enabled: !__DEV__,
+  });
+}
+```
+
+### Expo Router との統合
+
+```ts
+// src/lib/sentryRouting.ts
+import * as Sentry from '@sentry/react-native';
+import { useNavigationContainerRef } from 'expo-router';
+
+export const routingInstrumentation =
+  new Sentry.ReactNavigationInstrumentation();
+
+// app/_layout.tsx で使用
+export function useSentryRouting() {
+  const ref = useNavigationContainerRef();
+
+  useEffect(() => {
+    if (ref.current) {
+      routingInstrumentation.registerNavigationContainer(ref);
+    }
+  }, [ref]);
+
+  return ref;
+}
+```
+
+---
+
+## 3. PII フィルタリング
+
+```ts
+// src/lib/sentry.ts（sanitize 関数）
+
+// ── マスク対象フィールド ────────────────────────────────────────────────
+const PII_FIELDS = [
+  'email', 'phone', 'name', 'address', 'password',
+  'token', 'authorization', 'cookie', 'secret',
+  'card_number', 'cvv', 'birth_date',
+] as const;
+
+const PII_PATTERN = new RegExp(PII_FIELDS.join('|'), 'i');
+
+function maskValue(key: string, value: unknown): unknown {
+  if (typeof value === 'string' && PII_PATTERN.test(key)) {
+    return '[Filtered]';
+  }
+  return value;
+}
+
+function sanitizeObject(obj: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(obj).map(([k, v]) => [
+      k,
+      v && typeof v === 'object'
+        ? sanitizeObject(v as Record<string, unknown>)
+        : maskValue(k, v),
+    ]),
+  );
+}
+
+export function sanitizeEvent(event: Sentry.Event): Sentry.Event | null {
+  // request の body・headers をサニタイズ
+  if (event.request?.data) {
+    event.request.data = sanitizeObject(
+      event.request.data as Record<string, unknown>,
+    );
+  }
+  if (event.request?.headers) {
+    delete event.request.headers['Authorization'];
+    delete event.request.headers['Cookie'];
+  }
+
+  // extra / contexts をサニタイズ
+  if (event.extra) {
+    event.extra = sanitizeObject(event.extra as Record<string, unknown>);
+  }
+
+  return event;
+}
+
+export function sanitizeTransaction(
+  transaction: Sentry.TransactionEvent,
+): Sentry.TransactionEvent | null {
+  // トランザクション名に PII が含まれる場合（例: /users/user@example.com）
+  if (transaction.transaction) {
+    transaction.transaction = transaction.transaction
+      .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[email]')
+      .replace(/\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b/g, '[card]');
+  }
+  return transaction;
+}
+```
+
+🔴 **MUST**: `beforeSend` / `beforeSendTransaction` でサニタイズを必ず実施する  
+🔴 **MUST**: `Authorization` ヘッダをイベントから削除する  
+🔴 **MUST NOT**: ユーザーの氏名・メール・電話番号を `user.email` / `user.username` に設定しない
+
+```ts
+// ✅ 正解 — ユーザー識別は匿名 ID のみ
+Sentry.setUser({ id: userId });   // 内部 ID のみ
+
+// ❌ 禁止 — PII を Sentry に送らない
+Sentry.setUser({ id: userId, email: 'user@example.com', name: '山田 太郎' });
+```
+
+---
+
+## 4. logger — 構造化ログ
+
+```ts
+// src/lib/logger.ts
+import * as Sentry from '@sentry/react-native';
+
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+type LogContext = Record<string, unknown>;
+
+function log(level: LogLevel, message: string, context?: LogContext) {
+  // 開発中はコンソール出力
+  if (__DEV__) {
+    const method = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log';
+    console[method](`[${level.toUpperCase()}] ${message}`, context ?? '');
+  }
+
+  // Sentry に Breadcrumb として送信
+  Sentry.addBreadcrumb({
+    level:   level as Sentry.SeverityLevel,
+    message,
+    data:    context,
+    category: 'app',
+  });
+
+  // error / warn は Sentry にイベントとしても送信
+  if (level === 'error') {
+    Sentry.captureMessage(message, {
+      level:  'error',
+      extra:  context,
+    });
+  }
+}
+
+export const logger = {
+  debug: (msg: string, ctx?: LogContext) => log('debug', msg, ctx),
+  info:  (msg: string, ctx?: LogContext) => log('info',  msg, ctx),
+  warn:  (msg: string, ctx?: LogContext) => log('warn',  msg, ctx),
+  error: (msg: string, ctx?: LogContext) => log('error', msg, ctx),
+
+  // 例外オブジェクトを直接 Sentry に送る
+  capture: (err: unknown, ctx?: LogContext) => {
+    if (__DEV__) console.error('[EXCEPTION]', err, ctx);
+    Sentry.captureException(err, { extra: ctx });
+  },
+};
+```
+
+---
+
+## 5. React Query エラーの統合
+
+```ts
+// src/lib/queryClient.ts
+import * as Sentry   from '@sentry/react-native';
+import { queryClient } from './queryClientBase';
+
+// グローバルエラーハンドラ
+const queryCache = queryClient.getQueryCache();
+queryCache.subscribe((event) => {
+  if (event.type === 'observerResultsUpdated') {
+    const query = event.query;
+    if (query.state.status === 'error') {
+      const err = query.state.error;
+
+      // 認証エラー・404 は監視不要
+      if (err instanceof HttpError && [401, 403, 404].includes(err.status)) return;
+
+      Sentry.captureException(err, {
+        tags: {
+          query_key: JSON.stringify(query.queryKey).slice(0, 100),
+        },
+      });
+    }
+  }
+});
+```
+
+### Mutation エラーの統合
+
+```ts
+// useMutation の共通エラーハンドラ
+const mutationCache = queryClient.getMutationCache();
+mutationCache.subscribe((event) => {
+  if (event.type === 'updated' && event.mutation.state.status === 'error') {
+    const err = event.mutation.state.error;
+
+    if (err instanceof NetworkError) return;  // ネットワークエラーは通常監視
+    if (err instanceof HttpError && err.status < 500) return;  // 4xx は通常監視
+
+    logger.capture(err, {
+      mutation_key: JSON.stringify(event.mutation.options.mutationKey ?? []).slice(0, 100),
+    });
+  }
+});
+```
+
+---
+
+## 6. httpClient との統合
+
+```ts
+// src/lib/httpClient.ts（Sentry トレーシング追加）
+import * as Sentry from '@sentry/react-native';
+
+async function request<T>(method: string, path: string, ...): Promise<T> {
+  // Sentry トランザクションスパンを開始
+  const span = Sentry.startInactiveSpan({
+    name: `${method} ${path}`,
+    op:   'http.client',
+    attributes: {
+      'http.method': method,
+      'http.url':    `${BASE_URL}${path}`,
+    },
+  });
+
+  try {
+    const res = await fetch(...);
+
+    span.setAttributes({
+      'http.status_code': res.status,
+      'http.response_content_length':
+        Number(res.headers.get('content-length') ?? 0),
+    });
+    span.setStatus({ code: res.ok ? 1 : 2 });
+
+    // ... レスポンス処理
+    return parsed.data;
+  } catch (err) {
+    span.setStatus({ code: 2 });  // ERROR
+    throw err;
+  } finally {
+    span.end();
+  }
+}
+```
+
+---
+
+## 7. React Error Boundary との統合
+
+```tsx
+// src/components/providers/SentryErrorBoundary.tsx
+import * as Sentry from '@sentry/react-native';
+
+// Sentry が提供する ErrorBoundary をラップして通知を追加する
+export function AppErrorBoundary({ children }: { children: React.ReactNode }) {
+  return (
+    <Sentry.ErrorBoundary
+      fallback={({ error, resetError }) => (
+        <ErrorState
+          message="予期しないエラーが発生しました"
+          onRetry={resetError}
+        />
+      )}
+      onError={(error, componentStack) => {
+        logger.capture(error, { componentStack });
+      }}
+    >
+      {children}
+    </Sentry.ErrorBoundary>
+  );
+}
+```
+
+```tsx
+// app/_layout.tsx — Root に配置
+export default function RootLayout() {
+  return (
+    <AppErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        {/* ... */}
+      </QueryClientProvider>
+    </AppErrorBoundary>
+  );
+}
+```
+
+---
+
+## 8. パフォーマンストレーシング
+
+### 画面遷移のトレーシング（自動）
+
+Expo Router + Sentry.ReactNavigationInstrumentation で自動計測される。
+手動対応は不要。
+
+### カスタムトレース
+
+```ts
+// 重要な業務処理の計測
+export async function processCheckout(cartId: string) {
+  return Sentry.startSpan(
+    { name: 'checkout', op: 'business.checkout' },
+    async (span) => {
+      span.setAttribute('cart.id', cartId);
+
+      const cart = await fetchCart(cartId);
+      span.setAttribute('cart.item_count', cart.items.length);
+
+      const order = await createOrder(cart);
+      span.setAttribute('order.id', order.id);
+
+      return order;
+    },
+  );
+}
+```
+
+---
+
+## 9. ソースマップの自動アップロード
+
+```bash
+# eas.json に Sentry の設定を追加
+{
+  "build": {
+    "production": {
+      "env": {
+        "SENTRY_AUTH_TOKEN": "..."  // EAS Secret で管理
+      }
+    }
+  }
+}
+```
+
+```ts
+// app.config.ts — sentry-expo プラグインを設定
+export default {
+  plugins: [
+    [
+      '@sentry/react-native/expo',
+      {
+        organization: 'my-org',
+        project:      'my-app',
+        // ソースマップは EAS Build 時に自動アップロードされる
+      },
+    ],
+  ],
+};
+```
+
+🔴 **MUST**: 本番リリースではソースマップを必ずアップロードする（難読化されたスタックトレースは読めない）  
+🔴 **MUST**: `SENTRY_AUTH_TOKEN` を Git に含めない。EAS Secret で管理する
+
+---
+
+## 10. アラート設定方針
+
+06_Operations の「監視・アラート方針」と対応する Sentry 設定を定義する。
+
+<table>
+  <thead>
+    <tr>
+      <th>条件</th>
+      <th>Sentry アラートルール</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>クラッシュ率が前日比 2 倍</td>
+      <td>Issue Alerts → <code>event.count()</code> 増加率</td>
+    </tr>
+    <tr>
+      <td>新規エラーが発生</td>
+      <td>Issue Alerts → New Issue</td>
+    </tr>
+    <tr>
+      <td>特定エラー件数が閾値超過</td>
+      <td>Metric Alerts → Error Count &gt; N</td>
+    </tr>
+    <tr>
+      <td>API エラー率が 1% 超</td>
+      <td>Performance Alerts → Transaction failure rate</td>
+    </tr>
+  </tbody>
+</table>
+
+```
+Sentry → Alerts → Create Alert Rule
+  → タイプ: Issue Alert
+  → 条件: "A new issue is created"
+  → アクション: Send a notification to [Slack channel]
+```
+
+🟡 **SHOULD**: 新規 Issue は必ず Slack または GitLab Issue に通知する  
+🟡 **SHOULD**: ノイズを減らすため `handled: false`（未処理例外）のみをアラート対象にする
+
+---
+
+## 11. テスト実装規約
+
+```ts
+// src/lib/__tests__/logger.test.ts
+jest.mock('@sentry/react-native');
+import * as Sentry from '@sentry/react-native';
+import { logger }  from '@/lib/logger';
+
+describe('logger', () => {
+  test('error は Sentry.captureMessage を呼ぶ', () => {
+    logger.error('テストエラー', { key: 'value' });
+    expect(Sentry.captureMessage).toHaveBeenCalledWith(
+      'テストエラー',
+      expect.objectContaining({ level: 'error' }),
+    );
+  });
+
+  test('PII フィールドがマスクされる', () => {
+    const event = sanitizeEvent({
+      request: {
+        data: { email: 'user@example.com', amount: 1000 },
+        headers: { Authorization: 'Bearer token123' },
+      },
+    } as Sentry.Event);
+
+    expect(event?.request?.data).toEqual({
+      email: '[Filtered]',
+      amount: 1000,
+    });
+    expect(event?.request?.headers?.Authorization).toBeUndefined();
+  });
+});
+```
+
+🔴 **MUST**: `sanitizeEvent` のテストに PII フィールドが全件マスクされることを確認するテストを含める
+
+---
+
+## 12. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>リスク / 結果</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>beforeSend</code> 未設定</td>
+      <td>PII が Sentry に送信される</td>
+      <td>初期化時に必ず設定する</td>
+    </tr>
+    <tr>
+      <td><code>Authorization</code> ヘッダが残る</td>
+      <td>アクセストークンが Sentry に保存される</td>
+      <td><code>sanitizeEvent</code> で削除する</td>
+    </tr>
+    <tr>
+      <td><code>logger.error</code> が全エラーを送る</td>
+      <td>4xx エラーまで Sentry に積まれてノイズになる</td>
+      <td>5xx / NetworkError のみ <code>capture</code> する</td>
+    </tr>
+    <tr>
+      <td>ソースマップ未アップロード</td>
+      <td>スタックトレースが難読化されたまま</td>
+      <td>EAS Build の Sentry plugin を設定する</td>
+    </tr>
+    <tr>
+      <td><code>SENTRY_AUTH_TOKEN</code> を .env にコミット</td>
+      <td>トークン漏洩</td>
+      <td>EAS Secret で管理する</td>
+    </tr>
+    <tr>
+      <td><code>tracesSampleRate: 1.0</code> を本番で使う</td>
+      <td>Sentry の quota を大量消費</td>
+      <td>本番は 0.1（10%）以下にする</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 13. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

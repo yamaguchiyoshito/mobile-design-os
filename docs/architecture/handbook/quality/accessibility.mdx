@@ -1,0 +1,997 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Quality/Accessibility" />
+
+# アクセシビリティコーディング規約
+
+> **ステータス**: `APPROVED`  
+> **対象**: React Native mobile（Expo）アプリの全コンポーネント・画面実装
+
+---
+
+## 1. 方針と優先度
+
+### なぜ規約化するか
+
+React Native の accessibility API は Web の ARIA とは別体系であり、
+iOS VoiceOver と Android TalkBack で挙動差がある。
+「動いているように見える」実装が支援技術では完全に無音になるケースが頻発する。
+本規約はその落とし穴を事前に潰す。
+
+### 準拠基準
+
+<table>
+  <thead>
+    <tr>
+      <th>基準</th>
+      <th>適用範囲</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>WCAG 2.1 AA</strong></td>
+      <td>コントラスト比・操作性・テキスト代替の判定基準</td>
+    </tr>
+    <tr>
+      <td><strong>iOS HIG Accessibility</strong></td>
+      <td>VoiceOver・Dynamic Type・Switch Control</td>
+    </tr>
+    <tr>
+      <td><strong>Android Accessibility Guidelines</strong></td>
+      <td>TalkBack・Font Size・Switch Access</td>
+    </tr>
+    <tr>
+      <td><strong>APPT Foundation checklists</strong></td>
+      <td>実機テスト項目のベースライン</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 2. Props リファレンス
+
+### 必須 Props の全体マップ
+
+```
+インタラクティブ要素（Pressable / Button / TextInput / ...）
+  ├─ accessibilityLabel    ← 読み上げテキスト（MUST）
+  ├─ accessibilityRole     ← 要素の種別（MUST）
+  ├─ accessibilityHint     ← 操作結果の説明（SHOULD）
+  ├─ accessibilityState    ← disabled / checked / selected 等（MUST if applicable）
+  └─ testID                ← E2E / RNTL セレクタ（MUST）
+
+表示専用・意味のある要素
+  ├─ accessibilityLabel    ← 代替テキスト（MUST if image/icon）
+  └─ accessible={false}    ← 装飾要素は除外（MUST）
+
+コンテナ
+  └─ accessibilityViewIsModal  ← モーダル時（MUST if modal）
+```
+
+---
+
+## 3. accessibilityLabel
+
+### 原則
+
+🔴 **MUST**: すべてのインタラクティブ要素に `accessibilityLabel` を付与する  
+🔴 **MUST**: ラベルは **動詞＋目的語** または **名詞** で書く。「ボタン」等の役割語を含めない（role が読まれるため）  
+🔴 **MUST**: アイコンのみの要素（ラベルなし）には必ず付与する  
+🟡 **SHOULD**: ラベルは 40 文字以内に収める（長すぎると UX が低下する）
+
+```tsx
+// ❌ 禁止 — 役割語の重複
+<Pressable accessibilityLabel="送信ボタン">
+
+// ❌ 禁止 — 意味のないラベル
+<Pressable accessibilityLabel="タップしてください">
+
+// ✅ 正解 — 動詞＋目的語
+<Pressable accessibilityLabel="注文を確定する">
+
+// ✅ 正解 — アイコンボタン
+<Pressable accessibilityLabel="メニューを開く">
+  <Icon name="menu" />
+</Pressable>
+
+// ✅ 正解 — 文脈を含む（リスト内の削除ボタン等）
+<Pressable accessibilityLabel={`${item.name}を削除する`}>
+  <Icon name="trash" />
+</Pressable>
+```
+
+### 画像・イラスト
+
+```tsx
+// ✅ 意味のある画像
+<Image
+  source={...}
+  accessibilityLabel="注文確認書のプレビュー"
+  accessible={true}
+/>
+
+// ✅ 装飾画像（読み上げ不要）
+<Image
+  source={...}
+  accessible={false}
+/>
+```
+
+---
+
+## 4. accessibilityRole
+
+🔴 **MUST**: すべてのインタラクティブ要素に `accessibilityRole` を指定する
+
+<table>
+  <thead>
+    <tr>
+      <th>Role</th>
+      <th>使用場面</th>
+      <th>VoiceOver 読み上げ例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>&quot;button&quot;</code></td>
+      <td>タップで処理を実行する要素</td>
+      <td>「ボタン」</td>
+    </tr>
+    <tr>
+      <td><code>&quot;link&quot;</code></td>
+      <td>画面遷移・外部 URL 遷移</td>
+      <td>「リンク」</td>
+    </tr>
+    <tr>
+      <td><code>&quot;checkbox&quot;</code></td>
+      <td>ON/OFF の切り替え</td>
+      <td>「チェックボックス」</td>
+    </tr>
+    <tr>
+      <td><code>&quot;radio&quot;</code></td>
+      <td>複数選択肢から 1 つ選ぶ</td>
+      <td>「ラジオボタン」</td>
+    </tr>
+    <tr>
+      <td><code>&quot;switch&quot;</code></td>
+      <td>トグルスイッチ</td>
+      <td>「スイッチ」</td>
+    </tr>
+    <tr>
+      <td><code>&quot;tab&quot;</code></td>
+      <td>タブ切り替え</td>
+      <td>「タブ」</td>
+    </tr>
+    <tr>
+      <td><code>&quot;header&quot;</code></td>
+      <td>セクション見出し</td>
+      <td>「見出し」</td>
+    </tr>
+    <tr>
+      <td><code>&quot;image&quot;</code></td>
+      <td>意味のある画像</td>
+      <td>「画像」</td>
+    </tr>
+    <tr>
+      <td><code>&quot;text&quot;</code></td>
+      <td>通常テキスト（デフォルト）</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td><code>&quot;none&quot;</code></td>
+      <td>装飾要素</td>
+      <td>読み上げスキップ</td>
+    </tr>
+  </tbody>
+</table>
+
+```tsx
+// ✅ 正解例
+<Pressable
+  accessibilityRole="button"
+  accessibilityLabel="カートに追加する"
+  onPress={handleAddToCart}
+>
+  <Text>カートに追加</Text>
+</Pressable>
+
+<TouchableOpacity
+  accessibilityRole="link"
+  accessibilityLabel="利用規約を読む"
+  onPress={() => Linking.openURL(TERMS_URL)}
+>
+  <Text>利用規約</Text>
+</TouchableOpacity>
+```
+
+---
+
+## 5. accessibilityState
+
+🔴 **MUST**: 状態が変化する要素には `accessibilityState` で現在状態を伝える
+
+```tsx
+// ✅ disabled
+<Pressable
+  accessibilityRole="button"
+  accessibilityLabel="送信する"
+  accessibilityState={{ disabled: isSubmitting }}
+  disabled={isSubmitting}
+>
+
+// ✅ checked（チェックボックス）
+<Pressable
+  accessibilityRole="checkbox"
+  accessibilityLabel="利用規約に同意する"
+  accessibilityState={{ checked: isAgreed }}
+  onPress={() => setIsAgreed(!isAgreed)}
+>
+
+// ✅ selected（タブ・セグメント）
+<Pressable
+  accessibilityRole="tab"
+  accessibilityLabel="概要"
+  accessibilityState={{ selected: activeTab === 'overview' }}
+  onPress={() => setActiveTab('overview')}
+>
+
+// ✅ expanded（アコーディオン）
+<Pressable
+  accessibilityRole="button"
+  accessibilityLabel="詳細を表示"
+  accessibilityState={{ expanded: isOpen }}
+  onPress={() => setIsOpen(!isOpen)}
+>
+
+// ✅ busy（ローディング中）
+<View
+  accessibilityRole="progressbar"
+  accessibilityLabel="読み込み中"
+  accessibilityState={{ busy: isLoading }}
+>
+```
+
+---
+
+## 6. accessibilityHint
+
+🟡 **SHOULD**: label だけでは操作結果が不明な場合に付与する  
+🟡 **SHOULD**: 「〜します」「〜されます」という体言止め＋助詞の形で書く
+
+```tsx
+// ✅ 操作結果が label から自明でない場合に有効
+<Pressable
+  accessibilityRole="button"
+  accessibilityLabel="お気に入り"
+  accessibilityHint="タップするとお気に入りリストに追加されます"
+>
+
+// ❌ label で明確な場合は不要（重複になる）
+<Pressable
+  accessibilityRole="button"
+  accessibilityLabel="注文を確定する"
+  accessibilityHint="注文を確定します"  // 冗長
+>
+```
+
+---
+
+## 7. グループ化（accessible grouping）
+
+複数要素をひとつのフォーカス単位にまとめることで操作ステップを減らす。
+
+```tsx
+// ❌ 個別にフォーカスされる（ノイズが多い）
+<View>
+  <Text>商品名</Text>
+  <Text>コーヒーミルク</Text>
+  <Text>価格</Text>
+  <Text>¥450</Text>
+</View>
+
+// ✅ ひとつのグループとして読み上げ
+<View
+  accessible={true}
+  accessibilityLabel="コーヒーミルク、¥450"
+>
+  <Text>商品名</Text>
+  <Text>コーヒーミルク</Text>
+  <Text>価格</Text>
+  <Text>¥450</Text>
+</View>
+```
+
+### リスト内のカード
+
+```tsx
+// ✅ カード全体をひとつのボタンとして扱う
+export function OrderCard({ order }: { order: Order }) {
+  return (
+    <Pressable
+      accessible={true}
+      accessibilityRole="button"
+      accessibilityLabel={`注文番号 ${order.id}、${order.date}、${formatPrice(order.total, 'JPY')}`}
+      accessibilityHint="タップすると注文詳細を表示します"
+      onPress={() => router.push(`/order/${order.id}`)}
+    >
+      {/* 内部要素は個別フォーカスさせない */}
+      <View accessible={false}>
+        <Text>{order.id}</Text>
+        <Text>{order.date}</Text>
+        <Text>{formatPrice(order.total, 'JPY')}</Text>
+      </View>
+    </Pressable>
+  );
+}
+```
+
+🔴 **MUST**: カード / リストアイテム内の子要素が個別に読み上げられないよう `accessible={false}` を付ける  
+🟡 **SHOULD**: グループのラベルは「最重要情報 → 補足情報」の順で構成する
+
+---
+
+## 8. フォーカス管理
+
+### モーダル・ボトムシート
+
+```tsx
+import { AccessibilityInfo, findNodeHandle } from 'react-native';
+
+export function Modal({ visible, onClose, children }: ModalProps) {
+  const firstFocusableRef = useRef<View>(null);
+
+  useEffect(() => {
+    if (visible) {
+      // モーダル表示時に最初の要素へフォーカスを移動
+      const node = findNodeHandle(firstFocusableRef.current);
+      if (node) AccessibilityInfo.setAccessibilityFocus(node);
+    }
+  }, [visible]);
+
+  return (
+    <RNModal
+      visible={visible}
+      accessibilityViewIsModal={true}   // 背景をフォーカス対象外にする
+    >
+      <View ref={firstFocusableRef}>
+        {children}
+      </View>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="閉じる"
+        onPress={onClose}
+      />
+    </RNModal>
+  );
+}
+```
+
+🔴 **MUST**: モーダル表示時に `accessibilityViewIsModal={true}` を設定する  
+🔴 **MUST**: モーダル表示時にフォーカスをモーダル内の最初の要素へ移動する  
+🟡 **SHOULD**: モーダルを閉じた後は、モーダルを開いたトリガー要素にフォーカスを戻す
+
+### ページ遷移後のフォーカス
+
+```tsx
+// 新しい Screen の最上部にある見出しへフォーカスを移動する
+export default function SearchResultScreen() {
+  const headingRef = useRef<Text>(null);
+
+  useFocusEffect(() => {
+    const node = findNodeHandle(headingRef.current);
+    if (node) AccessibilityInfo.setAccessibilityFocus(node);
+  });
+
+  return (
+    <View>
+      <Text
+        ref={headingRef}
+        accessibilityRole="header"
+      >
+        検索結果
+      </Text>
+      {/* ... */}
+    </View>
+  );
+}
+```
+
+---
+
+## 9. ライブリージョン（動的コンテンツ）
+
+画面上でコンテンツが動的に変化する場合、支援技術に通知する。
+
+```tsx
+// ✅ 件数が変化するバッジ
+<View
+  accessibilityLiveRegion="polite"
+  accessibilityLabel={`カートに ${cartCount} 点`}
+>
+  <Text>{cartCount}</Text>
+</View>
+
+// ✅ エラーメッセージの表示
+<View
+  accessibilityLiveRegion="assertive"   // 緊急度が高い場合
+  accessibilityLabel={errorMessage ?? undefined}
+>
+  {errorMessage && <Text>{errorMessage}</Text>}
+</View>
+
+// ✅ ローディング完了通知
+<View
+  accessibilityLiveRegion="polite"
+  accessibilityLabel={isLoading ? '読み込み中' : `${results.length}件の結果が見つかりました`}
+>
+```
+
+<table>
+  <thead>
+    <tr>
+      <th>値</th>
+      <th>挙動</th>
+      <th>使用場面</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>&quot;polite&quot;</code></td>
+      <td>現在の読み上げが終わってから通知</td>
+      <td>件数変化・完了通知</td>
+    </tr>
+    <tr>
+      <td><code>&quot;assertive&quot;</code></td>
+      <td>現在の読み上げを中断して即通知</td>
+      <td>エラーメッセージ</td>
+    </tr>
+    <tr>
+      <td><code>&quot;none&quot;</code></td>
+      <td>通知しない（デフォルト）</td>
+      <td>装飾的な変化</td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: エラーメッセージは `"assertive"`、それ以外の更新は `"polite"` を使う
+
+---
+
+## 10. タッチターゲットサイズ
+
+🔴 **MUST**: タッチターゲットは最小 **44×44pt**（iOS HIG 基準）を確保する  
+🟡 **SHOULD**: 重要なボタンは 48×48pt 以上を目標にする
+
+```tsx
+// ❌ アイコンがそのままだと小さすぎる（例: 24×24pt）
+<Pressable onPress={handleClose}>
+  <Icon name="close" size={24} />
+</Pressable>
+
+// ✅ hitSlop で当たり判定を拡大
+<Pressable
+  onPress={handleClose}
+  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+  accessibilityRole="button"
+  accessibilityLabel="閉じる"
+>
+  <Icon name="close" size={24} />
+</Pressable>
+
+// ✅ または minWidth / minHeight で保証
+const styles = StyleSheet.create({
+  iconButton: {
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+});
+```
+
+### Design System での統一
+
+```tsx
+// components/ui/IconButton/IconButton.tsx
+export const IconButton: React.FC<IconButtonProps> = ({ icon, onPress, label }) => (
+  <Pressable
+    className="min-w-[44px] min-h-[44px] items-center justify-center"
+    accessibilityRole="button"
+    accessibilityLabel={label}
+    onPress={onPress}
+    testID={`icon-button-${label}`}
+  >
+    {icon}
+  </Pressable>
+);
+```
+
+🔴 **MUST**: `IconButton` は Design System のものを使い、個別 `Pressable` でアイコンをラップしない
+
+---
+
+## 11. Dynamic Type（文字サイズ対応）
+
+🔴 **MUST**: システムフォントサイズ設定に追従する（`allowFontScaling` を `false` にしない）  
+🔴 **MUST**: 最大フォントサイズ（Accessibility Extra Extra Extra Large）でレイアウトが崩れないことを確認する
+
+```tsx
+// ❌ 禁止 — フォントスケーリングを無効化
+<Text allowFontScaling={false}>注文を確定する</Text>
+
+// ✅ 正解 — デフォルト（allowFontScaling={true}）のままにする
+<Text>注文を確定する</Text>
+
+// ✅ 最大倍率に上限を設ける（レイアウト保護が必要な場合のみ）
+<Text maxFontSizeMultiplier={2.0}>注文を確定する</Text>
+```
+
+### NativeWind でのスケール対応
+
+```tsx
+// ✅ 固定 px ではなく rem ベース（NativeWind の rem はシステムフォントサイズに追従）
+<Text className="text-body-md">説明文</Text>
+
+// ❌ 固定サイズの直書き（スケールしない）
+<Text style={{ fontSize: 16 }}>説明文</Text>
+```
+
+### Dynamic Type テスト項目
+
+<table>
+  <thead>
+    <tr>
+      <th>チェック項目</th>
+      <th>確認方法</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>テキストが切れない</td>
+      <td>設定 &gt; アクセシビリティ &gt; 文字サイズを最大にして確認</td>
+    </tr>
+    <tr>
+      <td>行が重ならない</td>
+      <td>同上</td>
+    </tr>
+    <tr>
+      <td>ボタンラベルが収まる</td>
+      <td>同上（<code>numberOfLines=&#123;1&#125;</code> は注意）</td>
+    </tr>
+    <tr>
+      <td>スクロールで補完可能</td>
+      <td>固定高さコンテナ内を ScrollView で代替</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 12. カラーコントラスト
+
+🔴 **MUST**: テキストと背景のコントラスト比は **WCAG 2.1 AA** 以上を満たす
+
+<table>
+  <thead>
+    <tr>
+      <th>テキストサイズ</th>
+      <th>最低コントラスト比</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>通常テキスト（18pt 未満）</td>
+      <td><strong>4.5:1</strong></td>
+    </tr>
+    <tr>
+      <td>大きいテキスト（18pt 以上 / Bold 14pt 以上）</td>
+      <td><strong>3:1</strong></td>
+    </tr>
+    <tr>
+      <td>UI コンポーネントの境界線・アイコン</td>
+      <td><strong>3:1</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+```tsx
+// Figma Variables でコントラスト比をトークン設計時に保証する
+// token.json 内のカラーペアを Figma Accessibility Plugin で検証すること
+
+// ✅ トークンで保証されたペア
+<Text className="text-content-primary">    // #1A1A1A on #FFFFFF → 19.0:1 ✅
+<Text className="text-content-secondary">  // #6B6B6B on #FFFFFF →  5.9:1 ✅
+<Text className="text-content-disabled">   // #BDBDBD on #FFFFFF →  1.6:1 — 操作不能要素のみ許容
+```
+
+🟡 **SHOULD**: Figma で新しいカラーペアを作成するたびに Figma Accessibility Plugin でコントラスト比を確認する  
+🔴 **MUST**: カラーのみで状態（エラー・成功等）を伝えない。テキスト・アイコンを必ず併用する
+
+```tsx
+// ❌ 禁止 — 赤色のみでエラーを示す
+<TextInput style={{ borderColor: 'red' }} />
+
+// ✅ 正解 — 色 + テキスト + アイコン
+<View>
+  <TextInput
+    className="border-danger-border"
+    accessibilityState={{ invalid: !!error }}
+  />
+  {error && (
+    <View className="flex-row items-center gap-1">
+      <Icon name="alert-circle" className="text-danger" />
+      <Text className="text-danger text-body-sm">{error}</Text>
+    </View>
+  )}
+</View>
+```
+
+---
+
+## 13. フォーム・入力のアクセシビリティ
+
+```tsx
+export function EmailField({ control, error }: FieldProps) {
+  const errorId = useId();
+
+  return (
+    <View>
+      {/* Label と Input の関連付け */}
+      <Text
+        nativeID={`label-${errorId}`}
+        className="text-body-sm text-content-primary mb-1"
+      >
+        メールアドレス
+      </Text>
+
+      <TextInput
+        accessibilityLabel="メールアドレス"
+        accessibilityLabelledBy={`label-${errorId}`}
+        accessibilityErrorMessage={error}
+        accessibilityState={{ invalid: !!error }}
+        keyboardType="email-address"
+        autoCapitalize="none"
+        autoComplete="email"
+        returnKeyType="next"
+        className={`border rounded-lg px-3 py-2 ${
+          error ? 'border-danger-border' : 'border-border-default'
+        }`}
+      />
+
+      {/* エラーはライブリージョンで通知 */}
+      <View accessibilityLiveRegion="assertive">
+        {error && (
+          <Text
+            className="text-body-sm text-danger mt-1"
+            accessibilityRole="alert"
+          >
+            {error}
+          </Text>
+        )}
+      </View>
+    </View>
+  );
+}
+```
+
+🔴 **MUST**: TextInput に `accessibilityLabel` を付与する（placeholder だけでは不十分）  
+🔴 **MUST**: エラーメッセージを `accessibilityLiveRegion="assertive"` で通知する  
+🟡 **SHOULD**: `keyboardType` / `autoComplete` / `returnKeyType` を正しく設定する（スクリーンリーダーが読み上げる）
+
+---
+
+## 14. プラットフォーム差分の吸収
+
+iOS と Android でアクセシビリティ挙動が異なるケースを Design System 内で統一する。
+
+```tsx
+import { Platform } from 'react-native';
+
+// ✅ プラットフォーム差分を Component 内に閉じ込める
+export const Switch: React.FC<SwitchProps> = ({ value, label, onChange }) => (
+  <Pressable
+    accessibilityRole="switch"
+    accessibilityLabel={label}
+    accessibilityState={{ checked: value }}
+    // Android は accessibilityActions で toggle を明示する
+    accessibilityActions={
+      Platform.OS === 'android'
+        ? [{ name: 'activate', label: 'オン/オフを切り替える' }]
+        : undefined
+    }
+    onAccessibilityAction={(event) => {
+      if (event.nativeEvent.actionName === 'activate') onChange(!value);
+    }}
+    onPress={() => onChange(!value)}
+  >
+    <RNSwitch value={value} onValueChange={onChange} />
+  </Pressable>
+);
+```
+
+### 主なプラットフォーム差分
+
+<table>
+  <thead>
+    <tr>
+      <th>機能</th>
+      <th>iOS VoiceOver</th>
+      <th>Android TalkBack</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>ジェスチャ操作</td>
+      <td>スワイプで移動、ダブルタップで選択</td>
+      <td>スワイプで移動、ダブルタップで選択</td>
+    </tr>
+    <tr>
+      <td><code>accessibilityActions</code></td>
+      <td>限定的サポート</td>
+      <td>積極的に活用する</td>
+    </tr>
+    <tr>
+      <td><code>accessibilityViewIsModal</code></td>
+      <td>✅ 動作する</td>
+      <td>✅ 動作する</td>
+    </tr>
+    <tr>
+      <td>フォーカスの自動移動</td>
+      <td><code>setAccessibilityFocus</code> で制御</td>
+      <td>同左</td>
+    </tr>
+    <tr>
+      <td>ライブリージョン</td>
+      <td><code>assertive</code> / <code>polite</code></td>
+      <td>同左</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 15. スクリーンリーダー検知
+
+スクリーンリーダーが有効かどうかで UX を分岐させる必要がある場合。
+
+```tsx
+import { AccessibilityInfo } from 'react-native';
+
+export function useScreenReader() {
+  const [isEnabled, setIsEnabled] = useState(false);
+
+  useEffect(() => {
+    AccessibilityInfo.isScreenReaderEnabled().then(setIsEnabled);
+
+    const subscription = AccessibilityInfo.addEventListener(
+      'screenReaderChanged',
+      setIsEnabled,
+    );
+    return () => subscription.remove();
+  }, []);
+
+  return isEnabled;
+}
+
+// 使用例：アニメーションを無効化する
+export function AnimatedBanner() {
+  const isScreenReaderEnabled = useScreenReader();
+
+  return (
+    <Animated.View
+      style={isScreenReaderEnabled ? undefined : animatedStyle}
+    >
+      {/* ... */}
+    </Animated.View>
+  );
+}
+```
+
+🟡 **SHOULD**: `useReducedMotion`（`AccessibilityInfo.isReduceMotionEnabled`）で動きを抑制する
+
+```tsx
+export function useReducedMotion() {
+  const [reduceMotion, setReduceMotion] = useState(false);
+
+  useEffect(() => {
+    AccessibilityInfo.isReduceMotionEnabled().then(setReduceMotion);
+    const sub = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduceMotion);
+    return () => sub.remove();
+  }, []);
+
+  return reduceMotion;
+}
+```
+
+---
+
+## 16. テスト実装規約
+
+### addon-a11y（web Storybook）
+
+```tsx
+// ✅ Story レベルで a11y ルールを設定する
+export const Primary: Story = {
+  args: { label: '確認する', variant: 'primary' },
+  parameters: {
+    a11y: {
+      // 特定ルールを Story 単位で調整する（乱用禁止）
+      config: {
+        rules: [
+          { id: 'color-contrast', enabled: true },
+        ],
+      },
+    },
+  },
+};
+```
+
+🔴 **MUST**: `addon-a11y` の violations が 0 でなければ PR マージ不可
+
+### RNTL での a11y テスト
+
+```tsx
+// ✅ アクセシビリティツリーの検証
+test('送信ボタンが disabled 時に正しい状態を持つ', () => {
+  const { getByRole } = render(<SubmitButton disabled />);
+
+  const button = getByRole('button', { name: '送信する' });
+
+  expect(button).toHaveAccessibilityState({ disabled: true });
+  expect(button).not.toHaveAccessibilityState({ busy: true });
+});
+
+// ✅ エラーメッセージの読み上げ検証
+test('バリデーションエラーが accessibilityLiveRegion で通知される', async () => {
+  const { getByRole, findByRole } = render(<EmailField />);
+
+  fireEvent.changeText(getByRole('textbox', { name: 'メールアドレス' }), 'invalid');
+  fireEvent(getByRole('button', { name: '送信する' }), 'press');
+
+  const alert = await findByRole('alert');
+  expect(alert).toBeTruthy();
+});
+```
+
+### 実機 A11y テストチェックリスト
+
+PR レビュー前に下記を実機で確認する。
+
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>チェック項目</th>
+      <th>iOS</th>
+      <th>Android</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>すべてのインタラクティブ要素がフォーカス可能</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>フォーカス順序が画面の論理的順序と一致する</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>モーダル表示時に背景がフォーカスされない</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>アイコンのみのボタンが正しく読み上げられる</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>エラーメッセージが表示時に即座に読み上げられる</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>最大フォントサイズでレイアウトが崩れない</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>タッチターゲットが 44pt 以上ある</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>カラーのみで情報を伝えていない</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 17. よくある違反パターン集
+
+<table>
+  <thead>
+    <tr>
+      <th>パターン</th>
+      <th>問題</th>
+      <th>修正方法</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>&lt;Text onPress=&#123;...&#125;&gt;</code></td>
+      <td><code>accessibilityRole</code> なし。スクリーンリーダーにボタンと認識されない</td>
+      <td><code>&lt;Pressable accessibilityRole=&quot;button&quot;&gt;</code> に変更</td>
+    </tr>
+    <tr>
+      <td><code>&lt;Image source=&#123;...&#125; /&gt;</code> のみ</td>
+      <td>代替テキストなし</td>
+      <td><code>accessible=&#123;true&#125;</code> + <code>accessibilityLabel</code> を付与</td>
+    </tr>
+    <tr>
+      <td><code>allowFontScaling=&#123;false&#125;</code></td>
+      <td>文字サイズ設定に追従しない</td>
+      <td>削除。どうしても必要なら <code>maxFontSizeMultiplier</code></td>
+    </tr>
+    <tr>
+      <td>アイコンボタンに label なし</td>
+      <td>「ボタン」としか読み上げられない</td>
+      <td><code>accessibilityLabel</code> でアイコンの意味を説明</td>
+    </tr>
+    <tr>
+      <td>モーダルに <code>accessibilityViewIsModal</code> なし</td>
+      <td>背景コンテンツも読み上げられる</td>
+      <td><code>accessibilityViewIsModal=&#123;true&#125;</code> を設定</td>
+    </tr>
+    <tr>
+      <td>エラーを色のみで表示</td>
+      <td>色覚異常者に伝わらない</td>
+      <td>テキスト + アイコンを併用</td>
+    </tr>
+    <tr>
+      <td><code>disabled</code> prop のみ設定</td>
+      <td><code>accessibilityState=&#123;&#123; disabled &#125;&#125;</code> が抜けると状態が読まれない</td>
+      <td>必ずセットで設定</td>
+    </tr>
+    <tr>
+      <td>カード内子要素に <code>accessible</code> 設定なし</td>
+      <td>各子要素が個別にフォーカスされてノイズになる</td>
+      <td>子要素に <code>accessible=&#123;false&#125;</code> を設定</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 18. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

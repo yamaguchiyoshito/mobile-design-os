@@ -1,0 +1,408 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Platform/Feature Flags" />
+
+# フィーチャーフラグ・環境設定方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: 環境変数管理・フィーチャーフラグ・A/B テスト・段階リリース制御  
+> **依存**: 06_Operations（EAS 環境設定）
+
+---
+
+## 1. 方針
+
+### 環境変数とフィーチャーフラグの使い分け
+
+<table>
+  <thead>
+    <tr>
+      <th>種別</th>
+      <th>用途</th>
+      <th>変更タイミング</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>環境変数</strong>（<code>EXPO_PUBLIC_*</code>）</td>
+      <td>環境ごとに異なる設定値（API URL・DSN・プロジェクト ID）</td>
+      <td>ビルド時に固定</td>
+    </tr>
+    <tr>
+      <td><strong>静的フラグ</strong>（<code>EXPO_PUBLIC_FEATURE_*</code>）</td>
+      <td>ビルド単位で ON/OFF する機能</td>
+      <td>ビルド時に固定</td>
+    </tr>
+    <tr>
+      <td><strong>動的フラグ</strong>（サーバー配信）</td>
+      <td>リリース後に変更できる機能の開閉・A/B テスト</td>
+      <td>OTA または API で変更可能</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST**: API キー・秘密情報を `EXPO_PUBLIC_*` に設定しない（JS バンドルに含まれる）  
+🔴 **MUST**: 秘密情報は EAS Secret に登録し、ネイティブビルド時のみ参照する
+
+---
+
+## 2. 環境変数管理
+
+### ファイル構成
+
+```
+.env.development     ← ローカル開発（Git 管理外）
+.env.staging         ← Staging ビルド（Git 管理外）
+.env.production      ← 本番ビルド（Git 管理外）
+.env.example         ← 変数一覧（値なし。Git 管理内）
+.env.test            ← Jest テスト用（Git 管理内可。値はモック）
+```
+
+```bash
+# .env.example（Git 管理・値なし）
+EXPO_PUBLIC_API_BASE_URL=
+EXPO_PUBLIC_APP_ENV=
+EXPO_PUBLIC_SENTRY_DSN=
+EXPO_PUBLIC_FEATURE_NEW_CHECKOUT=
+EXPO_PUBLIC_FEATURE_RECOMMENDATIONS=
+```
+
+```bash
+# .env.development（Git 管理外・ローカル用）
+EXPO_PUBLIC_API_BASE_URL=https://api.dev.example.com
+EXPO_PUBLIC_APP_ENV=development
+EXPO_PUBLIC_SENTRY_DSN=
+EXPO_PUBLIC_FEATURE_NEW_CHECKOUT=true
+EXPO_PUBLIC_FEATURE_RECOMMENDATIONS=true
+```
+
+### Zod による型安全な環境変数
+
+```ts
+// src/lib/env.ts
+import { z } from 'zod';
+
+const envSchema = z.object({
+  EXPO_PUBLIC_API_BASE_URL: z.string().url(),
+  EXPO_PUBLIC_APP_ENV:      z.enum(['development', 'staging', 'production']),
+  EXPO_PUBLIC_SENTRY_DSN:   z.string().optional(),
+  EXPO_PUBLIC_APP_VERSION:  z.string().optional(),
+
+  // フィーチャーフラグ（文字列 "true" / "false"）
+  EXPO_PUBLIC_FEATURE_NEW_CHECKOUT:     z.string().optional(),
+  EXPO_PUBLIC_FEATURE_RECOMMENDATIONS:  z.string().optional(),
+});
+
+// アプリ起動時に検証
+const parsed = envSchema.safeParse(process.env);
+if (!parsed.success) {
+  console.error('Invalid environment variables:', parsed.error.format());
+  // 開発中は警告にとどめる。本番では起動失敗にする
+  if (process.env.EXPO_PUBLIC_APP_ENV === 'production') {
+    throw new Error('Missing required environment variables');
+  }
+}
+
+export const env = parsed.data ?? ({} as z.infer<typeof envSchema>);
+```
+
+🟡 **SHOULD**: 起動時に Zod で環境変数を検証し、必須値の欠落を早期発見する  
+🔴 **MUST NOT**: `process.env.EXPO_PUBLIC_*` を Feature / Screen に散在させる（`env` 経由のみ）
+
+---
+
+## 3. 静的フィーチャーフラグ
+
+ビルド時に決まるフラグ。環境ごとに ON/OFF を切り替える。
+
+```ts
+// src/lib/featureFlags.ts
+import { env } from '@/lib/env';
+
+// ─── フラグ定義 ───────────────────────────────────────────────────────────
+const FLAGS = {
+  newCheckout:     env.EXPO_PUBLIC_FEATURE_NEW_CHECKOUT     === 'true',
+  recommendations: env.EXPO_PUBLIC_FEATURE_RECOMMENDATIONS  === 'true',
+} as const;
+
+export type FeatureFlagKey = keyof typeof FLAGS;
+
+export function isFeatureEnabled(flag: FeatureFlagKey): boolean {
+  return FLAGS[flag];
+}
+
+// ─── React Hook ──────────────────────────────────────────────────────────
+export function useFeatureFlag(flag: FeatureFlagKey): boolean {
+  return FLAGS[flag];
+}
+```
+
+```tsx
+// Feature での使用
+export function CheckoutScreen() {
+  const useNewCheckout = useFeatureFlag('newCheckout');
+
+  return useNewCheckout ? <NewCheckoutFlow /> : <LegacyCheckoutFlow />;
+}
+```
+
+🟡 **SHOULD**: 静的フラグのデフォルト値は `false`（新機能はデフォルト OFF）  
+🟡 **SHOULD**: フラグが `false` の旧実装は削除予定のコードとして `// TODO: remove when newCheckout=true in all envs` とコメントする
+
+---
+
+## 4. 動的フィーチャーフラグ（サーバー配信）
+
+OTA 更新後に変更できる。A/B テスト・段階ロールアウトに使う。
+
+```ts
+// src/api/generated/schemas/featureFlagsSchema.ts（自動生成）
+export const featureFlagsSchema = z.object({
+  newRecommendations: z.boolean().default(false),
+  maxCartItems:       z.number().default(10),
+  promobannerText:    z.string().nullable().default(null),
+});
+
+export type FeatureFlags = z.infer<typeof featureFlagsSchema>;
+```
+
+```ts
+// src/features/config/hooks/useRemoteFlags.ts
+export function useRemoteFlags() {
+  return useQuery({
+    queryKey:  queryKeys.config.featureFlags(),
+    queryFn:   () => httpClient.get('/config/feature-flags', featureFlagsSchema),
+    staleTime: 1000 * 60 * 60,  // 1 時間キャッシュ
+    gcTime:    1000 * 60 * 60 * 24,
+    // フォールバック: ネットワーク失敗時はデフォルト値を使う
+    placeholderData: featureFlagsSchema.parse({}),
+  });
+}
+```
+
+```tsx
+// Feature での使用
+export function RecommendationSection() {
+  const { data: flags } = useRemoteFlags();
+
+  if (!flags?.newRecommendations) return null;
+
+  return <RecommendationList />;
+}
+```
+
+🟡 **SHOULD**: リモートフラグは常にデフォルト値（`z.default()`）を設定し、API エラー時に動作が壊れないようにする  
+🟡 **SHOULD**: リモートフラグの変更はサーバー側で記録し、変更理由と有効期間を管理する
+
+---
+
+## 5. A/B テストパターン
+
+```ts
+// src/lib/abTest.ts
+import { useAuthStore }    from '@/stores/authStore';
+import { useRemoteFlags }  from '@/features/config/hooks/useRemoteFlags';
+
+// ユーザー ID の末尾数字でコホートを決定（サーバー側と一致させる）
+export function getABVariant(
+  userId:   string,
+  flagName: string,
+  variants: string[],   // ['control', 'treatment'] 等
+): string {
+  const hash   = simpleHash(`${userId}:${flagName}`);
+  const index  = Math.abs(hash) % variants.length;
+  return variants[index];
+}
+
+function simpleHash(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash;
+}
+```
+
+```tsx
+// 使用例
+export function HomeScreen() {
+  const userId  = useAuthStore((s) => s.userId) ?? '';
+  const variant = getABVariant(userId, 'home_layout', ['grid', 'list']);
+
+  // A/B テストの実験結果を Sentry に記録する
+  useEffect(() => {
+    Sentry.setTag('ab_home_layout', variant);
+  }, [variant]);
+
+  return variant === 'grid' ? <GridHomeLayout /> : <ListHomeLayout />;
+}
+```
+
+---
+
+## 6. 段階リリース（ロールアウト）との統合
+
+OTA（EAS Update）の段階ロールアウトとフィーチャーフラグを組み合わせる。
+
+```bash
+# Step 1: 10% にまず配信
+eas update --branch production --rollout-percentage 10
+
+# Step 2: 問題なければ 50%、100% へ拡大
+eas update --branch production --rollout-percentage 50
+eas update --branch production --rollout-percentage 100
+```
+
+```ts
+// リモートフラグで新機能を段階的に開放する
+// → OTA の rollout が 10% でも、フラグを 100% ON にすれば
+//   OTA が当たったユーザー全員に新機能が開放される
+// → OTA は 100% でも、フラグを 10% にすればユーザーの 10% だけに開放できる
+```
+
+🟡 **SHOULD**: OTA ロールアウトとリモートフラグを独立した軸として使い分ける  
+🟡 **SHOULD**: クリティカルなフラグ変更は営業時間内（09:00〜17:00 JST）に実施する
+
+---
+
+## 7. 環境ごとの設定差分サマリ
+
+<table>
+  <thead>
+    <tr>
+      <th>変数</th>
+      <th>development</th>
+      <th>staging</th>
+      <th>production</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>EXPO_PUBLIC_APP_ENV</code></td>
+      <td><code>development</code></td>
+      <td><code>staging</code></td>
+      <td><code>production</code></td>
+    </tr>
+    <tr>
+      <td><code>EXPO_PUBLIC_API_BASE_URL</code></td>
+      <td><code>https://api.dev.example.com</code></td>
+      <td><code>https://api.staging.example.com</code></td>
+      <td><code>https://api.example.com</code></td>
+    </tr>
+    <tr>
+      <td><code>EXPO_PUBLIC_SENTRY_DSN</code></td>
+      <td>（空）</td>
+      <td>設定</td>
+      <td>設定</td>
+    </tr>
+    <tr>
+      <td><code>EXPO_PUBLIC_FEATURE_NEW_CHECKOUT</code></td>
+      <td><code>true</code></td>
+      <td><code>true</code></td>
+      <td><code>false</code>（段階的に <code>true</code> へ）</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 8. テスト実装規約
+
+```ts
+// src/lib/__tests__/featureFlags.test.ts
+
+describe('isFeatureEnabled', () => {
+  test('フラグが true のとき true を返す', () => {
+    jest.resetModules();
+    process.env.EXPO_PUBLIC_FEATURE_NEW_CHECKOUT = 'true';
+    const { isFeatureEnabled } = require('@/lib/featureFlags');
+    expect(isFeatureEnabled('newCheckout')).toBe(true);
+  });
+
+  test('フラグが未設定のとき false を返す', () => {
+    jest.resetModules();
+    delete process.env.EXPO_PUBLIC_FEATURE_NEW_CHECKOUT;
+    const { isFeatureEnabled } = require('@/lib/featureFlags');
+    expect(isFeatureEnabled('newCheckout')).toBe(false);
+  });
+});
+
+describe('getABVariant', () => {
+  test('同じ userId と flagName では常に同じ variant を返す', () => {
+    const v1 = getABVariant('user-123', 'home_layout', ['grid', 'list']);
+    const v2 = getABVariant('user-123', 'home_layout', ['grid', 'list']);
+    expect(v1).toBe(v2);
+  });
+
+  test('variants の外の値を返さない', () => {
+    const variants = ['control', 'treatment'];
+    for (let i = 0; i < 100; i++) {
+      const v = getABVariant(`user-${i}`, 'test', variants);
+      expect(variants).toContain(v);
+    }
+  });
+});
+```
+
+---
+
+## 9. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>リスク / 結果</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>process.env.EXPO_PUBLIC_*</code> を Feature に散在させる</td>
+      <td>変更時に全ファイルを修正する</td>
+      <td><code>env</code> / <code>featureFlags</code> 経由のみ</td>
+    </tr>
+    <tr>
+      <td>API キーを <code>EXPO_PUBLIC_</code> に設定する</td>
+      <td>JS バンドルに含まれ第三者が取得できる</td>
+      <td><code>EXPO_PUBLIC_</code> なし変数は EAS Secret で管理</td>
+    </tr>
+    <tr>
+      <td>リモートフラグに <code>z.default()</code> を設定しない</td>
+      <td>API エラー時に機能が壊れる</td>
+      <td>全フラグにデフォルト値を設定</td>
+    </tr>
+    <tr>
+      <td>フラグ分岐の旧コードを放置する</td>
+      <td>技術的負債が積まれる</td>
+      <td>フラグを全環境で <code>true</code> にした後に旧実装を削除する</td>
+    </tr>
+    <tr>
+      <td><code>.env</code> をGitにコミットする</td>
+      <td>秘密情報が漏洩する</td>
+      <td><code>.gitignore</code> に全 <code>.env.*</code>（<code>.example</code> 以外）を追加</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 10. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

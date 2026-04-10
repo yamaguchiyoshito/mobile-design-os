@@ -1,0 +1,324 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Foundation/Principles" />
+
+# アーキテクチャ全体方針
+
+> **ステータス**: `APPROVED`  
+> **対象**: React Native mobile（Expo）アプリ全域
+
+---
+
+## 1. 技術スタック全体像
+
+### 採用技術一覧
+
+<table>
+  <thead>
+    <tr>
+      <th>レイヤー</th>
+      <th>技術</th>
+      <th>バージョン</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>フレームワーク</td>
+      <td>Expo</td>
+      <td>latest stable</td>
+      <td>Android/iOS 基盤・Dev Build・OTA・EAS 連携</td>
+    </tr>
+    <tr>
+      <td>ルーティング</td>
+      <td>Expo Router</td>
+      <td>latest stable</td>
+      <td>file-based navigation / deep linking / layout 構成</td>
+    </tr>
+    <tr>
+      <td>言語</td>
+      <td>TypeScript</td>
+      <td>^5.5+</td>
+      <td>型安全・契約整合</td>
+    </tr>
+    <tr>
+      <td>UI ライブラリ</td>
+      <td>React Native</td>
+      <td>Expo SDK 準拠</td>
+      <td>ネイティブ UI レンダリング基盤</td>
+    </tr>
+    <tr>
+      <td>デザインツール</td>
+      <td>Figma</td>
+      <td>latest</td>
+      <td>UI デザイン / Variables 定義 / 仕様管理</td>
+    </tr>
+    <tr>
+      <td>スタイリング</td>
+      <td>NativeWind</td>
+      <td>latest stable</td>
+      <td>Tailwind ライクなユーティリティ設計</td>
+    </tr>
+    <tr>
+      <td>UI コンポーネント</td>
+      <td>自前 Design System</td>
+      <td>—</td>
+      <td>React Native primitives をラップした業務 UI 部品群</td>
+    </tr>
+    <tr>
+      <td>アニメーション</td>
+      <td>react-native-reanimated</td>
+      <td>Expo SDK 準拠</td>
+      <td>60fps アニメーション / gesture 連携</td>
+    </tr>
+    <tr>
+      <td>ジェスチャ</td>
+      <td>react-native-gesture-handler</td>
+      <td>Expo SDK 準拠</td>
+      <td>ネイティブジェスチャ制御</td>
+    </tr>
+    <tr>
+      <td>サーバ状態</td>
+      <td>@tanstack/react-query</td>
+      <td>^5.x</td>
+      <td>サーバ状態キャッシュ / 再検証</td>
+    </tr>
+    <tr>
+      <td>クライアント状態</td>
+      <td>Zustand</td>
+      <td>^5.x</td>
+      <td>軽量状態管理</td>
+    </tr>
+    <tr>
+      <td>フォーム</td>
+      <td>react-hook-form</td>
+      <td>latest</td>
+      <td>非制御フォーム管理</td>
+    </tr>
+    <tr>
+      <td>スキーマ検証</td>
+      <td>Zod</td>
+      <td>^3.23+</td>
+      <td>実行時型検証・Factory SSOT</td>
+    </tr>
+    <tr>
+      <td>通信基盤</td>
+      <td>fetch + 独自 httpClient</td>
+      <td>Web 標準</td>
+      <td>app runtime 共通ラッパ</td>
+    </tr>
+    <tr>
+      <td>モック</td>
+      <td>MSW</td>
+      <td>^2.x</td>
+      <td>API 再現・Jest / Storybook / E2E 間共有</td>
+    </tr>
+    <tr>
+      <td>国際化</td>
+      <td>expo-localization + i18next</td>
+      <td>latest</td>
+      <td>端末ロケール取得 / 多言語対応</td>
+    </tr>
+    <tr>
+      <td>テスト（Unit）</td>
+      <td>Jest + jest-expo</td>
+      <td>latest</td>
+      <td>RN 標準のユニット / 画面テスト基盤</td>
+    </tr>
+    <tr>
+      <td>テスト（UI）</td>
+      <td>@testing-library/react-native</td>
+      <td>latest</td>
+      <td>ユーザー視点テスト</td>
+    </tr>
+    <tr>
+      <td>E2E</td>
+      <td>MagicPod / Maestro</td>
+      <td>latest</td>
+      <td>実機・エミュレータ上の業務導線検証</td>
+    </tr>
+    <tr>
+      <td>パッケージ管理</td>
+      <td>pnpm</td>
+      <td>^9.x</td>
+      <td>高速依存管理</td>
+    </tr>
+    <tr>
+      <td>契約管理</td>
+      <td>OpenAPI + orval / openapi-zod-client</td>
+      <td>latest</td>
+      <td>型・zod 自動生成</td>
+    </tr>
+    <tr>
+      <td>CI/CD</td>
+      <td>GitLab CI + EAS Build / EAS Workflows</td>
+      <td>latest</td>
+      <td>build / update / submit / mobile test automation</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 2. レイヤー責務と依存方向
+
+```
+┌─────────────────────────────────────────┐
+│  app/ (Expo Router Screen)              │  ← ナビゲーション・URL 設計の一次ソース
+├─────────────────────────────────────────┤
+│  features/ (Feature Components)        │  ← 業務ロジック・状態結合
+├─────────────────────────────────────────┤
+│  components/ (Design System)           │  ← 再利用可能 UI 部品・トークン消費者
+├─────────────────────────────────────────┤
+│  hooks/ / stores/ / queries/           │  ← 状態・通信・副作用
+├─────────────────────────────────────────┤
+│  lib/httpClient  lib/factory  lib/i18n │  ← インフラ共通層
+└─────────────────────────────────────────┘
+         依存方向: 上 → 下のみ
+```
+
+🔴 **MUST**: 下位レイヤーから上位レイヤーへのインポート禁止  
+🔴 **MUST**: `app/` 配下のファイルは UI 結合のみ担う（ロジックを書かない）
+
+---
+
+## 3. 絶対禁止事項（MUST NOT）
+
+### UI 部品の外来持ち込み禁止
+
+```tsx
+// ❌ 禁止 — Web DOM 前提のライブラリ
+import { Button } from 'shadcn/ui';
+import * as Dialog from '@radix-ui/react-dialog';
+
+// ✅ 正解 — 自前 Design System
+import { Button } from '@/components/ui/Button';
+import { Modal } from '@/components/ui/Modal';
+```
+
+> **理由**: shadcn/ui・Radix UI は DOM 依存であり React Native では動作しない
+
+### 通信の直書き禁止
+
+```tsx
+// ❌ 禁止
+const res = await fetch('/api/users');
+
+// ✅ 正解
+const res = await httpClient.get('/users');
+```
+
+### 通知の直呼び禁止
+
+```tsx
+// ❌ 禁止
+Toast.show({ text: 'Error' });
+
+// ✅ 正解
+notify.error('保存に失敗しました');
+```
+
+### 非決定論的値の直使用禁止
+
+```tsx
+// ❌ 禁止
+const id = Math.random().toString();
+const now = new Date();
+
+// ✅ 正解（注入された Provider 経由）
+const id = idProvider.generate();
+const now = clock.now();
+```
+
+### 端末 API の直呼び禁止
+
+```tsx
+// ❌ 禁止 — 画面層から Expo モジュール直呼び
+import * as Location from 'expo-location';
+const loc = await Location.getCurrentPositionAsync();
+
+// ✅ 正解 — wrapper 経由
+import { locationService } from '@/lib/location';
+const loc = await locationService.getCurrent();
+```
+
+---
+
+## 4. ナビゲーション方針
+
+🔴 **MUST**: ルーティングの正とするのは `app/` のファイル構造のみ  
+🔴 **MUST**: `react-navigation` を直接使わない（Expo Router が内包する）  
+🟡 **SHOULD**: 深いネストは `(group)` ディレクトリで論理分割する
+
+```
+app/
+  (auth)/
+    login.tsx
+    signup.tsx
+  (main)/
+    _layout.tsx        ← Tab Navigator
+    index.tsx          ← ホーム
+    search/
+      index.tsx
+      [id].tsx
+  _layout.tsx          ← Root layout（Provider 注入点）
+```
+
+---
+
+## 5. 型安全・契約整合方針
+
+```
+OpenAPI 仕様
+    ↓ orval / openapi-zod-client
+Zod スキーマ（自動生成）
+    ↓
+TypeScript 型（推論）   +   Factory（テストデータ生成）
+    ↓                           ↓
+httpClient レスポンス検証    MSW ハンドラ / Jest / Storybook
+```
+
+🔴 **MUST**: Zod スキーマは OpenAPI から自動生成し、手書き禁止  
+🔴 **MUST**: API レスポンスは実行時に Zod で検証する（`parse` / `safeParse`）
+
+---
+
+## 6. 選定理由（主要技術）
+
+### Expo を選ぶ理由
+
+React Native 公式が「まず Framework を使う」を推奨しており、Expo はその中核候補である。
+Dev Build・OTA・EAS Workflows による CI/CD 統合が他の選択肢と比較して最も成熟している。
+
+### Vitest を使わない理由
+
+Expo 公式は unit testing に `jest-expo` を案内しており、
+Expo Router の testing も `jest-expo` + `@testing-library/react-native` 前提である。
+React Native Testing Library は完全な native runtime を提供しないため、
+native API や OS 依存挙動は simulator / 実機の E2E で担保する必要がある。
+
+### next-intl を使わない理由
+
+next-intl は Next.js（App Router）専用であり React Native では動作しない。
+`expo-localization` + `i18next` / `react-i18next` に置換する。
+
+---
+
+## 7. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

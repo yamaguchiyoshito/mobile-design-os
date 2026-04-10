@@ -1,0 +1,443 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Platform/Biometric Auth" />
+
+# 生体認証・セキュア認証方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: Face ID / Touch ID / Fingerprint による再認証・アプリロック  
+> **依存**: 08_API_Communication（トークン管理）、14_Device_Permissions（biometricService）
+
+---
+
+## 1. 方針
+
+### ユースケースの明確化
+
+生体認証は **ログイン認証の代替** ではなく **セッション再確認の手段** として使う。
+
+<table>
+  <thead>
+    <tr>
+      <th>ユースケース</th>
+      <th>使う</th>
+      <th>使わない</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>バックグラウンド復帰後のアプリロック解除</td>
+      <td>✅</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>高額決済・破壊的操作の直前確認</td>
+      <td>✅</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>初回ログイン認証</td>
+      <td></td>
+      <td>❌（パスワード or SSO が正）</td>
+    </tr>
+    <tr>
+      <td>生体認証だけで完全な認証を完結させる</td>
+      <td></td>
+      <td>❌（フォールバックが必須）</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST**: 生体認証は `expo-local-authentication` のみを使う（14_Device_Permissions の `biometricService` 経由）  
+🔴 **MUST**: 生体認証が失敗した場合のフォールバック（PIN / パスコード）を必ず提供する  
+🔴 **MUST NOT**: 生体認証の成否だけでサーバー API の認証トークンを発行しない
+
+---
+
+## 2. アプリロック方式
+
+### ロック状態の管理
+
+```ts
+// src/stores/appLockStore.ts
+import { create }      from 'zustand';
+import * as SecureStore from 'expo-secure-store';
+
+const LOCK_ENABLED_KEY    = 'biometric_lock_enabled';
+const LAST_ACTIVE_KEY     = 'last_active_at';
+const LOCK_TIMEOUT_MS     = 1000 * 60 * 5;  // 5 分間操作なしでロック
+
+type AppLockState = {
+  isLocked:       boolean;
+  isEnabled:      boolean;
+  lock:           () => void;
+  unlock:         () => void;
+  setEnabled:     (enabled: boolean) => Promise<void>;
+  checkShouldLock: () => Promise<boolean>;
+  recordActivity:  () => Promise<void>;
+};
+
+export const useAppLockStore = create<AppLockState>((set, get) => ({
+  isLocked:  false,
+  isEnabled: false,
+
+  lock:   () => set({ isLocked: true }),
+  unlock: () => set({ isLocked: false }),
+
+  setEnabled: async (enabled: boolean) => {
+    await SecureStore.setItemAsync(LOCK_ENABLED_KEY, String(enabled));
+    set({ isEnabled: enabled });
+  },
+
+  checkShouldLock: async () => {
+    const enabled = await SecureStore.getItemAsync(LOCK_ENABLED_KEY);
+    if (enabled !== 'true') return false;
+
+    const lastActiveStr = await SecureStore.getItemAsync(LAST_ACTIVE_KEY);
+    if (!lastActiveStr) return true;
+
+    const elapsed = Date.now() - Number(lastActiveStr);
+    return elapsed > LOCK_TIMEOUT_MS;
+  },
+
+  recordActivity: async () => {
+    await SecureStore.setItemAsync(LAST_ACTIVE_KEY, String(Date.now()));
+  },
+}));
+```
+
+### AppState 変化でのロック制御
+
+```tsx
+// app/_layout.tsx
+import { AppState } from 'react-native';
+import { useAppLockStore } from '@/stores/appLockStore';
+import { AppLockScreen }   from '@/components/providers/AppLockScreen';
+
+export default function RootLayout() {
+  const { isLocked, lock, checkShouldLock, recordActivity } = useAppLockStore();
+
+  // アプリがバックグラウンドから復帰したときにロックチェック
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', async (nextState) => {
+      if (nextState === 'active') {
+        const shouldLock = await checkShouldLock();
+        if (shouldLock) lock();
+      }
+      if (nextState === 'background') {
+        await recordActivity();
+      }
+    });
+    return () => sub.remove();
+  }, []);
+
+  // ロック中はロック画面のみ表示
+  if (isLocked) return <AppLockScreen />;
+
+  return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      {/* ... */}
+    </GestureHandlerRootView>
+  );
+}
+```
+
+### AppLockScreen
+
+```tsx
+// src/components/providers/AppLockScreen.tsx
+import { biometricService } from '@/lib/permissions/biometricService';
+import { useAppLockStore }  from '@/stores/appLockStore';
+
+export function AppLockScreen() {
+  const { unlock }   = useAppLockStore();
+  const { t }        = useTranslation();
+  const [error, setError] = useState<string | null>(null);
+
+  // 画面表示時に自動で生体認証を起動
+  useEffect(() => {
+    handleAuthenticate();
+  }, []);
+
+  const handleAuthenticate = async () => {
+    const capability = await biometricService.getCapability();
+
+    if (capability === 'none') {
+      // 生体認証が使えない端末ではロックしない
+      unlock();
+      return;
+    }
+
+    const result = await biometricService.authenticate({
+      reason: t('appLock.reason'),  // 'アプリのロックを解除します'
+    });
+
+    switch (result) {
+      case 'success':
+        setError(null);
+        unlock();
+        break;
+      case 'cancelled':
+        // キャンセルはエラー表示しない（再試行ボタンを表示）
+        break;
+      case 'lockout':
+        setError(t('appLock.lockoutError'));  // '認証に複数回失敗しました'
+        break;
+      case 'failed':
+        setError(t('appLock.failedError'));   // '認証に失敗しました'
+        break;
+    }
+  };
+
+  return (
+    <View
+      className="flex-1 items-center justify-center bg-surface-primary"
+      accessible={true}
+      accessibilityLabel={t('appLock.screenLabel')}
+    >
+      <Icon name="lock-closed" size={48} className="text-content-secondary mb-6" accessible={false} />
+      <Text className="text-heading-md text-content-primary mb-2">
+        {t('appLock.title')}  {/* 'ロックされています' */}
+      </Text>
+
+      {error && (
+        <Text
+          className="text-body-sm text-content-danger mb-4"
+          accessibilityLiveRegion="assertive"
+          accessibilityRole="alert"
+        >
+          {error}
+        </Text>
+      )}
+
+      <Button
+        label={t('appLock.unlockButton')}  // '生体認証で解除'
+        variant="primary"
+        onPress={handleAuthenticate}
+      />
+    </View>
+  );
+}
+```
+
+🟡 **SHOULD**: ロック画面表示時に自動で生体認証プロンプトを起動する（ユーザーの操作を 1 ステップ省く）  
+🟡 **SHOULD**: `lockout`（連続失敗）の場合はリトライボタンを非表示にする
+
+---
+
+## 3. 高感度操作の直前確認
+
+決済・削除等の操作直前に再確認として生体認証を挟む。
+
+```tsx
+// features/payment/hooks/useSecureConfirm.ts
+export function useSecureConfirm() {
+  const { t } = useTranslation();
+
+  return async (
+    operation: () => Promise<void>,
+    options?: { reason?: string },
+  ): Promise<void> => {
+    const capability = await biometricService.getCapability();
+
+    // 生体認証が使えない端末では通常の Dialog 確認に fallback
+    if (capability === 'none') {
+      return new Promise<void>((resolve, reject) => {
+        notify.dialog({
+          title:        t('secureConfirm.title'),    // '操作を確認してください'
+          message:      options?.reason ?? t('secureConfirm.defaultMessage'),
+          confirmLabel: t('secureConfirm.confirm'),  // '実行する'
+          destructive:  true,
+          onConfirm:    () => operation().then(resolve).catch(reject),
+          onCancel:     () => reject(new Error('cancelled')),
+        });
+      });
+    }
+
+    // 生体認証で確認
+    const result = await biometricService.authenticate({
+      reason: options?.reason ?? t('secureConfirm.biometricReason'),
+    });
+
+    if (result !== 'success') {
+      throw new Error('authentication_failed');
+    }
+
+    return operation();
+  };
+}
+```
+
+```tsx
+// 使用例
+export function PaymentConfirmButton({ amount, onPay }: Props) {
+  const { t }          = useTranslation();
+  const secureConfirm  = useSecureConfirm();
+
+  const handlePress = async () => {
+    try {
+      await secureConfirm(
+        () => onPay(),
+        { reason: `${formatPrice(amount, 'JPY')} の支払いを実行します` },
+      );
+      notify.success(t('payment.success'));
+    } catch (err) {
+      if ((err as Error).message === 'cancelled') return;
+      notify.error(t('payment.error'));
+    }
+  };
+
+  return (
+    <Button
+      label={`${formatPrice(amount, 'JPY')} を支払う`}
+      variant="primary"
+      onPress={handlePress}
+    />
+  );
+}
+```
+
+---
+
+## 4. 設定画面の実装
+
+```tsx
+// features/settings/components/BiometricSettingRow.tsx
+export function BiometricSettingRow() {
+  const { t }                     = useTranslation();
+  const { isEnabled, setEnabled } = useAppLockStore();
+  const [capability, setCapability] = useState<BiometricCapability>('none');
+
+  useEffect(() => {
+    biometricService.getCapability().then(setCapability);
+  }, []);
+
+  // 生体認証が使えない端末では設定を表示しない
+  if (capability === 'none') return null;
+
+  const biometricLabel = {
+    facial:      'Face ID',
+    fingerprint: 'Touch ID / 指紋認証',
+    iris:        '虹彩認証',
+    none:        '',
+  }[capability];
+
+  const handleToggle = async (nextValue: boolean) => {
+    if (nextValue) {
+      // 有効化前に一度認証して意思確認
+      const result = await biometricService.authenticate({
+        reason: `${biometricLabel} でアプリをロックします`,
+      });
+      if (result !== 'success') return;
+    }
+    await setEnabled(nextValue);
+    notify.success(nextValue
+      ? `${biometricLabel} ロックを有効にしました`
+      : 'ロックを無効にしました',
+    );
+  };
+
+  return (
+    <View className="flex-row items-center justify-between py-4">
+      <View className="flex-1 mr-4">
+        <Text className="text-body-md text-content-primary">
+          {biometricLabel} ロック
+        </Text>
+        <Text className="text-body-sm text-content-secondary">
+          バックグラウンド復帰時に認証を要求します
+        </Text>
+      </View>
+      <Switch
+        value={isEnabled}
+        label={`${biometricLabel} ロック`}
+        onChange={handleToggle}
+      />
+    </View>
+  );
+}
+```
+
+---
+
+## 5. テスト実装規約
+
+```ts
+// src/stores/__tests__/appLockStore.test.ts
+jest.mock('expo-secure-store');
+import * as SecureStore from 'expo-secure-store';
+import { useAppLockStore } from '@/stores/appLockStore';
+
+describe('checkShouldLock', () => {
+  test('ロックが無効なら false を返す', async () => {
+    (SecureStore.getItemAsync as jest.Mock).mockResolvedValue('false');
+    expect(await useAppLockStore.getState().checkShouldLock()).toBe(false);
+  });
+
+  test('最終アクティブから 5 分超で true を返す', async () => {
+    (SecureStore.getItemAsync as jest.Mock).mockImplementation((key) => {
+      if (key === 'biometric_lock_enabled') return Promise.resolve('true');
+      if (key === 'last_active_at')
+        return Promise.resolve(String(Date.now() - 1000 * 60 * 6)); // 6 分前
+      return Promise.resolve(null);
+    });
+    expect(await useAppLockStore.getState().checkShouldLock()).toBe(true);
+  });
+});
+```
+
+---
+
+## 6. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>リスク / 結果</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>生体認証の成功だけで API トークンを発行する</td>
+      <td>生体情報漏洩時にアカウントが乗っ取られる</td>
+      <td>サーバー側認証（パスワード or SSO）は別途必要</td>
+    </tr>
+    <tr>
+      <td><code>disableDeviceFallback: true</code></td>
+      <td>パスコードフォールバックがなくロック解除不能になる</td>
+      <td>必ず <code>false</code> に設定</td>
+    </tr>
+    <tr>
+      <td>生体認証が使えない端末で設定 UI を表示する</td>
+      <td>ユーザーが操作しても何も起きない</td>
+      <td><code>getCapability()</code> が <code>none</code> なら非表示</td>
+    </tr>
+    <tr>
+      <td><code>lockout</code> 後にリトライを許可する</td>
+      <td>OS のロックアウトを回避できてしまう</td>
+      <td><code>lockout</code> は <code>false</code> → 時間経過後に再試行を案内</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 7. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

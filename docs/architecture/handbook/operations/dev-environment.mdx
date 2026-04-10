@@ -1,0 +1,877 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Operations/Dev Environment" />
+
+# 開発者環境構築手順
+
+> **ステータス**: `APPROVED`  
+> **対象**: プロジェクト参画者全員。初回セットアップ・MCP ツール統合・IDE 設定  
+> **更新契機**: ツールバージョンアップ・MCP サーバー追加・セットアップ手順変更時
+
+---
+
+## 1. 全体構成
+
+```
+開発者の手元
+  ├─ Claude Code（ターミナル）/ Claude.ai（ブラウザ）  ← AI アシスタント
+  │     └─ MCP Servers（ツール統合）
+  │           ├─ @storybook/mcp     ← Story 生成・検索・lint
+  │           ├─ Figma MCP          ← デザイントークン・仕様取得
+  │           └─ Playwright MCP     ← ブラウザ自動操作・VRT 補助
+  │
+  ├─ VS Code                        ← エディタ
+  │     └─ 推奨拡張機能
+  │
+  ├─ Expo Dev Build（実機 / シミュレーター）
+  └─ Storybook（web / on-device 二系統）
+```
+
+---
+
+## 2. 前提条件
+
+### 必須ツールのバージョン
+
+<table>
+  <thead>
+    <tr>
+      <th>ツール</th>
+      <th>最小バージョン</th>
+      <th>確認コマンド</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Node.js</td>
+      <td>22.x LTS</td>
+      <td><code>node -v</code></td>
+    </tr>
+    <tr>
+      <td>pnpm</td>
+      <td>9.x</td>
+      <td><code>pnpm -v</code></td>
+    </tr>
+    <tr>
+      <td>Xcode</td>
+      <td>16.x（iOS 開発）</td>
+      <td><code>xcodebuild -version</code></td>
+    </tr>
+    <tr>
+      <td>Android Studio</td>
+      <td>Hedgehog 以降</td>
+      <td>Android Studio 起動画面</td>
+    </tr>
+    <tr>
+      <td>Expo CLI</td>
+      <td>latest</td>
+      <td><code>npx expo --version</code></td>
+    </tr>
+    <tr>
+      <td>EAS CLI</td>
+      <td>latest</td>
+      <td><code>eas --version</code></td>
+    </tr>
+  </tbody>
+</table>
+
+```bash
+# Node.js は Volta で管理する（推奨）
+curl https://get.volta.sh | bash
+volta install node@22
+volta install pnpm@9
+
+# EAS CLI
+npm install -g eas-cli
+eas login
+```
+
+---
+
+## 3. リポジトリのセットアップ
+
+```bash
+# 1. clone
+git clone git@gitlab.example.com:dpc/myapp.git
+cd myapp
+
+# 2. 依存インストール
+pnpm install
+
+# 3. 環境変数ファイルを作成
+cp .env.example .env.development
+# → .env.development を各自の値で埋める（チームの共有ドキュメント参照）
+
+# 4. OpenAPI からコードを生成
+pnpm orval
+
+# 5. Expo のネイティブモジュール整合確認
+npx expo-doctor
+npx expo install --check
+
+# 6. Dev Build をインストール（初回 or ネイティブコード変更後）
+eas build --platform ios --profile development --local
+# または EAS クラウドビルドを使う場合
+eas build --platform ios --profile development
+```
+
+---
+
+## 4. MCP サーバーのセットアップ
+
+MCP（Model Context Protocol）サーバーは Claude Code が
+外部ツールを呼び出すためのプロキシ層として機能する。
+
+### Claude Code の MCP 設定ファイル
+
+Claude Code の MCP 設定はプロジェクトローカルとグローバルの 2 箇所に置ける。
+
+```
+プロジェクトローカル（チーム共有推奨）:
+  .claude/mcp.json         ← リポジトリに含める（APIキーは書かない）
+
+グローバル（個人設定）:
+  macOS: ~/.claude/mcp.json
+```
+
+```json
+// .claude/mcp.json（プロジェクトルート）
+{
+  "mcpServers": {
+    "storybook":  { ... },
+    "figma":      { ... },
+    "playwright": { ... }
+  }
+}
+```
+
+設定後は Claude Code を再起動するか、`/mcp` コマンドで接続状態を確認する。
+
+```bash
+# Claude Code での MCP 操作
+claude mcp list         # 登録済みサーバーを一覧表示
+claude mcp add          # 対話式でサーバーを追加
+claude mcp remove <name> # サーバーを削除
+```
+
+---
+
+## 5. Storybook MCP Addon
+
+### 役割
+
+<table>
+  <thead>
+    <tr>
+      <th>できること</th>
+      <th>具体的な使用例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Story の検索・取得</td>
+      <td>「Button コンポーネントの Story 一覧を見せて」</td>
+    </tr>
+    <tr>
+      <td>Story の自動生成</td>
+      <td>「OrderCard の Story を variants に基づいて生成して」</td>
+    </tr>
+    <tr>
+      <td>a11y・lint ルールのチェック</td>
+      <td>「現在の Story の a11y 違反を確認して」</td>
+    </tr>
+    <tr>
+      <td>コンポーネント仕様の参照</td>
+      <td>「TextField の args 定義を教えて」</td>
+    </tr>
+  </tbody>
+</table>
+
+### インストール
+
+```bash
+# web Storybook 側（.storybook/）に addon を追加
+pnpm add -D @storybook/addon-mcp
+```
+
+```ts
+// .storybook/main.ts（web Storybook）
+import type { StorybookConfig } from '@storybook/react-vite';
+
+const config: StorybookConfig = {
+  addons: [
+    '@storybook/addon-docs',
+    '@storybook/addon-vitest',
+    '@storybook/addon-a11y',
+    'msw-storybook-addon',
+    '@storybook/addon-mcp',   // ← 追加
+  ],
+};
+export default config;
+```
+
+### MCP サーバーの起動スクリプト
+
+```json
+// package.json
+{
+  "scripts": {
+    "storybook:web":     "storybook dev -p 6006",
+    "storybook:mcp":     "npx @storybook/mcp --storybook-url http://localhost:6006",
+    "storybook:dev":     "concurrently \"pnpm storybook:web\" \"pnpm storybook:mcp\""
+  }
+}
+```
+
+### Claude Code での MCP 設定
+
+```json
+// .claude/mcp.json
+{
+  "mcpServers": {
+    "storybook": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@storybook/mcp",
+        "--storybook-url",
+        "http://localhost:6006"
+      ]
+    }
+  }
+}
+```
+
+または CLI で追加:
+
+```bash
+claude mcp add storybook \
+  --command npx \
+  --args "-y,@storybook/mcp,--storybook-url,http://localhost:6006"
+```
+
+> **注意**: Storybook が起動していない状態では MCP サーバーが機能しない。  
+> Claude Code で Storybook 関連の作業を依頼する前に `pnpm storybook:web` を起動しておく。
+
+### 動作確認
+
+```bash
+# Claude Code のターミナルで確認
+claude mcp list
+# → storybook が CONNECTED と表示されれば OK
+
+# または Claude Code に直接入力:
+# 「Storybook の Button コンポーネントの Story 一覧を教えて」
+# → Claude Code が Storybook MCP 経由で Story を取得して一覧を返す
+```
+
+### 開発ワークフロー例
+
+```
+1. Figma で新しいコンポーネントの仕様を確認（Figma MCP）
+2. Claude Code に「このコンポーネントの Story を生成して」と依頼
+   → Storybook MCP が既存 Story の規約を参照
+   → 生成された Story を .stories.tsx に貼り付ける
+3. pnpm storybook:web でブラウザ確認
+4. addon-vitest / addon-a11y で自動テスト
+```
+
+---
+
+## 6. Figma MCP
+
+### 役割
+
+<table>
+  <thead>
+    <tr>
+      <th>できること</th>
+      <th>具体的な使用例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>コンポーネント仕様取得</td>
+      <td>「Button コンポーネントの variant と props を確認して」</td>
+    </tr>
+    <tr>
+      <td>デザイントークン取得</td>
+      <td>「surface-primary の色コードを確認して」</td>
+    </tr>
+    <tr>
+      <td>レイアウト情報取得</td>
+      <td>「OrderCard のパディングとマージンを確認して」</td>
+    </tr>
+    <tr>
+      <td>選択中ノードの情報取得</td>
+      <td>Figma で選択した要素の詳細を Claude に渡す</td>
+    </tr>
+  </tbody>
+</table>
+
+### インストール
+
+Figma MCP は Figma 公式が提供する `mcp.figma.com` をエンドポイントとして使う。
+ローカルインストール不要。
+
+### Figma アクセストークンの取得
+
+```
+1. Figma を開く
+2. 右上のアバター → Settings → Security
+3. Personal access tokens → Generate new token
+4. トークン名: "Claude MCP"
+5. Expiration: 90 日（推奨）
+6. Scopes: File content（Read）、Dev resources（Read）にチェック
+7. トークンをコピーして安全な場所に保管
+```
+
+### Claude Code での MCP 設定
+
+APIキーは `.claude/mcp.json` に直書きせず、シェルの環境変数から渡す。
+
+```bash
+# ~/.zshrc または ~/.bashrc に追加
+export FIGMA_API_KEY="figd_YOUR_PERSONAL_ACCESS_TOKEN_HERE"
+```
+
+```json
+// .claude/mcp.json（APIキーは env 参照）
+{
+  "mcpServers": {
+    "figma": {
+      "command": "npx",
+      "args": ["-y", "figma-developer-mcp"],
+      "env": {
+        "FIGMA_API_KEY": "${FIGMA_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+または CLI で追加（環境変数が設定済みの場合）:
+
+```bash
+claude mcp add figma \
+  --command npx \
+  --args "-y,figma-developer-mcp" \
+  --env "FIGMA_API_KEY=${FIGMA_API_KEY}"
+```
+
+> **セキュリティ**: `FIGMA_API_KEY` は `.claude/mcp.json` に直書きしない。  
+> `.claude/mcp.json` はリポジトリに含めるため、個人トークンが漏洩する。  
+> シェルの環境変数経由で渡し、各自でトークンを発行する。
+
+### 動作確認
+
+```bash
+claude mcp list
+# → figma が CONNECTED と表示されれば OK
+
+# Claude Code のターミナルで試す:
+# 「https://www.figma.com/design/XXXX/MyApp?node-id=123-456 の
+#   Button コンポーネントの仕様を教えて」
+```
+
+### Figma URL からコンポーネントを参照する方法
+
+```bash
+# Claude Code のターミナルで直接入力:
+# 「この Figma URL のコンポーネント仕様を確認して:
+#  https://www.figma.com/design/XXXX/MyApp?node-id=123-456」
+```
+
+### 開発ワークフロー例
+
+```
+1. Figma でデザインを開き、実装するコンポーネントの URL をコピー
+2. Claude Code に「この Figma URL から TypeScript の Props 型と
+   NativeWind クラスを生成して」と依頼
+   → Claude Code が Figma MCP でデザイントークン・スペーシング・
+     カラーを取得し、型定義とクラスを生成
+3. 生成されたコードを components/ui/ に貼り付けて調整
+4. Storybook MCP で Story を追加生成
+```
+
+---
+
+## 7. Playwright MCP
+
+### 役割
+
+<table>
+  <thead>
+    <tr>
+      <th>できること</th>
+      <th>具体的な使用例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>ブラウザ自動操作</td>
+      <td>「Storybook の OrderCard Story を開いてスクリーンショットを撮って」</td>
+    </tr>
+    <tr>
+      <td>VRT ベースライン撮影</td>
+      <td>「全 Story のスクリーンショットを撮って reports/ に保存して」</td>
+    </tr>
+    <tr>
+      <td>フォーム入力テスト</td>
+      <td>「ログインフォームに値を入れて送信ボタンを押した状態を確認して」</td>
+    </tr>
+    <tr>
+      <td>クロスブラウザ確認</td>
+      <td>「この URL を Chrome と Firefox で開いて比較して」</td>
+    </tr>
+  </tbody>
+</table>
+
+### インストール
+
+```bash
+# Playwright 本体（プロジェクトに既にある場合はスキップ）
+pnpm add -D @playwright/test
+npx playwright install chromium firefox
+
+# Playwright MCP サーバー
+pnpm add -D @playwright/mcp
+```
+
+### Claude Code での MCP 設定
+
+```json
+// .claude/mcp.json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "@playwright/mcp",
+        "--browser",      "chromium",
+        "--headless",     "false",
+        "--output-dir",   "reports/screenshots"
+      ]
+    }
+  }
+}
+```
+
+または CLI で追加:
+
+```bash
+claude mcp add playwright \
+  --command npx \
+  --args "@playwright/mcp,--browser,chromium,--headless,false,--output-dir,reports/screenshots"
+```
+
+<table>
+  <thead>
+    <tr>
+      <th>オプション</th>
+      <th>値</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>--browser</code></td>
+      <td><code>chromium</code> / <code>firefox</code> / <code>webkit</code></td>
+      <td>使用ブラウザ</td>
+    </tr>
+    <tr>
+      <td><code>--headless</code></td>
+      <td><code>true</code> / <code>false</code></td>
+      <td>ヘッドレスモード（<code>false</code> で操作を目視確認）</td>
+    </tr>
+    <tr>
+      <td><code>--viewport-size</code></td>
+      <td><code>&quot;1280,800&quot;</code></td>
+      <td>ビューポートサイズ</td>
+    </tr>
+    <tr>
+      <td><code>--output-dir</code></td>
+      <td><code>&quot;reports/screenshots&quot;</code></td>
+      <td>スクリーンショット保存先</td>
+    </tr>
+  </tbody>
+</table>
+
+### 動作確認
+
+```bash
+claude mcp list
+# → playwright が CONNECTED と表示されれば OK
+
+# Claude Code のターミナルで試す:
+# 「http://localhost:6006 の Button の Primary Story を
+#   開いてスクリーンショットを撮って」
+```
+
+### VRT ワークフロー例
+
+```bash
+# Claude Code のターミナルで入力:
+# 「Storybook の全 UI コンポーネントの Story を開いて
+#   スクリーンショットを reports/vrt-baseline/ に保存して」
+
+# → Claude Code が Playwright MCP で全 Story を巡回して撮影
+# → PR 時に「前回との差分 Story だけ再撮影して比較して」と依頼可能
+```
+
+### Playwright MCP と CI の併用
+
+```yaml
+# .gitlab-ci.yml — CI では headless で実行
+playwright-vrt:
+  stage: test
+  script:
+    - pnpm storybook:build
+    - pnpm exec playwright test tests/vrt/
+  artifacts:
+    paths: [reports/screenshots/]
+    expire_in: 7 days
+```
+
+---
+
+## 8. 3 つの MCP を組み合わせたワークフロー
+
+### 新規コンポーネント実装フロー
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ Step 1: Figma MCP でデザイン仕様を取得                            │
+│   Claude Code: 「この Figma URL の CardComponent の仕様を確認して」│
+│   → props 型・カラートークン・スペーシングがコンテキストに入る      │
+└────────────────────────┬─────────────────────────────────────────┘
+                         ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Step 2: Storybook MCP で既存規約を参照して実装・Story 生成         │
+│   Claude Code: 「既存の Button Story を参考に CardComponent の    │
+│               実装と Story を生成して」                           │
+│   → 既存規約（accessibilityRole・testID・NativeWind）に沿ったコード │
+└────────────────────────┬─────────────────────────────────────────┘
+                         ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Step 3: Playwright MCP でビジュアル確認                           │
+│   Claude Code: 「生成した Story を Storybook で開いて確認して」    │
+│   → ブラウザで実際の表示を確認してフィードバック                    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### バグ調査フロー
+
+```
+Claude Code のターミナルで入力:
+
+1. 「OrderCard の Error バリアントを Playwright で開いて
+   a11y 違反がないか Storybook の addon-a11y で確認して」
+
+2. Playwright MCP がブラウザでページを開く
+   Storybook MCP が a11y チェック結果を取得
+   Claude Code が問題点を特定して修正案を提示
+
+3. 修正後に「スクリーンショットを再撮影して修正前後を比較して」
+```
+
+---
+
+## 9. 全 MCP 設定の完成形
+
+### `.claude/mcp.json`（プロジェクトルート・Git 管理対象）
+
+APIキーは含めない。環境変数経由で渡す。
+
+```json
+{
+  "mcpServers": {
+    "storybook": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@storybook/mcp",
+        "--storybook-url",
+        "http://localhost:6006"
+      ]
+    },
+    "figma": {
+      "command": "npx",
+      "args": ["-y", "figma-developer-mcp"],
+      "env": {
+        "FIGMA_API_KEY": "${FIGMA_API_KEY}"
+      }
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "@playwright/mcp",
+        "--browser",      "chromium",
+        "--headless",     "false",
+        "--output-dir",   "reports/screenshots"
+      ]
+    }
+  }
+}
+```
+
+### 個人環境変数の設定（`~/.zshrc` 等）
+
+```bash
+# Figma Personal Access Token（各自で発行）
+export FIGMA_API_KEY="figd_YOUR_TOKEN_HERE"
+```
+
+### 設定後のチェックリスト
+
+```bash
+# Claude Code で MCP 接続を確認
+claude mcp list
+# → storybook   CONNECTED
+# → figma       CONNECTED
+# → playwright  CONNECTED
+
+# 動作確認（Storybook 起動後）
+# Claude Code のターミナルで:
+# 「Storybook の Story 一覧を教えて」         → Storybook MCP
+# 「Figma URL から仕様を取得して」             → Figma MCP
+# 「http://localhost:6006 のスクリーンショット」→ Playwright MCP
+```
+
+---
+
+## 10. VS Code 推奨拡張機能
+
+```json
+// .vscode/extensions.json
+{
+  "recommendations": [
+    // TypeScript / React
+    "dbaeumer.vscode-eslint",
+    "esbenp.prettier-vscode",
+    "bradlc.vscode-tailwindcss",        // NativeWind の className 補完
+
+    // Expo / React Native
+    "msjsdiag.vscode-react-native",
+    "expo.vscode-expo-tools",           // app.json / EAS 補完
+
+    // テスト
+    "orta.vscode-jest",
+    "ms-playwright.playwright",
+
+    // Git
+    "eamodio.gitlens",
+
+    // Storybook
+    "chromatic.storybook-vscode"        // Story ファイルの補完・プレビュー
+  ]
+}
+```
+
+### VS Code 設定
+
+```json
+// .vscode/settings.json
+{
+  // TypeScript
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "typescript.preferences.importModuleSpecifier": "non-relative",
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+
+  // NativeWind の className 補完を有効化
+  "tailwindCSS.experimental.classRegex": [
+    ["className=\"([^\"]*)\"", "([a-zA-Z0-9\\-:]+)"]
+  ],
+  "tailwindCSS.includeLanguages": {
+    "typescriptreact": "html"
+  },
+
+  // Jest
+  "jest.jestCommandLine": "pnpm test --",
+  "jest.autoRun": "off",
+
+  // ファイル除外（不要なファイルを検索対象から外す）
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist":         true,
+    "**/.expo":        true,
+    "**/src/api/generated": true   // 自動生成コードは検索対象外
+  }
+}
+```
+
+---
+
+## 11. Expo Dev Build のセットアップ
+
+### iOS シミュレーター（ローカルビルド）
+
+```bash
+# Dev Build をローカルでビルド（初回・ネイティブコード変更時）
+eas build --platform ios --profile development --local
+
+# ビルドされた .ipa をシミュレーターにインストール
+open ./path/to/MyApp.ipa
+
+# 起動
+pnpm start
+# → Metro が起動するので シミュレーターでアプリを開く
+```
+
+### Android エミュレーター（ローカルビルド）
+
+```bash
+eas build --platform android --profile development --local
+
+# ビルドされた .apk をエミュレーターにインストール
+adb install ./path/to/MyApp.apk
+
+pnpm start
+```
+
+### EAS クラウドビルド（推奨）
+
+```bash
+# iOS
+eas build --platform ios --profile development
+# → ビルド完了後に QR コードが表示される
+# → Expo Go ではなく「Development Build」アプリとしてインストール
+
+# Android
+eas build --platform android --profile development
+```
+
+### Storybook on-device の起動
+
+```bash
+# Storybook モードで起動
+EXPO_PUBLIC_STORYBOOK_ENABLED=true pnpm start
+
+# または package.json にスクリプトを追加
+# "storybook:native": "EXPO_PUBLIC_STORYBOOK_ENABLED=true expo start"
+```
+
+---
+
+## 12. Storybook web の起動
+
+```bash
+# web Storybook（Docs / VRT / addon-vitest）
+pnpm storybook:web       # → http://localhost:6006
+
+# Storybook MCP と同時起動
+pnpm storybook:dev       # storybook:web + storybook:mcp を concurrently で実行
+
+# ビルド（CI 用）
+pnpm build:storybook:web
+```
+
+---
+
+## 13. よくあるセットアップのトラブルと対処
+
+<table>
+  <thead>
+    <tr>
+      <th>症状</th>
+      <th>原因</th>
+      <th>対処</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>claude mcp list</code> で MCP が表示されない</td>
+      <td><code>.claude/mcp.json</code> の JSON が壊れている</td>
+      <td>JSON を validator で確認 → Claude Code を再起動</td>
+    </tr>
+    <tr>
+      <td>Storybook MCP が「接続できない」</td>
+      <td>Storybook が起動していない</td>
+      <td><code>pnpm storybook:web</code> を先に起動する</td>
+    </tr>
+    <tr>
+      <td>Figma MCP が「認証エラー」</td>
+      <td><code>FIGMA_API_KEY</code> が未設定またはトークン期限切れ</td>
+      <td><code>echo $FIGMA_API_KEY</code> で確認 → Figma で再発行</td>
+    </tr>
+    <tr>
+      <td>Playwright MCP でブラウザが開かない</td>
+      <td>Playwright のブラウザが未インストール</td>
+      <td><code>npx playwright install chromium</code></td>
+    </tr>
+    <tr>
+      <td><code>expo-doctor</code> で警告が出る</td>
+      <td>ネイティブモジュールのバージョン不整合</td>
+      <td><code>npx expo install --fix</code></td>
+    </tr>
+    <tr>
+      <td><code>pnpm install</code> で peer dependency エラー</td>
+      <td>Node バージョンが古い</td>
+      <td><code>volta install node@22</code></td>
+    </tr>
+    <tr>
+      <td>iOS ビルドが失敗する</td>
+      <td>Xcode の証明書設定が未完了</td>
+      <td><code>eas credentials</code> で証明書を設定</td>
+    </tr>
+    <tr>
+      <td><code>pnpm orval</code> でエラー</td>
+      <td>OpenAPI spec が取得できない / 不正</td>
+      <td>spec URL・認証情報を確認する</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 14. チーム参画チェックリスト
+
+```
+初回セットアップ
+  □ Node.js 22 / pnpm 9 をインストールした
+  □ リポジトリを clone した
+  □ .env.development を設定した
+  □ pnpm install が通った
+  □ pnpm orval が通った
+  □ expo-doctor の警告が 0 になった
+
+Claude Code のセットアップ
+  □ Claude Code をインストールした（npm install -g @anthropic-ai/claude-code）
+  □ .claude/mcp.json をリポジトリに配置した
+  □ ~/.zshrc に FIGMA_API_KEY を設定した
+  □ claude mcp list で 3 つの MCP が CONNECTED と表示される
+  □ Storybook MCP の動作確認が取れた
+  □ Figma MCP の動作確認が取れた
+  □ Playwright MCP の動作確認が取れた
+
+開発環境確認
+  □ pnpm storybook:web が起動する（http://localhost:6006）
+  □ pnpm test が通る
+  □ EAS Dev Build が実機 / シミュレーターで起動する
+  □ VS Code 推奨拡張がインストールされている
+```
+
+---
+
+## 15. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

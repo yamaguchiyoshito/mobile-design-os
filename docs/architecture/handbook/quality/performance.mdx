@@ -1,0 +1,563 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Quality/Performance" />
+
+# パフォーマンス最適化標準
+
+> **ステータス**: `APPROVED`  
+> **対象**: React Native mobile（Expo）アプリ全域のレンダリング・メモリ・バンドル最適化  
+> **依存**: 02_UI_System（NativeWind）、03_Data_and_State（React Query）、17_Animation（Reanimated）
+
+---
+
+## 1. 方針
+
+### 最適化の優先順位
+
+```
+1. 計測する（FlipperProfiler / Flashlight / Perfetto）
+2. ボトルネックを特定する
+3. 最小の変更で最大の改善を得る
+4. 再計測して効果を確認する
+```
+
+🔴 **MUST NOT**: 計測なしに「念のため」の最適化を施さない  
+（`React.memo` の乱用・`useMemo` の過剰適用は可読性を下げるだけになる）  
+🟡 **SHOULD**: パフォーマンス劣化を招く変更は CI の bundle size チェックで検知する（10_Library_Update 参照）
+
+### パフォーマンス目標値
+
+<table>
+  <thead>
+    <tr>
+      <th>指標</th>
+      <th>目標</th>
+      <th>計測ツール</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>初回インタラクション（TTI）</td>
+      <td>3 秒以内</td>
+      <td>Flashlight</td>
+    </tr>
+    <tr>
+      <td>フレームレート</td>
+      <td>60fps 維持（重処理中は 30fps 許容）</td>
+      <td>Flipper Perf Monitor</td>
+    </tr>
+    <tr>
+      <td>JS バンドルサイズ</td>
+      <td>ベースラインから +50KB 以内 / MR</td>
+      <td>10_Library_Update の CI スクリプト</td>
+    </tr>
+    <tr>
+      <td>メモリ使用量</td>
+      <td>無限スクロール 200 件で 200MB 以内</td>
+      <td>Xcode Instruments / Android Profiler</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 2. リスト描画最適化（FlatList）
+
+FlatList の設定漏れが体感品質に最も直結する。
+
+### 基本設定テンプレート
+
+```tsx
+// ✅ 推奨設定を網羅した FlatList テンプレート
+export function OrderList({ orders }: { orders: Order[] }) {
+  const renderItem = useCallback(
+    ({ item }: { item: Order }) => <OrderCard order={item} />,
+    [],
+  );
+
+  const keyExtractor = useCallback(
+    (item: Order) => item.id,
+    [],
+  );
+
+  return (
+    <FlatList
+      data={orders}
+      renderItem={renderItem}
+      keyExtractor={keyExtractor}
+
+      // ── レンダリング最適化 ──────────────────────────────────────────
+      removeClippedSubviews={true}   // 画面外アイテムをビューツリーから除外
+      maxToRenderPerBatch={10}       // 1 バッチのレンダリング件数（デフォルト 10）
+      updateCellsBatchingPeriod={50} // バッチ間隔 ms
+      windowSize={5}                 // 描画ウィンドウ（画面高 × 5 分 = 前後 2 画面分）
+      initialNumToRender={8}         // 初回レンダリング件数（画面に収まる程度）
+
+      // ── アイテム高さが固定の場合 ──────────────────────────────────
+      getItemLayout={(_data, index) => ({
+        length: ORDER_CARD_HEIGHT,          // px 固定値
+        offset: ORDER_CARD_HEIGHT * index,
+        index,
+      })}
+
+      // ── 無限スクロール ──────────────────────────────────────────
+      onEndReached={handleLoadMore}
+      onEndReachedThreshold={0.5}    // 残り 50% で次ページを取得
+
+      // ── メモリ解放 ──────────────────────────────────────────────
+      maintainVisibleContentPosition={{    // スクロール位置の維持
+        minIndexForVisible: 0,
+      }}
+    />
+  );
+}
+
+const ORDER_CARD_HEIGHT = 80;  // px。固定高の場合のみ定義
+```
+
+### `getItemLayout` の適用基準
+
+```tsx
+// ✅ 固定高アイテム → getItemLayout を使う（スクロールバー精度・scrollToIndex が正確になる）
+getItemLayout={(_data, index) => ({
+  length: ITEM_HEIGHT,
+  offset: ITEM_HEIGHT * index,
+  index,
+})}
+
+// ✅ セクションヘッダ付き固定高 → offset にヘッダ分を加算
+getItemLayout={(_data, index) => {
+  const HEADER_HEIGHT = 40;
+  const sectionIndex  = Math.floor(index / SECTION_SIZE);
+  return {
+    length: ITEM_HEIGHT,
+    offset: ITEM_HEIGHT * index + HEADER_HEIGHT * sectionIndex,
+    index,
+  };
+}}
+
+// ❌ 可変高アイテム → getItemLayout を使わない（誤差が出る）
+```
+
+🟡 **SHOULD**: アイテム高さが固定の場合は必ず `getItemLayout` を設定する  
+🔴 **MUST NOT**: `getItemLayout` を可変高アイテムに適用する（スクロール位置がずれる）
+
+---
+
+## 3. コンポーネントメモ化
+
+### `React.memo` の適用基準
+
+```tsx
+// ✅ 適用すべき場面 — 親が頻繁に再レンダリングされ、かつ props が変わらないコンポーネント
+export const OrderCard = React.memo(function OrderCard({ order }: { order: Order }) {
+  return (
+    <View>
+      <Text>{order.id}</Text>
+      <Text>{formatPrice(order.total, 'JPY')}</Text>
+    </View>
+  );
+});
+
+// カスタム比較関数が必要な場合（props がオブジェクトで参照が変わるが値は同じ場合）
+export const OrderCard = React.memo(
+  function OrderCard({ order }: { order: Order }) { /* ... */ },
+  (prev, next) => prev.order.id === next.order.id && prev.order.status === next.order.status,
+);
+```
+
+```tsx
+// ❌ 不要な React.memo（親が滅多に再レンダリングされない場合は効果なし）
+export const StaticBanner = React.memo(function StaticBanner() {
+  return <View><Text>固定バナー</Text></View>;
+});
+```
+
+**適用基準チェックリスト**
+
+<table>
+  <thead>
+    <tr>
+      <th>条件</th>
+      <th><code>React.memo</code> を使う</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>FlatList の <code>renderItem</code> に渡す</td>
+      <td>✅ 必須</td>
+    </tr>
+    <tr>
+      <td>親コンポーネントが状態を持ち頻繁に再レンダリングする</td>
+      <td>✅ 適用</td>
+    </tr>
+    <tr>
+      <td>props に関数が含まれる</td>
+      <td><code>useCallback</code> とセットで適用</td>
+    </tr>
+    <tr>
+      <td>Leaf コンポーネント（子なし）</td>
+      <td>計測して判断</td>
+    </tr>
+    <tr>
+      <td>滅多に再レンダリングされない画面レベルコンポーネント</td>
+      <td>❌ 不要</td>
+    </tr>
+  </tbody>
+</table>
+
+### `useMemo` / `useCallback` の適用基準
+
+```tsx
+// ✅ useMemo — 計算コストが高い値のキャッシュ
+const sortedOrders = useMemo(
+  () => [...orders].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+  [orders],
+);
+
+// ✅ useCallback — React.memo コンポーネントに渡す関数
+const handlePress = useCallback(
+  (id: string) => router.push(`/order/${id}`),
+  [router],
+);
+
+// ❌ 不要な useMemo — 単純な値の参照はキャッシュ不要
+const label = useMemo(() => `注文 ${order.id}`, [order.id]);  // ← 過剰
+const label = `注文 ${order.id}`;                              // ← これで十分
+```
+
+🔴 **MUST NOT**: すべての関数に `useCallback` を適用しない。`React.memo` コンポーネントへの受け渡しと、依存配列の参照安定化が必要な場合のみ使う
+
+---
+
+## 4. 画像最適化
+
+### `expo-image` を使う
+
+```tsx
+// ✅ 正解 — expo-image（キャッシュ・フォーマット変換・プレースホルダー対応）
+import { Image } from 'expo-image';
+
+<Image
+  source={{ uri: 'https://example.com/photo.jpg' }}
+  style={{ width: 80, height: 80 }}
+  contentFit="cover"
+  placeholder={blurhash}          // Blurhash によるローディングプレースホルダー
+  transition={200}                 // フェードイン ms
+  cachePolicy="memory-disk"        // メモリ + ディスクキャッシュ
+  recyclingKey={order.id}          // FlatList でのリサイクル最適化
+/>
+
+// ❌ 非推奨 — React Native 標準 Image（キャッシュ制御が弱い）
+import { Image } from 'react-native';
+```
+
+### 画像サイズの最適化
+
+```tsx
+// ✅ 表示サイズに合わせたリサイズ URL を使う（サーバーサイドリサイズ）
+const thumbnailUrl = `${imageBaseUrl}?w=${width * PixelRatio.get()}&h=${height * PixelRatio.get()}&fit=cover`;
+
+// ✅ Blurhash プレースホルダーの生成（サーバーで事前計算して API で返す）
+const blurhash = order.thumbnail?.blurhash;
+```
+
+🔴 **MUST**: `expo-image` を使う（`react-native` の `Image` の新規使用禁止）  
+🟡 **SHOULD**: FlatList 内の画像は `recyclingKey` を設定してセルのリサイクルを最適化する  
+🟡 **SHOULD**: サムネイルは表示サイズ × DPR のリサイズ URL を使い、オリジナルサイズを読み込まない
+
+---
+
+## 5. JS スレッド負荷の分散
+
+### InteractionManager
+
+画面遷移アニメーションが終わるまで重い処理を遅延させる。
+
+```tsx
+import { InteractionManager } from 'react-native';
+
+export function HeavyDataScreen() {
+  const [data, setData] = useState<HeavyData | null>(null);
+
+  useEffect(() => {
+    // 遷移アニメーション完了後にデータ処理を開始する
+    const task = InteractionManager.runAfterInteractions(async () => {
+      const result = await processHeavyData();
+      setData(result);
+    });
+    return () => task.cancel();
+  }, []);
+
+  return data ? <DataView data={data} /> : <Skeleton />;
+}
+```
+
+🟡 **SHOULD**: 画面遷移直後に重い初期化処理が走る場合は `InteractionManager.runAfterInteractions` で遅延させる
+
+### `useTransition`（React 18）
+
+```tsx
+// 非緊急の状態更新を低優先度に下げる
+import { useTransition, useState } from 'react';
+
+export function SearchScreen() {
+  const [query,  setQuery]  = useState('');
+  const [results, setResults] = useState<SearchResult[]>([]);
+  const [isPending, startTransition] = useTransition();
+
+  const handleChange = (text: string) => {
+    setQuery(text);           // 入力は即時反映（高優先度）
+    startTransition(() => {
+      setResults(search(text)); // 検索結果は低優先度（UI をブロックしない）
+    });
+  };
+
+  return (
+    <>
+      <TextInput value={query} onChangeText={handleChange} />
+      {isPending ? <ActivityIndicator /> : <ResultList results={results} />}
+    </>
+  );
+}
+```
+
+---
+
+## 6. バンドルサイズ最適化
+
+### Tree-shaking が効く import に統一
+
+```tsx
+// ✅ Named import（Tree-shaking 有効）
+import { format } from 'date-fns';
+import { debounce } from 'lodash';
+
+// ❌ Default import（Tree-shaking が効かない場合がある）
+import _ from 'lodash';
+import dateFns from 'date-fns';
+```
+
+### 重いライブラリの代替検討
+
+<table>
+  <thead>
+    <tr>
+      <th>重いライブラリ</th>
+      <th>軽量代替</th>
+      <th>削減目安</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>moment</code></td>
+      <td><code>date-fns</code>（必要な関数のみ import）</td>
+      <td>-65KB</td>
+    </tr>
+    <tr>
+      <td><code>lodash</code>（全体）</td>
+      <td><code>lodash-es</code>（個別 import）</td>
+      <td>-50KB</td>
+    </tr>
+    <tr>
+      <td><code>axios</code></td>
+      <td>独自 <code>httpClient</code>（fetch ベース）</td>
+      <td>-15KB</td>
+    </tr>
+  </tbody>
+</table>
+
+### 動的 import（コード分割）
+
+```tsx
+// 初期バンドルに含めたくない重いコンポーネント（PDF ビューア等）を遅延ロード
+const PdfViewer = React.lazy(() =>
+  import('@/features/documents/components/PdfViewer')
+);
+
+export function DocumentScreen() {
+  return (
+    <Suspense fallback={<Skeleton />}>
+      <PdfViewer uri={documentUri} />
+    </Suspense>
+  );
+}
+```
+
+🟡 **SHOULD**: 初回起動で使わない重いコンポーネントは `React.lazy` で分割する
+
+---
+
+## 7. React Query によるパフォーマンス最適化
+
+```ts
+// ✅ staleTime を適切に設定して不要な再フェッチを防ぐ
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60 * 5,   // 5 分間はキャッシュを新鮮とみなす
+      gcTime:    1000 * 60 * 30,  // 30 分間キャッシュを保持
+    },
+  },
+});
+
+// ✅ select でデータの再レンダリングを絞り込む
+// orders 全体ではなく count だけが変化したときのみ再レンダリングする
+const { data: count } = useQuery({
+  queryKey: queryKeys.orders.all(),
+  queryFn:  fetchOrders,
+  select:   (data) => data.items.length,  // ← count が変わらなければ再レンダリングしない
+});
+```
+
+🟡 **SHOULD**: `select` を使い、コンポーネントが依存する最小データだけを返す  
+🟡 **SHOULD**: マスタデータ・設定値は `staleTime: Infinity` で再フェッチを無効化する
+
+---
+
+## 8. メモリリーク対策
+
+```tsx
+// ✅ useEffect のクリーンアップを必ず実装する
+useEffect(() => {
+  const sub = someEventEmitter.addListener('event', handler);
+  return () => sub.remove();  // ← クリーンアップ
+}, []);
+
+// ✅ アンマウント後の setState を防ぐ
+useEffect(() => {
+  let mounted = true;
+  fetchData().then((data) => {
+    if (mounted) setData(data);  // アンマウント後は setState しない
+  });
+  return () => { mounted = false; };
+}, []);
+
+// ✅ Reanimated の shared value はコンポーネントのライフサイクルに従う
+// → useSharedValue は自動的にクリーンアップされる（明示的な解放不要）
+```
+
+### FlatList でのメモリ解放
+
+```tsx
+// 長大リストでのメモリ最適化
+<FlatList
+  removeClippedSubviews={true}
+  // Android: 画面外のビューを破棄してメモリを解放する
+  // iOS: オーバースクロール時のバッファを減らす
+/>
+```
+
+---
+
+## 9. パフォーマンス計測ツール
+
+### Flashlight（CI 計測に統合可能）
+
+```bash
+# Flashlight で起動時間を計測
+npx @perf-tools/flashlight measure --bundleId com.example.myapp
+
+# EAS Workflows での自動計測
+npx @perf-tools/flashlight test \
+  --bundleId com.example.myapp \
+  --testCommand "maestro test flows/login.yaml" \
+  --resultsFile reports/performance.json
+```
+
+### Flipper（開発中のプロファイリング）
+
+```
+Flipper → React DevTools → Profiler タブ
+→ 「Record」を押してインタラクションを実行
+→ Flamechart で再レンダリングのコストを確認
+```
+
+### `why-did-you-render`（開発環境）
+
+```ts
+// src/test/wdyr.ts（開発環境のみ）
+import React from 'react';
+import whyDidYouRender from '@welldone-software/why-did-you-render';
+
+if (__DEV__) {
+  whyDidYouRender(React, {
+    trackAllPureComponents: true,
+    logOnDifferentValues:   true,
+  });
+}
+```
+
+🟡 **SHOULD**: 不要な再レンダリングが疑われる場合のみ `why-did-you-render` を有効化する（常時は不要）
+
+---
+
+## 10. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>影響</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>FlatList</code> に <code>getItemLayout</code> なし（固定高）</td>
+      <td><code>scrollToIndex</code> が不正確・初回スクロールがぎこちない</td>
+      <td>固定高なら必ず設定</td>
+    </tr>
+    <tr>
+      <td><code>renderItem</code> をインライン関数で定義</td>
+      <td>セルが毎回再レンダリングされる</td>
+      <td><code>useCallback</code> でメモ化</td>
+    </tr>
+    <tr>
+      <td><code>React.memo</code> 未適用の FlatList セル</td>
+      <td>全セルが再レンダリングされる</td>
+      <td>セルコンポーネントに <code>React.memo</code></td>
+    </tr>
+    <tr>
+      <td><code>staleTime</code> が 0（デフォルト）</td>
+      <td>画面フォーカスのたびに API を叩く</td>
+      <td>データ特性に合わせて設定</td>
+    </tr>
+    <tr>
+      <td>画面遷移直後に重い処理</td>
+      <td>アニメーションがカクつく</td>
+      <td><code>InteractionManager.runAfterInteractions</code> で遅延</td>
+    </tr>
+    <tr>
+      <td><code>react-native Image</code> をそのまま使用</td>
+      <td>キャッシュ効率が低い</td>
+      <td><code>expo-image</code> に置き換える</td>
+    </tr>
+    <tr>
+      <td><code>lodash</code> を全体 import</td>
+      <td>バンドルサイズが増大</td>
+      <td>個別 import に変更</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 11. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,999 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Platform/WebView" />
+
+# WebView 方式設計書
+
+> **ステータス**: `APPROVED`  
+> **対象**: React Native mobile（Expo）アプリ内の WebView 実装全般
+
+---
+
+## 1. 方針
+
+### WebView を使う条件
+
+WebView はネイティブ実装の代替ではなく、**特定の用途に限定した補完手段** である。
+以下のいずれかに該当する場合のみ使用を許可する。
+
+<table>
+  <thead>
+    <tr>
+      <th>許可される用途</th>
+      <th>具体例</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>外部 Web コンテンツの表示</td>
+      <td>利用規約・プライバシーポリシー・ヘルプページ</td>
+    </tr>
+    <tr>
+      <td>ネイティブ未対応の決済 SDK</td>
+      <td>3-D セキュア認証・特定 PSP の決済フォーム</td>
+    </tr>
+    <tr>
+      <td>社内 Web ツールの埋め込み</td>
+      <td>管理画面の一部機能を暫定的に提供する場合</td>
+    </tr>
+    <tr>
+      <td>リッチテキストレンダリング</td>
+      <td>CMS から配信される HTML コンテンツ</td>
+    </tr>
+  </tbody>
+</table>
+
+🔴 **MUST NOT**: ネイティブで実装可能な画面を「工数削減」を理由に WebView で代替しない  
+🔴 **MUST NOT**: 新規機能を WebView ファーストで設計しない  
+🟡 **SHOULD**: WebView を使う場合は MR に「WebView を使う理由」を記載する
+
+### 採用ライブラリ
+
+```
+react-native-webview（Expo 公式サポート）
+expo install react-native-webview
+```
+
+🔴 **MUST**: `react-native-webview` 以外の WebView 実装ライブラリを追加しない  
+🔴 **MUST NOT**: `<WebView>` を `react-native` コアから import しない（RN 0.57 以降廃止済み）
+
+---
+
+## 2. アーキテクチャ概観
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  React Native（Native Layer）                           │
+│                                                         │
+│   Feature / Screen                                      │
+│       ↓                                                 │
+│   <WebViewContainer>（共通ラッパー）                     │
+│       ↓                                                 │
+│   <WebView />（react-native-webview）                   │
+│       ↕  JSI Bridge / postMessage                       │
+│   WebContent（HTML / JS）                               │
+│                                                         │
+│   WebViewBridge（双方向通信マネージャー）                 │
+│   WebViewSecurityPolicy（許可 URL 管理）                 │
+│   WebViewLoadingState（ロード状態管理）                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 責務の分離
+
+<table>
+  <thead>
+    <tr>
+      <th>層</th>
+      <th>ファイル</th>
+      <th>責務</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>共通ラッパー</strong></td>
+      <td><code>components/ui/WebViewContainer/</code></td>
+      <td>ロード・エラー・セキュリティの共通処理</td>
+    </tr>
+    <tr>
+      <td><strong>Bridge</strong></td>
+      <td><code>lib/webViewBridge.ts</code></td>
+      <td>ネイティブ ↔ Web の双方向メッセージ管理</td>
+    </tr>
+    <tr>
+      <td><strong>セキュリティポリシー</strong></td>
+      <td><code>lib/webViewSecurityPolicy.ts</code></td>
+      <td>許可 URL リスト・ナビゲーション制御</td>
+    </tr>
+    <tr>
+      <td><strong>Feature 固有</strong></td>
+      <td><code>features/*/components/</code></td>
+      <td>ユースケース固有のロジック</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 3. WebViewContainer 共通ラッパー
+
+全 WebView 実装はこのラッパーを通す。直接 `<WebView>` を Feature に書かない。
+
+```tsx
+// src/components/ui/WebViewContainer/WebViewContainer.tsx
+import { useRef, useState, useCallback } from 'react';
+import { View, BackHandler }             from 'react-native';
+import RNWebView, { WebViewNavigation }  from 'react-native-webview';
+import { useFocusEffect }                from 'expo-router';
+import { useSafeAreaInsets }             from 'react-native-safe-area-context';
+import { webViewSecurityPolicy }         from '@/lib/webViewSecurityPolicy';
+import { WebViewLoadingOverlay }         from './WebViewLoadingOverlay';
+import { WebViewErrorState }             from './WebViewErrorState';
+
+export type WebViewContainerProps = {
+  uri:             string;
+  title?:          string;               // アクセシビリティ用ページタイトル
+  injectedJS?:     string;               // 追加 JS（最小限に留める）
+  allowedOrigins?: string[];             // デフォルトポリシーを上書きする場合のみ
+  onMessage?:      (data: string) => void;
+  onNavigate?:     (url: string) => void;
+  onLoadEnd?:      () => void;
+  showLoadingOverlay?: boolean;          // デフォルト: true
+  testID?:         string;
+};
+
+export function WebViewContainer({
+  uri,
+  title,
+  injectedJS,
+  allowedOrigins,
+  onMessage,
+  onNavigate,
+  onLoadEnd,
+  showLoadingOverlay = true,
+  testID,
+}: WebViewContainerProps) {
+  const webViewRef    = useRef<RNWebView>(null);
+  const insets        = useSafeAreaInsets();
+  const [loadState, setLoadState] = useState<'loading' | 'loaded' | 'error'>('loading');
+  const [canGoBack,  setCanGoBack]  = useState(false);
+
+  // ── Android ハードウェアバックキー対応 ──────────────────────────────────
+  useFocusEffect(
+    useCallback(() => {
+      const onBackPress = () => {
+        if (canGoBack) {
+          webViewRef.current?.goBack();
+          return true;   // イベントを消費（アプリ終了を防ぐ）
+        }
+        return false;
+      };
+      const sub = BackHandler.addEventListener('hardwareBackPress', onBackPress);
+      return () => sub.remove();
+    }, [canGoBack]),
+  );
+
+  // ── ナビゲーション許可判定 ──────────────────────────────────────────────
+  const handleNavigationStateChange = (navState: WebViewNavigation) => {
+    setCanGoBack(navState.canGoBack);
+    onNavigate?.(navState.url);
+  };
+
+  const handleShouldStartLoadWithRequest = useCallback(
+    (request: { url: string }) => {
+      const policy = allowedOrigins
+        ? webViewSecurityPolicy.createCustomPolicy(allowedOrigins)
+        : webViewSecurityPolicy.default;
+
+      const allowed = policy.isAllowed(request.url);
+
+      if (!allowed) {
+        // 許可されていない URL は外部ブラウザで開く
+        webViewSecurityPolicy.openExternal(request.url);
+        return false;
+      }
+      return true;
+    },
+    [allowedOrigins],
+  );
+
+  // ── メッセージ受信 ─────────────────────────────────────────────────────
+  const handleMessage = useCallback(
+    (event: { nativeEvent: { data: string } }) => {
+      const raw = event.nativeEvent.data;
+      onMessage?.(raw);
+    },
+    [onMessage],
+  );
+
+  return (
+    <View
+      style={{ flex: 1, paddingBottom: insets.bottom }}
+      accessible={true}
+      accessibilityLabel={title ?? 'ウェブコンテンツ'}
+      testID={testID}
+    >
+      {loadState !== 'error' && (
+        <RNWebView
+          ref={webViewRef}
+          source={{ uri }}
+          // ── セキュリティ設定 ─────────────────────────────────────────
+          originWhitelist={
+            allowedOrigins ?? webViewSecurityPolicy.default.originWhitelist
+          }
+          onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
+          // ── JS 設定 ──────────────────────────────────────────────────
+          javaScriptEnabled={true}
+          injectedJavaScriptBeforeContentLoaded={
+            webViewSecurityPolicy.baseInjectedJS +
+            (injectedJS ?? '')
+          }
+          // ── ロード制御 ───────────────────────────────────────────────
+          onLoadStart={() => setLoadState('loading')}
+          onLoadEnd={() => {
+            setLoadState('loaded');
+            onLoadEnd?.();
+          }}
+          onError={() => setLoadState('error')}
+          onHttpError={(e) => {
+            if (e.nativeEvent.statusCode >= 500) setLoadState('error');
+          }}
+          // ── ナビゲーション ───────────────────────────────────────────
+          onNavigationStateChange={handleNavigationStateChange}
+          // ── メッセージ ───────────────────────────────────────────────
+          onMessage={handleMessage}
+          // ── UX ──────────────────────────────────────────────────────
+          pullToRefreshEnabled={true}
+          allowsBackForwardNavigationGestures={true}  // iOS スワイプバック
+          contentInsetAdjustmentBehavior="automatic"
+          // ── キャッシュ ───────────────────────────────────────────────
+          cacheEnabled={true}
+          cacheMode="LOAD_CACHE_ELSE_NETWORK"         // Android のみ有効
+        />
+      )}
+
+      {showLoadingOverlay && loadState === 'loading' && (
+        <WebViewLoadingOverlay />
+      )}
+
+      {loadState === 'error' && (
+        <WebViewErrorState onRetry={() => {
+          setLoadState('loading');
+          webViewRef.current?.reload();
+        }} />
+      )}
+    </View>
+  );
+}
+```
+
+🔴 **MUST**: すべての WebView 表示は `<WebViewContainer>` を経由する  
+🔴 **MUST**: Feature 内で直接 `<WebView>` を `import` しない  
+🟡 **SHOULD**: `title` を必ず渡し、スクリーンリーダーにページの文脈を伝える
+
+---
+
+## 4. セキュリティポリシー
+
+### 設計原則
+
+WebView のセキュリティリスクは **フィッシング・XSS・意図しない外部ナビゲーション** の 3 つに集約される。
+これらを許可 URL の一元管理で制御する。
+
+```ts
+// src/lib/webViewSecurityPolicy.ts
+import { Linking } from 'react-native';
+
+// ─── デフォルト許可オリジン ─────────────────────────────────────────────────
+// 自社ドメインのみを許可する。サードパーティ URL は個別に allowedOrigins で指定する
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://*.example.com',      // 本番ドメイン
+  'https://*.staging.example.com', // ステージング
+  'about:blank',
+] as const;
+
+// ─── スキーム許可リスト ─────────────────────────────────────────────────────
+const ALLOWED_SCHEMES = ['https:', 'about:'] as const;
+
+// ─── 外部ブラウザで開くスキーム ───────────────────────────────────────────
+const EXTERNAL_SCHEMES = ['tel:', 'mailto:', 'sms:'] as const;
+
+type SecurityPolicy = {
+  originWhitelist: string[];
+  isAllowed: (url: string) => boolean;
+};
+
+function createPolicy(origins: string[]): SecurityPolicy {
+  return {
+    originWhitelist: origins,
+
+    isAllowed(url: string): boolean {
+      try {
+        const parsed = new URL(url);
+
+        // 外部ブラウザ委譲スキームは false で返す（openExternal が拾う）
+        if ((EXTERNAL_SCHEMES as readonly string[]).includes(parsed.protocol)) {
+          return false;
+        }
+
+        // 許可スキーム外は拒否
+        if (!(ALLOWED_SCHEMES as readonly string[]).includes(parsed.protocol)) {
+          return false;
+        }
+
+        // about:blank は常に許可
+        if (url === 'about:blank') return true;
+
+        // オリジン一致チェック（ワイルドカード対応）
+        return origins.some((pattern) => {
+          if (pattern === 'about:blank') return false;
+          const regex = new RegExp(
+            '^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '[^.]+') + '$',
+          );
+          return regex.test(parsed.origin);
+        });
+      } catch {
+        return false;   // URL パース失敗は拒否
+      }
+    },
+  };
+}
+
+// ─── 外部リンクを OS のブラウザで開く ─────────────────────────────────────
+async function openExternal(url: string) {
+  const canOpen = await Linking.canOpenURL(url);
+  if (canOpen) {
+    await Linking.openURL(url);
+  }
+}
+
+// ─── セキュリティ強化用の基底 injectedJS ───────────────────────────────────
+// WebView 内から Native へのメッセージ以外の通信を制限する
+const BASE_INJECTED_JS = `
+  (function() {
+    // window.open を無効化（ポップアップ防止）
+    window.open = function(url) {
+      window.ReactNativeWebView.postMessage(
+        JSON.stringify({ type: 'OPEN_EXTERNAL', url })
+      );
+      return null;
+    };
+    true;
+  })();
+` as const;
+
+export const webViewSecurityPolicy = {
+  default:       createPolicy([...DEFAULT_ALLOWED_ORIGINS]),
+  createCustomPolicy: (origins: string[]) => createPolicy(origins),
+  openExternal,
+  baseInjectedJS: BASE_INJECTED_JS,
+};
+```
+
+### 禁止設定
+
+```tsx
+// ❌ 禁止 — ワイルドカードで全オリジンを許可
+<WebView originWhitelist={['*']} />
+
+// ❌ 禁止 — HTTP を許可（中間者攻撃のリスク）
+<WebView originWhitelist={['http://*', 'https://*']} />
+
+// ❌ 禁止 — JavaScript を無効化しての回避（機能が壊れる）
+<WebView javaScriptEnabled={false} />
+
+// ❌ 禁止 — ファイルアクセスを有効化
+<WebView allowFileAccess={true} />
+<WebView allowFileAccessFromFileURLs={true} />
+
+// ✅ 正解 — 自社ドメインのみ許可
+<WebViewContainer
+  uri="https://help.example.com/terms"
+  allowedOrigins={['https://help.example.com']}
+/>
+```
+
+🔴 **MUST**: `originWhitelist={['*']}` を使わない  
+🔴 **MUST**: `allowFileAccess` / `allowFileAccessFromFileURLs` を有効にしない  
+🔴 **MUST**: `http://` スキームを許可しない（`https://` のみ）  
+🔴 **MUST**: `allowUniversalAccessFromFileURLs` を有効にしない（XSS リスク）
+
+---
+
+## 5. ネイティブ ↔ Web 双方向通信（Bridge）
+
+### 設計原則
+
+メッセージは **型付きのメッセージオブジェクト** で統一する。
+文字列の生 JSON を直接やり取りしない。
+
+```ts
+// src/lib/webViewBridge.ts
+
+// ─── メッセージ型定義（Native → Web）─────────────────────────────────────
+export type NativeToWebMessage =
+  | { type: 'INIT';         payload: { authToken: string; locale: string } }
+  | { type: 'THEME_CHANGE'; payload: { colorScheme: 'light' | 'dark' } }
+  | { type: 'NAVIGATE_BACK' }
+
+// ─── メッセージ型定義（Web → Native）─────────────────────────────────────
+export type WebToNativeMessage =
+  | { type: 'READY' }
+  | { type: 'CLOSE' }
+  | { type: 'OPEN_EXTERNAL'; payload: { url: string } }
+  | { type: 'PAYMENT_SUCCESS'; payload: { transactionId: string } }
+  | { type: 'PAYMENT_CANCEL' }
+  | { type: 'PAYMENT_ERROR';   payload: { code: string; message: string } }
+  | { type: 'HEIGHT_CHANGED';  payload: { height: number } }
+
+// ─── Zod スキーマ（Web からのメッセージをランタイム検証）──────────────────
+import { z } from 'zod';
+
+const webToNativeMessageSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('READY') }),
+  z.object({ type: z.literal('CLOSE') }),
+  z.object({ type: z.literal('OPEN_EXTERNAL'), payload: z.object({ url: z.string().url() }) }),
+  z.object({ type: z.literal('PAYMENT_SUCCESS'), payload: z.object({ transactionId: z.string() }) }),
+  z.object({ type: z.literal('PAYMENT_CANCEL') }),
+  z.object({ type: z.literal('PAYMENT_ERROR'),   payload: z.object({ code: z.string(), message: z.string() }) }),
+  z.object({ type: z.literal('HEIGHT_CHANGED'),  payload: z.object({ height: z.number().positive() }) }),
+]);
+
+// ─── Bridge 本体 ───────────────────────────────────────────────────────────
+
+export const webViewBridge = {
+  // Web → Native: 受信メッセージをパース・検証する
+  parseIncoming(raw: string): WebToNativeMessage | null {
+    try {
+      const json   = JSON.parse(raw);
+      const parsed = webToNativeMessageSchema.safeParse(json);
+      if (!parsed.success) {
+        logger.warn('WebView bridge: unknown message', { raw, issues: parsed.error.issues });
+        return null;
+      }
+      return parsed.data;
+    } catch {
+      logger.warn('WebView bridge: invalid JSON', { raw });
+      return null;
+    }
+  },
+
+  // Native → Web: メッセージを WebView へ送信する injectedJS を生成する
+  buildInjectScript(message: NativeToWebMessage): string {
+    const json = JSON.stringify(message);
+    // window.__nativeBridge__ に登録された受信ハンドラを呼び出す
+    return `
+      (function() {
+        if (window.__nativeBridge__) {
+          window.__nativeBridge__(${json});
+        } else {
+          // ハンドラ未登録時はキューに積む
+          window.__nativeBridgeQueue__ = window.__nativeBridgeQueue__ || [];
+          window.__nativeBridgeQueue__.push(${json});
+        }
+        true;
+      })();
+    `;
+  },
+};
+```
+
+### Feature での使用例（決済 WebView）
+
+```tsx
+// features/payment/components/PaymentWebView.tsx
+import { useRef, useCallback } from 'react';
+import { useRouter }           from 'expo-router';
+import RNWebView               from 'react-native-webview';
+import { WebViewContainer }    from '@/components/ui/WebViewContainer';
+import { webViewBridge }       from '@/lib/webViewBridge';
+import { notify }              from '@/lib/notify';
+
+type Props = {
+  paymentUrl:    string;
+  onSuccess:     (transactionId: string) => void;
+  onCancel:      () => void;
+};
+
+export function PaymentWebView({ paymentUrl, onSuccess, onCancel }: Props) {
+  const router     = useRouter();
+  const webViewRef = useRef<RNWebView>(null);
+
+  const handleMessage = useCallback((raw: string) => {
+    const message = webViewBridge.parseIncoming(raw);
+    if (!message) return;
+
+    switch (message.type) {
+      case 'READY':
+        // Web 側の準備完了 → auth token を送る
+        webViewRef.current?.injectJavaScript(
+          webViewBridge.buildInjectScript({
+            type:    'INIT',
+            payload: { authToken: getAuthTokenSync(), locale: i18n.language },
+          }),
+        );
+        break;
+
+      case 'PAYMENT_SUCCESS':
+        onSuccess(message.payload.transactionId);
+        break;
+
+      case 'PAYMENT_CANCEL':
+        onCancel();
+        break;
+
+      case 'PAYMENT_ERROR':
+        notify.error(message.payload.message);
+        onCancel();
+        break;
+
+      case 'OPEN_EXTERNAL':
+        webViewSecurityPolicy.openExternal(message.payload.url);
+        break;
+
+      case 'CLOSE':
+        router.back();
+        break;
+    }
+  }, [onSuccess, onCancel]);
+
+  return (
+    <WebViewContainer
+      uri={paymentUrl}
+      title="お支払い"
+      allowedOrigins={[
+        'https://payment.example.com',
+        'https://*.stripe.com',
+        'https://*.3dsecure.example.com',
+      ]}
+      onMessage={handleMessage}
+      testID="payment-webview"
+    />
+  );
+}
+```
+
+🔴 **MUST**: Web からのメッセージは必ず Zod で検証してから処理する（未検証の値を直接使わない）  
+🔴 **MUST**: `injectJavaScript` で渡す値は `JSON.stringify` を通す（XSS インジェクション防止）  
+🟡 **SHOULD**: メッセージ型は `discriminatedUnion` で網羅し、`switch` の `default` で未知メッセージをログに残す
+
+---
+
+## 6. ローディング・エラー状態
+
+### ローディングオーバーレイ
+
+```tsx
+// src/components/ui/WebViewContainer/WebViewLoadingOverlay.tsx
+import { ActivityIndicator, View } from 'react-native';
+
+export function WebViewLoadingOverlay() {
+  return (
+    <View
+      className="absolute inset-0 items-center justify-center bg-surface-primary/80"
+      accessible={true}
+      accessibilityRole="progressbar"
+      accessibilityLabel="ページを読み込んでいます"
+    >
+      <ActivityIndicator size="large" />
+    </View>
+  );
+}
+```
+
+### エラー状態
+
+```tsx
+// src/components/ui/WebViewContainer/WebViewErrorState.tsx
+import { useTranslation } from 'react-i18next';
+import { ErrorState }     from '@/components/ui/ErrorState';
+
+export function WebViewErrorState({ onRetry }: { onRetry: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <ErrorState
+      message={t('webview.loadError')}  // 'ページを読み込めませんでした'
+      onRetry={onRetry}
+    />
+  );
+}
+```
+
+### ロード進捗（任意）
+
+長時間かかるページにはプログレスバーを表示する。
+
+```tsx
+// WebViewContainer に追加する場合
+<RNWebView
+  onLoadProgress={({ nativeEvent }) =>
+    setProgress(nativeEvent.progress)  // 0.0 〜 1.0
+  }
+/>
+
+{progress < 1 && (
+  <View className="absolute top-0 left-0 right-0 h-0.5 bg-border-default">
+    <View
+      className="h-full bg-brand-primary"
+      style={{ width: `${progress * 100}%` }}
+      accessible={false}
+    />
+  </View>
+)}
+```
+
+---
+
+## 7. URL スキームと Deep Link のハンドリング
+
+WebView 内のナビゲーションは 4 種類に分類して処理する。
+
+```ts
+// src/lib/webViewSecurityPolicy.ts に追加
+
+export type UrlDispatchResult =
+  | { action: 'allow' }          // WebView 内で表示
+  | { action: 'external' }       // OS の外部ブラウザへ委譲
+  | { action: 'deeplink' }       // アプリの Expo Router へルーティング
+  | { action: 'block' }          // 拒否（ログのみ）
+
+export function dispatchUrl(url: string): UrlDispatchResult {
+  try {
+    const parsed = new URL(url);
+
+    // Deep Link（自アプリスキーム）→ Expo Router へ
+    if (parsed.protocol === 'myapp:') return { action: 'deeplink' };
+
+    // tel: / mailto: / sms: → 外部アプリへ
+    if ((EXTERNAL_SCHEMES as readonly string[]).includes(parsed.protocol)) {
+      return { action: 'external' };
+    }
+
+    // 許可 HTTPS → WebView 内で表示
+    if (parsed.protocol === 'https:') return { action: 'allow' };
+
+    // それ以外（javascript: 等）→ 拒否
+    return { action: 'block' };
+  } catch {
+    return { action: 'block' };
+  }
+}
+```
+
+```tsx
+// WebViewContainer 内での処理
+const handleShouldStartLoadWithRequest = useCallback((request: { url: string }) => {
+  const result = webViewSecurityPolicy.dispatchUrl(request.url);
+
+  switch (result.action) {
+    case 'allow':
+      return true;
+
+    case 'external':
+      webViewSecurityPolicy.openExternal(request.url);
+      return false;
+
+    case 'deeplink':
+      router.push(request.url.replace('myapp:/', ''));
+      return false;
+
+    case 'block':
+      logger.warn('WebView: blocked navigation', { url: request.url });
+      return false;
+  }
+}, [router]);
+```
+
+🔴 **MUST**: `javascript:` スキームは `block` で拒否する  
+🔴 **MUST**: Deep Link をアプリ内で処理する場合は Expo Router に委譲し、WebView を閉じる
+
+---
+
+## 8. Cookie・セッション管理
+
+### セッション共有が必要なケース
+
+WebView が API 認証と同じセッションを必要とする場合（例: SSO 統合）は
+URL に短命トークンを付与して渡す。Cookie の直接操作は行わない。
+
+```tsx
+// ✅ 正解 — 短命トークンをクエリパラメータで渡す
+const { data: webviewToken } = useQuery({
+  queryKey: queryKeys.auth.webviewToken(),
+  queryFn:  () => httpClient.get('/auth/webview-token', webviewTokenSchema),
+  staleTime: 1000 * 60,  // 1 分
+});
+
+const uri = webviewToken
+  ? `https://app.example.com/help?token=${webviewToken.value}&locale=${locale}`
+  : null;
+```
+
+```tsx
+// ❌ 禁止 — CookieManager の直接操作
+import CookieManager from '@react-native-cookies/cookies';
+await CookieManager.set('https://example.com', { name: 'session', value: token });
+```
+
+🔴 **MUST**: 認証情報を Cookie で直接注入しない。短命トークンの URL パラメータか `postMessage` 経由にする  
+🟡 **SHOULD**: WebView 用トークンの有効期限は 5 分以内にする  
+🟡 **SHOULD**: WebView を閉じるタイミングで不要なセッションをサーバー側で失効させる
+
+### WebView キャッシュのクリア
+
+ログアウト時や個人情報に関わる WebView の終了時にキャッシュをクリアする。
+
+```ts
+// src/lib/webViewCacheManager.ts
+import { WebView } from 'react-native-webview';
+
+export async function clearWebViewCache() {
+  // Android のみキャッシュクリア API が存在する
+  if (Platform.OS === 'android') {
+    WebView.clearCache?.(true);
+  }
+  // iOS は WebView インスタンス単位でキャッシュを制御する
+  // → cacheEnabled={false} を渡す
+}
+```
+
+🟡 **SHOULD**: ログアウト処理に `clearWebViewCache()` を含める
+
+---
+
+## 9. パフォーマンス
+
+### レンダリングのオーバーヘッドを減らす
+
+```tsx
+// ✅ 条件付きレンダリングではなく visibility で制御する
+// （破棄 → 再マウントによるリロードを防ぐ）
+<View style={{ flex: 1, display: isVisible ? 'flex' : 'none' }}>
+  <WebViewContainer uri={uri} />
+</View>
+
+// ❌ 毎回アンマウントされ、ページが再ロードされる
+{isVisible && <WebViewContainer uri={uri} />}
+```
+
+🟡 **SHOULD**: モーダル内 WebView は `display: none` で制御し、破棄 → 再マウントのリロードを防ぐ
+
+### プリロード
+
+遷移先が確定している場合、WebView を事前にウォームアップする。
+
+```tsx
+// features/payment/hooks/usePaymentWebViewPreload.ts
+export function usePaymentWebViewPreload(paymentUrl: string | null) {
+  // バックグラウンドで WebView を非表示レンダリング
+  // ユーザーが遷移したとき即表示できる
+  return paymentUrl ? (
+    <View style={{ width: 0, height: 0, overflow: 'hidden' }} accessible={false}>
+      <WebViewContainer uri={paymentUrl} showLoadingOverlay={false} />
+    </View>
+  ) : null;
+}
+```
+
+🟢 **MAY**: 決済・重要フローの直前画面でプリロードを使い体感速度を改善する
+
+---
+
+## 10. アクセシビリティ
+
+### WebView のフォーカス管理
+
+```tsx
+// Screen 遷移時に WebView にフォーカスを移す
+import { AccessibilityInfo, findNodeHandle } from 'react-native';
+
+export function WebViewScreen() {
+  const containerRef = useRef<View>(null);
+
+  useFocusEffect(useCallback(() => {
+    const node = findNodeHandle(containerRef.current);
+    if (node) AccessibilityInfo.setAccessibilityFocus(node);
+  }, []));
+
+  return (
+    <View ref={containerRef} style={{ flex: 1 }}>
+      <WebViewContainer uri={uri} title="利用規約" />
+    </View>
+  );
+}
+```
+
+### Web コンテンツ側の責務
+
+WebView 内の HTML コンテンツのアクセシビリティは **Web 側の実装責任** である。
+ただし Native 側で `title` を設定し、スクリーンリーダーがコンテキストを把握できるようにする。
+
+🟡 **SHOULD**: 社内提供の WebView コンテンツは WCAG 2.1 AA を満たすこと（Web チームへの要件として伝達する）  
+🟡 **SHOULD**: VoiceOver / TalkBack で WebView 内のコンテンツが読み上げられることを実機確認する
+
+---
+
+## 11. テスト実装規約
+
+### WebViewContainer のテスト
+
+```tsx
+// src/components/ui/WebViewContainer/__tests__/WebViewContainer.test.tsx
+import { render, fireEvent, waitFor } from '@testing-library/react-native';
+import { WebViewContainer } from '../WebViewContainer';
+
+// react-native-webview のモック
+jest.mock('react-native-webview', () => {
+  const { View } = require('react-native');
+  const MockWebView = jest.fn(({ onLoadEnd, onError, onMessage, testID }) => {
+    // テスト用にイベントを発火できる ref を渡す
+    return <View testID={testID ?? 'mock-webview'} />;
+  });
+  return { default: MockWebView, __MockWebView: MockWebView };
+});
+
+const { __MockWebView } = require('react-native-webview');
+
+describe('WebViewContainer', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  test('ロード完了前はローディングオーバーレイを表示する', () => {
+    const { getByRole } = render(
+      <WebViewContainer uri="https://example.com" />,
+    );
+    expect(getByRole('progressbar')).toBeTruthy();
+  });
+
+  test('onLoadEnd でローディングオーバーレイが消える', async () => {
+    const { queryByRole } = render(
+      <WebViewContainer uri="https://example.com" />,
+    );
+
+    // WebView の onLoadEnd を発火
+    const [props] = __MockWebView.mock.calls.at(-1);
+    props.onLoadEnd?.();
+
+    await waitFor(() =>
+      expect(queryByRole('progressbar')).toBeNull(),
+    );
+  });
+
+  test('onError でエラー状態を表示する', async () => {
+    const { findByRole } = render(
+      <WebViewContainer uri="https://example.com" />,
+    );
+    const [props] = __MockWebView.mock.calls.at(-1);
+    props.onError?.();
+
+    expect(await findByRole('button', { name: '再試行' })).toBeTruthy();
+  });
+});
+```
+
+### Bridge のテスト
+
+```ts
+// src/lib/__tests__/webViewBridge.test.ts
+import { webViewBridge } from '@/lib/webViewBridge';
+
+describe('webViewBridge.parseIncoming', () => {
+  test('PAYMENT_SUCCESS メッセージを正しくパースする', () => {
+    const raw = JSON.stringify({
+      type:    'PAYMENT_SUCCESS',
+      payload: { transactionId: 'txn-001' },
+    });
+    const result = webViewBridge.parseIncoming(raw);
+    expect(result?.type).toBe('PAYMENT_SUCCESS');
+  });
+
+  test('未知の type は null を返す', () => {
+    const raw = JSON.stringify({ type: 'UNKNOWN_EVENT' });
+    expect(webViewBridge.parseIncoming(raw)).toBeNull();
+  });
+
+  test('不正な JSON は null を返す', () => {
+    expect(webViewBridge.parseIncoming('{ broken json')).toBeNull();
+  });
+
+  test('payload のスキーマ違反は null を返す', () => {
+    const raw = JSON.stringify({
+      type:    'PAYMENT_SUCCESS',
+      payload: { transactionId: 12345 },  // string でなく number
+    });
+    expect(webViewBridge.parseIncoming(raw)).toBeNull();
+  });
+});
+
+describe('webViewSecurityPolicy.dispatchUrl', () => {
+  test.each([
+    ['https://example.com/page',  'allow'],
+    ['tel:0120-000-000',          'external'],
+    ['mailto:info@example.com',   'external'],
+    ['javascript:alert(1)',       'block'],
+    ['http://example.com',        'block'],
+    ['myapp://home',              'deeplink'],
+  ])('%s は %s を返す', (url, expected) => {
+    expect(webViewSecurityPolicy.dispatchUrl(url).action).toBe(expected);
+  });
+});
+```
+
+🔴 **MUST**: `webViewBridge.parseIncoming` のテストに「不正 JSON」「未知の type」「スキーマ違反」の 3 ケースを含める  
+🟡 **SHOULD**: `dispatchUrl` は全スキームパターンを `test.each` で網羅する
+
+---
+
+## 12. よくある実装ミスと対策
+
+<table>
+  <thead>
+    <tr>
+      <th>ミス</th>
+      <th>リスク</th>
+      <th>対策</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>originWhitelist=&#123;[&#39;*&#39;]&#125;</code></td>
+      <td>任意の URL を WebView 内でロード可能になる</td>
+      <td>デフォルトポリシーを必ず使う</td>
+    </tr>
+    <tr>
+      <td>Web メッセージを型なしで <code>JSON.parse</code></td>
+      <td>不正データで実行時クラッシュ</td>
+      <td>Zod で <code>safeParse</code> する</td>
+    </tr>
+    <tr>
+      <td><code>injectJavaScript</code> に変数を文字列結合</td>
+      <td>XSS インジェクション</td>
+      <td><code>JSON.stringify</code> 経由のみ許可</td>
+    </tr>
+    <tr>
+      <td>ナビゲーション制御なしで全 URL を許可</td>
+      <td>フィッシングページへの誘導</td>
+      <td><code>onShouldStartLoadWithRequest</code> で全リクエストを審査</td>
+    </tr>
+    <tr>
+      <td>ログアウト時にキャッシュ未クリア</td>
+      <td>前ユーザーの情報が残る</td>
+      <td><code>clearWebViewCache()</code> をログアウトフックに含める</td>
+    </tr>
+    <tr>
+      <td><code>&#123;isVisible &amp;&amp; &lt;WebView&gt;&#125;</code> のトグル</td>
+      <td>ページが毎回リロードされる</td>
+      <td><code>display: none</code> でアンマウントを回避</td>
+    </tr>
+    <tr>
+      <td>Android バックキーの未ハンドリング</td>
+      <td>WebView 内履歴をスキップしてアプリが終了する</td>
+      <td><code>BackHandler</code> で <code>goBack()</code> を呼ぶ</td>
+    </tr>
+    <tr>
+      <td><code>accessibilityLabel</code> 未設定</td>
+      <td>スクリーンリーダーに何も読み上げられない</td>
+      <td><code>title</code> を必ず渡す</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 13. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

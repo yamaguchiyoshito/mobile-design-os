@@ -1,0 +1,718 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Operations/Store Publishing" />
+
+# ストア公開運用ガイド TIPS
+
+> **ステータス**: `APPROVED`  
+> **対象**: App Store（Apple）・Google Play（Google）への公開・審査・運用全般  
+> **前提**: 06_Operations（EAS Submit・バージョニング）を読んでいること  
+> **位置づけ**: 06 は「CI/CD からどう提出するか」を定義した。本書は「審査を通すためのノウハウ・リジェクト対策・ストア運用の継続的な実務」を定義する
+
+---
+
+## 1. 全体スケジュールの目安
+
+```
+コードフリーズ
+    ↓ 1〜2 日
+Staging ビルド + QA
+    ↓ 1〜2 日
+Production ビルド（EAS Build）
+    ↓ 数時間〜1 日
+ストア提出（EAS Submit）
+    ↓
+審査待ち
+  iOS App Store: 平均 1〜3 日（初回・機能追加時は 1 週間を見込む）
+  Google Play:   平均 数時間〜3 日
+    ↓
+段階的ロールアウト開始
+  iOS:     全ユーザーに即公開 or 段階リリース（最大 7 日間）
+  Android: 段階ロールアウト（1% → 10% → 50% → 100%）
+    ↓
+全体公開・監視
+```
+
+🟡 **SHOULD**: リリース目標日の **1 週間前** には提出する。審査遅延・リジェクトのバッファを確保する  
+🔴 **MUST NOT**: 金曜日の夕方〜週末に提出しない（審査が遅延すると週明けまで対応できない）
+
+---
+
+## 2. EAS Submit の設定
+
+### eas.json の提出設定
+
+```json
+// eas.json
+{
+  "submit": {
+    "production": {
+      "ios": {
+        "appleId":         "developer@example.com",
+        "ascAppId":        "1234567890",
+        "appleTeamId":     "XXXXXXXXXX"
+      },
+      "android": {
+        "serviceAccountKeyPath": "./google-play-service-account.json",
+        "track":                 "internal",
+        "releaseStatus":         "draft"
+      }
+    },
+    "staging": {
+      "ios": {
+        "appleId":         "developer@example.com",
+        "ascAppId":        "1234567890",
+        "appleTeamId":     "XXXXXXXXXX"
+      },
+      "android": {
+        "serviceAccountKeyPath": "./google-play-service-account.json",
+        "track":                 "internal"
+      }
+    }
+  }
+}
+```
+
+### 提出コマンド
+
+```bash
+# 最新のビルドをストアに提出
+eas submit --platform ios     --profile production
+eas submit --platform android --profile production
+
+# 特定のビルド ID を指定して提出
+eas submit --platform ios \
+  --profile production \
+  --id <build-id>
+
+# 両プラットフォームを同時に提出
+eas submit --platform all --profile production
+```
+
+### Google Play サービスアカウントの設定
+
+```bash
+# google-play-service-account.json は Git 管理外
+echo "google-play-service-account.json" >> .gitignore
+
+# EAS Secret Files として管理
+eas secret:create \
+  --scope project \
+  --name GOOGLE_PLAY_SERVICE_ACCOUNT \
+  --type file \
+  --value ./google-play-service-account.json
+```
+
+🔴 **MUST**: `google-play-service-account.json` を Git にコミットしない  
+🟡 **SHOULD**: サービスアカウントの権限は「リリース管理者」のみに絞る
+
+---
+
+## 3. App Store（iOS）審査のポイント
+
+### 審査でよく指摘される項目
+
+#### 3-1. 権限の使用説明文（Info.plist Usage Descriptions）
+
+```json
+// app.json / app.config.ts — 全使用権限に具体的な説明を書く
+{
+  "ios": {
+    "infoPlist": {
+      // ❌ リジェクトされる説明文
+      "NSCameraUsageDescription": "カメラを使用します",
+      "NSLocationWhenInUseUsageDescription": "位置情報を使用します",
+
+      // ✅ 通過する説明文（ユーザーへのメリットと具体的用途を書く）
+      "NSCameraUsageDescription":
+        "プロフィール写真の撮影と書類のスキャンに使用します。",
+      "NSLocationWhenInUseUsageDescription":
+        "近くの店舗を表示するために現在地を使用します。アプリ使用中のみ取得します。",
+      "NSPhotoLibraryUsageDescription":
+        "プロフィール写真の選択に使用します。",
+      "NSPhotoLibraryAddUsageDescription":
+        "加工した写真をカメラロールに保存するために使用します。",
+      "NSFaceIDUsageDescription":
+        "アプリへのサインインを素早く安全に行うために使用します。",
+      "NSMicrophoneUsageDescription":
+        "音声でのメッセージ送信に使用します。",
+      "NSContactsUsageDescription":
+        "友人への送金時に連絡先から選択するために使用します。"
+    }
+  }
+}
+```
+
+#### 3-2. App Privacy（プライバシーラベル）
+
+App Store Connect の「App Privacy」セクションは審査前に**必ず記入する**。
+未記入のまま提出するとリジェクトされる。
+
+```
+必ず回答が必要な質問:
+  ├─ データを収集するか？ → Firebase Analytics を使うなら YES
+  ├─ 収集するデータの種類:
+  │     ├─ 使用状況データ（画面表示・ボタン押下）→ Analytics
+  │     ├─ クラッシュデータ                    → Sentry / Crashlytics
+  │     ├─ 識別子（デバイス ID・ユーザー ID）   → Analytics / Crashlytics
+  │     └─ 購入（購入履歴）                     → 決済機能がある場合
+  └─ サードパーティと共有するか？ → Firebase / Sentry があれば YES
+```
+
+**Data Types と Data Use のマッピング例（Firebase Analytics 利用時）**
+
+| Data Type | Collection | Linked to User | Tracking |
+|-----------|-----------|----------------|---------|
+| Usage Data | ✅ | ❌ | ❌ |
+| Crash Data | ✅ | ❌ | ❌ |
+| Identifiers（Device ID）| ✅ | ❌ | ❌ |
+| Purchases | ✅（決済ありの場合）| ✅ | ❌ |
+
+#### 3-3. 起動直後の権限リクエスト
+
+```
+❌ リジェクトされる → アプリ起動直後・スプラッシュ画面・ログイン前に権限を要求する
+✅ 通過する         → 機能が必要になったタイミングで要求する（14_Device_Permissions 参照）
+```
+
+#### 3-4. In-App Purchase（IAP）の適用漏れ
+
+```
+❌ リジェクト対象 → デジタルコンテンツ・サブスクリプションを Apple 経由以外で決済する
+✅ 例外（審査通過）→ 実物商品・サービス・B2B 業務アプリの機能解放は IAP 不要
+```
+
+🟡 **SHOULD**: デジタルコンテンツが存在する場合は法務確認の上で IAP を実装する  
+🔴 **MUST**: 「App Store 以外で購入してください」というリンクや文言をアプリ内に置かない（ガイドライン 3.1.1 違反）
+
+#### 3-5. テストアカウントの提供
+
+審査チームがログインを必要とする機能を確認するためのテストアカウントが必須。
+
+```
+App Store Connect → App Review Information
+  └─ Demo Account
+       ├─ Username: reviewer@example.com
+       ├─ Password: Review1234!
+       └─ Notes:
+            - ゲストログインボタンでもログイン可能です
+            - 決済フローは sandbox モードで動作します
+            - 管理者権限の機能は「設定 > テストモード」から確認できます
+```
+
+🔴 **MUST**: すべての機能が確認できるテストアカウントを提供する  
+🟡 **SHOULD**: テストアカウントには本番に近い状態のデータを用意する（空のアカウントは機能確認不能でリジェクトされる）
+
+#### 3-6. クラッシュがない状態でのみ提出する
+
+```bash
+# 提出前の最終確認コマンド
+# CI の全テストが通っていること
+# Staging ビルドで Sentry のエラー率が正常範囲であること
+# 実機の E2E テストが通っていること
+
+# Sentry のエラー率を確認してから提出する
+# 06_Operations のアラート閾値（前日比 2 倍）を超えていないこと
+```
+
+🔴 **MUST**: Staging ビルドで最低 1 日以上 QA を行い、クラッシュがないことを確認してから提出する
+
+---
+
+## 4. Google Play（Android）審査のポイント
+
+### 審査でよく指摘される項目
+
+#### 4-1. ターゲット API レベルの最新化
+
+Google Play は毎年 API レベルの要件を更新する。古い targetSdkVersion はリジェクトされる。
+
+```json
+// app.json
+{
+  "android": {
+    "targetSdkVersion": 35,   // 2025 年要件: API 35（Android 15）
+    "minSdkVersion":    24    // Android 7.0 以上（Expo の最小要件に従う）
+  }
+}
+```
+
+🔴 **MUST**: 毎年 8 月頃の Google の要件更新に追従する（10_Library_Update の年次チェック項目に追加する）
+
+#### 4-2. 権限の宣言（AndroidManifest）
+
+```json
+// app.json — 使用する権限のみ宣言する（未使用権限は却下対象）
+{
+  "android": {
+    "permissions": [
+      "android.permission.CAMERA",
+      "android.permission.READ_MEDIA_IMAGES",
+      "android.permission.ACCESS_FINE_LOCATION",
+      "android.permission.RECEIVE_BOOT_COMPLETED",
+      "android.permission.VIBRATE"
+      // 使わない権限を絶対に追加しない
+    ]
+  }
+}
+```
+
+🔴 **MUST**: 宣言した権限を実際に使用する。未使用権限はリジェクト対象  
+🟡 **SHOULD**: `expo-doctor` で不要な権限が自動追加されていないか定期確認する
+
+#### 4-3. データ安全セクション（Data Safety）
+
+Google Play Console の「データ安全」セクション。
+Firebase Analytics・Crashlytics 等の SDK が収集するデータを申告する。
+
+```
+Google Play Console → アプリのコンテンツ → データ安全
+
+収集するデータ:
+  ├─ 位置情報: おおよその位置 → YES（位置情報機能がある場合）
+  ├─ アプリのアクティビティ: アプリのインタラクション → YES（Analytics）
+  ├─ クラッシュログ → YES（Sentry / Crashlytics）
+  ├─ 端末 ID / その他の ID → YES（Analytics）
+  └─ 個人情報: ユーザー ID → YES（ログイン機能がある場合）
+
+データの取り扱い:
+  ├─ ユーザーのデータを第三者と共有するか？ → YES（Firebase / Sentry）
+  └─ データを暗号化して転送するか？         → YES（HTTPS 必須）
+```
+
+🔴 **MUST**: Data Safety セクションを正確に記入する。虚偽記入はアカウント停止対象
+
+#### 4-4. 段階的ロールアウトの活用
+
+```
+Google Play Console → リリース → 本番 → 新しいリリースを作成
+
+ロールアウトの割合:
+  1% → 24h 監視（クラッシュ率・ANR 率を確認）
+  10% → 24h 監視
+  50% → 24h 監視
+  100% → 全体公開
+```
+
+🟡 **SHOULD**: 初回リリースは 1% から開始し、Sentry / Firebase Crashlytics でクラッシュ率が閾値以内であることを確認しながら拡大する
+
+#### 4-5. 内部テスト → クローズドテスト → オープンテスト → 本番のトラック管理
+
+```
+[内部テスト] → [クローズドテスト] → [オープンテスト] → [本番]
+      QA 1〜2 名    社内 + 外部 QA      大規模ベータ     全ユーザー
+      即承認         即承認              即承認           審査あり
+```
+
+```bash
+# EAS Submit でトラックを指定
+eas submit --platform android --profile staging
+# → eas.json の "track": "internal" → 内部テストトラックへ提出
+```
+
+---
+
+## 5. ストアメタデータの管理
+
+### ファイル構成
+
+```
+store/
+  ios/
+    metadata/
+      ja/
+        description.txt          ← アプリ説明文（4000 文字以内）
+        keywords.txt             ← キーワード（100 文字以内、カンマ区切り）
+        promotional_text.txt     ← プロモーションテキスト（170 文字以内）
+        release_notes.txt        ← アップデート内容（4000 文字以内）
+      en-US/
+        description.txt
+        keywords.txt
+        promotional_text.txt
+        release_notes.txt
+    screenshots/
+      iPhone_6.9/               ← iPhone 16 Pro Max（必須サイズ）
+      iPad_13/                  ← iPad 13インチ（必須サイズ）
+  android/
+    metadata/
+      ja-JP/
+        full_description.txt    ← 詳細説明（4000 文字以内）
+        short_description.txt   ← 短い説明（80 文字以内）
+        title.txt               ← アプリ名（30 文字以内）
+        changelogs/
+          <versionCode>.txt     ← バージョンごとのリリースノート
+      en-US/
+        full_description.txt
+        short_description.txt
+        title.txt
+```
+
+🟡 **SHOULD**: メタデータは Git で管理し、マーケティング担当がレビューする  
+🟡 **SHOULD**: リリースノートは開発者が書いたものをマーケティング担当が日本語・英語に調整する
+
+### スクリーンショット要件
+
+```
+iOS（2025 年時点の必須サイズ）
+  iPhone 6.9インチ: 1320 × 2868 px（iPhone 16 Pro Max）
+  iPad 13インチ:    2064 × 2752 px（iPad Pro M4）
+
+Android（2025 年時点）
+  スマートフォン:  最小 320dp 幅、最大 3840px × 3840px
+  タブレット:      7インチ・10インチ（任意）
+
+共通ルール:
+  - PNG または JPEG（iOS は PNG 推奨）
+  - アルファチャンネル（透明部分）禁止
+  - テキスト・UI オーバーレイは各ストアのガイドラインに従う
+```
+
+🟡 **SHOULD**: スクリーンショットはシミュレーター / エミュレーターで撮影し、Figma でテキストオーバーレイを追加する  
+🟡 **SHOULD**: スクリーンショットの撮影は EAS ビルド後の Staging ビルドで行う（開発ビルドとは UI が異なる場合がある）
+
+---
+
+## 6. バージョン管理とリリースノートの書き方
+
+### バージョン番号の更新手順
+
+```bash
+# app.json を手動で更新する（自動化推奨）
+# version: semver（例: 2.3.1）
+# ios.buildNumber: 単調増加の整数文字列（例: "231"）
+# android.versionCode: 単調増加の整数（例: 231）
+
+# 自動インクリメントスクリプト例
+node scripts/bump-version.js --type patch
+# → version: 2.3.0 → 2.3.1
+# → buildNumber: "230" → "231"
+# → versionCode: 230 → 231
+```
+
+```js
+// scripts/bump-version.js
+const fs   = require('fs');
+const path = require('path');
+
+const appJsonPath = path.resolve('./app.json');
+const appJson     = JSON.parse(fs.readFileSync(appJsonPath, 'utf8'));
+
+const type = process.argv[2]?.replace('--type=', '') ?? 'patch';
+const [major, minor, patch] = appJson.expo.version.split('.').map(Number);
+
+const newVersion = {
+  major: `${major + 1}.0.0`,
+  minor: `${major}.${minor + 1}.0`,
+  patch: `${major}.${minor}.${patch + 1}`,
+}[type] ?? `${major}.${minor}.${patch + 1}`;
+
+const currentBuildNumber = Number(appJson.expo.ios.buildNumber);
+const newBuildNumber     = currentBuildNumber + 1;
+
+appJson.expo.version                      = newVersion;
+appJson.expo.ios.buildNumber              = String(newBuildNumber);
+appJson.expo.android.versionCode          = newBuildNumber;
+
+fs.writeFileSync(appJsonPath, JSON.stringify(appJson, null, 2));
+console.log(`Bumped to ${newVersion} (build: ${newBuildNumber})`);
+```
+
+🔴 **MUST**: 同じ `buildNumber` / `versionCode` で 2 回ビルドを提出しない（ストアがリジェクトする）  
+🟡 **SHOULD**: バージョン更新は PR にして、ビルドナンバーのコンフリクトを防ぐ
+
+### リリースノートのテンプレート
+
+```
+# v2.3.0 のリリースノート テンプレート
+
+ユーザー向け（ストア公開用）:
+  ─────────────────────────────
+  【v2.3.0 アップデート】
+
+  ■ 新機能
+  ・注文履歴から再注文できるようになりました
+  ・ダークモードに対応しました
+
+  ■ 改善
+  ・検索画面の表示速度を改善しました
+
+  ■ 不具合修正
+  ・特定の環境で決済画面が表示されない問題を修正しました
+  ─────────────────────────────
+
+社内向け（変更履歴 / チケット番号）:
+  - #1234 feat: 再注文機能を追加
+  - #1289 feat: ダークモード対応（トークン更新）
+  - #1301 perf: 検索 API のキャッシュ改善
+  - #1312 fix:  決済 WebView の初期化タイミング修正
+```
+
+🟡 **SHOULD**: ユーザー向けノートはマーケティング担当がレビューしてからストアに入力する  
+🔴 **MUST NOT**: 社内チケット番号・技術的な詳細をストアのリリースノートに書かない
+
+---
+
+## 7. 審査リジェクト対応フロー
+
+### リジェクト通知の受け取り方
+
+```
+iOS:    App Store Connect のメール通知 + Resolution Center
+Android: Play Console のメール通知 + ダッシュボード
+```
+
+### リジェクト種別と対応方針
+
+| リジェクト種別 | 典型的な原因 | 対応方針 |
+|--------------|------------|---------|
+| **Guideline 2.1** Performance（クラッシュ）| 特定デバイス・OS でのクラッシュ | Sentry / Crashlytics でエラーを特定して修正 |
+| **Guideline 2.3** Accurate Metadata | スクリーンショットとアプリの内容が一致しない | スクリーンショットを更新 |
+| **Guideline 4.0** Design | ネイティブ UI ガイドラインへの非準拠 | HIG を確認して修正 |
+| **Guideline 5.1.1** Data Collection（プライバシー）| 権限説明文が不十分・プライバシーラベルの不整合 | Section 3-1・3-2 を参照して修正 |
+| **Guideline 3.1.1** In-App Purchase | デジタルコンテンツを外部決済 | IAP を実装、または Apple に該当しない旨を説明 |
+| **Google Policy**: Metadata Policy | 説明文にキーワードの詰め込み | 自然な説明文に書き直す |
+| **Google Policy**: Target API level | targetSdkVersion が要件を満たさない | Section 4-1 を参照して更新 |
+
+### Apple Resolution Center でのリジェクト返答テンプレート
+
+```
+件名: Re: [アプリ名] v2.3.0 審査結果について
+
+Apple 審査チームのみなさま、
+
+ご指摘ありがとうございます。Guideline [X.X.X] に関して、
+以下の修正を行いました。
+
+【問題の理解】
+（Apple の指摘を正確に言い換える）
+
+【実施した修正】
+・〇〇の説明文を「△△△△△」に変更しました
+・〇〇機能を〇〇に移行しました
+
+【確認手順】
+1. テストアカウント（reviewer@example.com / Review1234!）でログインする
+2. 〇〇画面を開く
+3. 〇〇ボタンをタップする
+4. 〇〇が正しく動作することを確認する
+
+引き続きよろしくお願いします。
+```
+
+🟡 **SHOULD**: Resolution Center の返答は英語で書く（Apple 審査チームへの対応速度が上がる）  
+🟡 **SHOULD**: リジェクト内容が不明確な場合は Resolution Center で追加情報を要求する（Appealing your Review など）
+
+---
+
+## 8. TestFlight 運用（iOS）
+
+### TestFlight の配布フロー
+
+```
+EAS Build（production プロファイル）
+    ↓ EAS Submit
+App Store Connect（ビルドのアップロード）
+    ↓ 処理完了まで 15〜30 分
+TestFlight（内部テスト）      ← 審査なし・即時配布
+    ↓ グループ追加
+TestFlight（外部テスト）      ← β 審査あり（1〜2 日）
+    ↓ 審査通過
+App Store 審査提出
+```
+
+### 内部テスターとグループ管理
+
+```
+App Store Connect → TestFlight → 内部テスト
+  └─ グループ: 開発チーム（最大 100 名）
+       ├─ 自動配布: ON（ビルド提出後に自動通知）
+       └─ メンバー: チームメンバーを Apple ID で招待
+
+App Store Connect → TestFlight → 外部テスト
+  └─ グループ: QA チーム
+       ├─ β 審査が必要（初回のみ）
+       └─ 最大 10,000 名
+```
+
+🟡 **SHOULD**: 内部テストグループに全開発者を追加し、毎 Staging ビルドで確認できるようにする
+
+### TestFlight ビルドの有効期限
+
+```
+TestFlight ビルドは 90 日間有効。
+期限切れ前にリリースするか、新しいビルドを提出する必要がある。
+```
+
+🟡 **SHOULD**: TestFlight のビルド有効期限を App Store Connect のダッシュボードで週次確認する
+
+---
+
+## 9. Google Play Console の段階ロールアウト運用
+
+### ロールアウトの監視指標
+
+```
+Google Play Console → Android Vitals
+
+確認する指標:
+  ├─ クラッシュ率:      < 1.09%（Play の優良率基準）
+  ├─ ANR 率:           < 0.47%（Play の優良率基準）
+  └─ レーティング変動:  急激な低下に注意
+```
+
+### ロールアウト拡大の判断基準
+
+```
+1% から 10% へ拡大する条件:
+  □ クラッシュ率が前バージョン以下
+  □ ANR 率が前バージョン以下
+  □ Sentry / Crashlytics で新規エラーが発生していない
+  □ レーティングが維持されている
+  □ 1% 展開から 24 時間以上経過している
+
+10% → 50% → 100% も同様の基準で判断する
+```
+
+### ロールアウトの停止・ロールバック
+
+```bash
+# Google Play Console での操作
+# リリース → 本番 → 現在のリリースを管理
+# → 「ロールアウトを一時停止」または「ロールアウトを停止してロールバック」
+
+# OTA（EAS Update）でのホットフィックス配布（ネイティブ変更なしの場合）
+eas update --branch production \
+  --message "Hotfix: クラッシュ修正" \
+  --rollout-percentage 10
+```
+
+🟡 **SHOULD**: クラッシュ率が前バージョン比 2 倍超になった場合は即座にロールアウトを停止する  
+🟡 **SHOULD**: ロールアウトを停止した場合は Slack / 社内チャネルにアナウンスし、原因特定を優先する
+
+---
+
+## 10. アカウント・証明書の管理
+
+### Apple Developer の管理項目
+
+```
+Apple Developer Program（年間 $99 USD）
+  ├─ 証明書（Certificate）
+  │     ├─ iOS Distribution（有効期限: 1 年）
+  │     └─ Apple Push Services（有効期限: 1 年）
+  ├─ Provisioning Profile（有効期限: 1 年）
+  │     ├─ App Store Distribution
+  │     └─ Ad Hoc（TestFlight / 社内配布）
+  └─ App ID（不変）
+
+EAS が証明書を管理する場合:
+  eas credentials --platform ios
+  → EAS が証明書を自動更新・保管してくれる
+```
+
+### 証明書の期限切れ対策
+
+```yaml
+# .gitlab-ci.yml — 週次で証明書の期限を確認する
+check-cert-expiry:
+  stage: scan
+  rules:
+    - if: '$PIPELINE_TYPE == "weekly_scan"'
+  script:
+    - eas credentials --platform ios --json > /tmp/creds.json
+    - node scripts/ci/check-cert-expiry.js
+```
+
+```js
+// scripts/ci/check-cert-expiry.js
+const creds        = JSON.parse(require('fs').readFileSync('/tmp/creds.json'));
+const expiresAt    = new Date(creds?.distCert?.certificateP12?.validityNotAfter);
+const daysLeft     = Math.round((expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
+
+if (daysLeft < 30) {
+  console.error(`⚠️ iOS Distribution Certificate expires in ${daysLeft} days!`);
+  // GitLab Issue を自動作成（10_Library_Update の create-gitlab-issue.js を流用）
+  process.exit(1);
+}
+console.log(`✅ Certificate valid for ${daysLeft} more days`);
+```
+
+🔴 **MUST**: 証明書の有効期限が 30 日を切る前に更新する  
+🟡 **SHOULD**: EAS に証明書管理を委譲し、手動管理をなくす
+
+### Google Play の管理項目
+
+```
+Google Play Console（登録料: 一回 $25 USD）
+  ├─ App Signing Key（不変・Google が管理）
+  ├─ Upload Key（EAS Submit が使う key）
+  │     └─ 紛失した場合: Google Play Console で再リセット申請
+  └─ Service Account（EAS Submit の認証用）
+        └─ 有効期限なし・定期的に権限を見直す
+```
+
+🟡 **SHOULD**: Upload Key のバックアップを EAS と社内の安全な場所（1Password 等）に保管する  
+🔴 **MUST**: App Signing Key は Google が管理する設定（Play App Signing）を使い、自己管理しない
+
+---
+
+## 11. リリース前チェックリスト
+
+```
+コードチェック
+  □ 全テスト（Unit / Integration / E2E）が通っている
+  □ TypeScript エラー・ESLint エラーがない
+  □ Sentry の新規エラーが発生していない（Staging 24h 以上）
+  □ expo-doctor の警告が 0 件
+
+バージョン
+  □ app.json の version・buildNumber・versionCode を更新した
+  □ 更新内容がリリースノートに反映されている
+  □ CHANGELOG.md（社内用）を更新した
+
+ストアメタデータ
+  □ スクリーンショットが最新の UI を反映している
+  □ 説明文に誤字・古い情報がない
+  □ 権限説明文（iOS Info.plist）に使用理由が書かれている
+  □ App Privacy（iOS）/ Data Safety（Android）が正確に記入されている
+
+iOS 固有
+  □ TestFlight 内部テストで動作確認している（最低 1 日）
+  □ テストアカウントが App Store Connect に登録されている
+  □ iOS Distribution 証明書の有効期限が 30 日以上ある
+  □ 提出先が App Store（本番）または TestFlight（外部テスト）であることを確認
+
+Android 固有
+  □ targetSdkVersion が要件を満たしている
+  □ Google Play 内部テストで動作確認している
+  □ Data Safety セクションが正確に記入されている
+  □ ロールアウト割合を 1% から開始することを確認
+
+提出後
+  □ 審査ステータスを App Store Connect / Play Console で確認した
+  □ 審査通過後、Sentry / Crashlytics で 24h モニタリングを開始した
+  □ クラッシュ率を確認しながら段階的にロールアウトを拡大する
+```
+
+---
+
+## 12. よくあるトラブルと対処
+
+| 症状 | 原因 | 対処 |
+|------|------|------|
+| iOS 審査でクラッシュ指摘（Guideline 2.1）| 特定デバイスのみ再現するクラッシュ | Apple からのシンボルファイル（.ips）を Sentry で解析 |
+| 「Missing Compliance」警告 | 暗号化の輸出規制申告が未設定 | app.json に `"ITSAppUsesNonExemptEncryption": false` を追加 |
+| Android ビルドが `deobfuscation` エラー | ProGuard マッピングファイルが未アップロード | EAS の `androidAppBundle` 設定を確認 |
+| App Store Connect に「Missing Screenshots」| 必須デバイスサイズのスクリーンショットがない | iPhone 6.9 インチと iPad 13 インチを追加 |
+| 提出後に「Invalid Binary」エラー | ビルドの署名・バンドル ID が不一致 | `eas credentials` で証明書を再設定 |
+| Play Console で「API レベルが低い」| targetSdkVersion が要件未達 | Section 4-1 を参照して更新 |
+| TestFlight でビルドが表示されない | App Store Connect の処理待ち | 15〜30 分待ってからページを更新 |
+| ロールアウト後にクラッシュ急増 | 本番特有の設定・データとの不整合 | ロールアウトを即停止 → OTA でホットフィックス → 原因修正 |
+
+---
+
+## 13. 変更履歴
+
+| 日付 | 変更内容 | 担当 |
+|------|----------|------|
+| 2026-03 | 初版作成 | — |

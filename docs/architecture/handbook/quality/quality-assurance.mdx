@@ -1,0 +1,477 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Quality/Quality Assurance" />
+
+# 品質保証方式
+
+> **ステータス**: `APPROVED`  
+> **対象**: Storybook 運用・テスト戦略・A11y・VRT・CI ゲート
+
+---
+
+## 1. テスト戦略全体像
+
+```
+                    E2E（MagicPod / Maestro）
+                   ┌────────────────────────┐
+                   │ 実機 / simulator 上で    │
+                   │ クリティカルジャーニーを  │
+                   │ 業務観点で検証           │
+                   └────────────────────────┘
+          Screen Integration Tests（Jest + jest-expo + RNTL + MSW）
+         ┌──────────────────────────────────────────────────────┐
+         │ API・状態・ナビゲーションを含む画面単位の振る舞いを検証 │
+         └──────────────────────────────────────────────────────┘
+   Component Interaction Tests          Logic Tests
+  ┌──────────────────────────────┐  ┌──────────────────────┐
+  │ Storybook on-device + RNTL   │  │ Jest（純粋関数）      │
+  │ 表示・押下・入力・バリデーション │  │ 変換ロジック入出力検証 │
+  └──────────────────────────────┘  └──────────────────────┘
+  Static（TypeScript + ESLint）
+```
+
+### テスト種別と担当技術
+
+<table>
+  <thead>
+    <tr>
+      <th>テスト種別</th>
+      <th>技術構成</th>
+      <th>確認観点</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>E2E</strong></td>
+      <td>MagicPod / Maestro + EAS Workflows</td>
+      <td>ログイン・検索・登録・決済などの業務導線</td>
+    </tr>
+    <tr>
+      <td><strong>Screen Integration</strong></td>
+      <td>Jest + jest-expo + RNTL + MSW</td>
+      <td>API・状態・ナビゲーション含む画面単位の振る舞い</td>
+    </tr>
+    <tr>
+      <td><strong>Component Interaction</strong></td>
+      <td>Storybook on-device + RNTL</td>
+      <td>表示・押下・入力・バリデーション</td>
+    </tr>
+    <tr>
+      <td><strong>Logic</strong></td>
+      <td>Jest</td>
+      <td>純粋関数・変換ロジックの入出力</td>
+    </tr>
+    <tr>
+      <td><strong>Static</strong></td>
+      <td>TypeScript + ESLint</td>
+      <td>型整合性・構文・規約違反</td>
+    </tr>
+    <tr>
+      <td><strong>VRT</strong></td>
+      <td>React Native Web Storybook + Playwright screenshot</td>
+      <td>視覚差分の自動検知</td>
+    </tr>
+    <tr>
+      <td><strong>Device A11y</strong></td>
+      <td>実機確認 + E2E 補助</td>
+      <td>focus 順・label・dynamic type・screen reader</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 2. Storybook 二系統運用
+
+### 設計判断
+
+Storybook を **1 系統にまとめない**。理由は明確である。
+
+- `@storybook/react-native`（on-device）は **高忠実度** だが Test addon / Docs が限定的
+- React Native Web Storybook は **Docs / addon-vitest / addon-a11y / VRT** が強い
+- Web 系 test runner は browser ベースであり、`@storybook/react-native` に直接当てる設計ではない
+
+したがって **native 表示確認** と **Docs / Vitest / A11y / VRT** を系統ごとに分離する。
+
+### 採用構成
+
+<table>
+  <thead>
+    <tr>
+      <th>用途</th>
+      <th>採用技術</th>
+      <th>位置づけ</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>on-device Storybook</td>
+      <td><code>@storybook/react-native</code></td>
+      <td>実機 / simulator 上での高忠実度 UI 確認</td>
+    </tr>
+    <tr>
+      <td>on-device controls</td>
+      <td><code>@storybook/addon-ondevice-controls</code></td>
+      <td>props 変更による状態確認</td>
+    </tr>
+    <tr>
+      <td>on-device actions</td>
+      <td><code>@storybook/addon-ondevice-actions</code></td>
+      <td>callback 発火確認</td>
+    </tr>
+    <tr>
+      <td>web Storybook</td>
+      <td>React Native Web + Vite の Storybook framework</td>
+      <td>Docs / VRT / addon test 実行基盤</td>
+    </tr>
+    <tr>
+      <td>component test</td>
+      <td><code>@storybook/addon-vitest</code></td>
+      <td>web 側のみで story をテスト化</td>
+    </tr>
+    <tr>
+      <td>a11y test</td>
+      <td><code>@storybook/addon-a11y</code></td>
+      <td>web 側のみで自動 a11y チェック</td>
+    </tr>
+    <tr>
+      <td>API mock</td>
+      <td><code>msw-storybook-addon</code></td>
+      <td>web 側 Storybook の API モック統合</td>
+    </tr>
+    <tr>
+      <td>MCP 連携</td>
+      <td><code>@storybook/addon-mcp</code></td>
+      <td>外部ツール連携が必要な場合のみ</td>
+    </tr>
+  </tbody>
+</table>
+
+### 不採用の理由
+
+<table>
+  <thead>
+    <tr>
+      <th>対象</th>
+      <th>判断</th>
+      <th>理由</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>@storybook/test-runner</code></td>
+      <td>原則不要</td>
+      <td>Vite 系は <code>addon-vitest</code> 優先</td>
+    </tr>
+    <tr>
+      <td><code>addon-vitest</code> を native 側で直接使う</td>
+      <td>不採用</td>
+      <td>native Storybook 直結ではなく web 側に寄せる</td>
+    </tr>
+    <tr>
+      <td><code>@storybook/addon-viewport</code></td>
+      <td>明示追加不要</td>
+      <td>mobile は実機 / エミュレータ確認を優先</td>
+    </tr>
+    <tr>
+      <td><code>@storybook/addon-storysource</code></td>
+      <td>不採用</td>
+      <td>古い。価値が薄い</td>
+    </tr>
+    <tr>
+      <td>Chromatic 前提 VRT</td>
+      <td>不採用</td>
+      <td>使用不可条件のため</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 3. native Storybook 実装方針
+
+```ts
+// .rnstorybook/main.ts
+const config: StorybookConfig = {
+  stories: ['../src/**/*.stories.tsx'],
+  addons: [
+    '@storybook/addon-ondevice-controls',
+    '@storybook/addon-ondevice-actions',
+  ],
+};
+```
+
+```ts
+// metro.config.js
+const { withStorybook } = require('@storybook/react-native/metro-preset');
+module.exports = withStorybook(config, {
+  enabled: process.env.EXPO_PUBLIC_STORYBOOK_ENABLED === 'true',
+});
+```
+
+```tsx
+// app/_layout.tsx または App.tsx
+import { EXPO_PUBLIC_STORYBOOK_ENABLED } from '@env';
+
+export default EXPO_PUBLIC_STORYBOOK_ENABLED === 'true'
+  ? require('.rnstorybook').default
+  : require('./App').default;
+```
+
+🔴 **MUST**: `EXPO_PUBLIC_STORYBOOK_ENABLED` で bundle への inclusion を切り替える  
+🔴 **MUST**: 本番ビルドには Storybook を含めない
+
+---
+
+## 4. web Storybook 実装方針
+
+```ts
+// .storybook/main.ts（web 系）
+import { StorybookConfig } from '@storybook/react-vite';
+
+const config: StorybookConfig = {
+  framework: '@storybook/react-vite',
+  stories:   ['../src/**/*.stories.tsx'],
+  addons: [
+    '@storybook/addon-docs',
+    '@storybook/addon-vitest',
+    '@storybook/addon-a11y',
+    'msw-storybook-addon',
+  ],
+};
+```
+
+```ts
+// .storybook/preview.ts（web 系）
+import { initialize, mswLoader } from 'msw-storybook-addon';
+initialize();
+
+export const loaders = [mswLoader];
+```
+
+---
+
+## 5. Story 記述規約
+
+```tsx
+// components/ui/Button/Button.stories.tsx
+import type { Meta, StoryObj } from '@storybook/react';
+import { Button } from './Button';
+
+const meta: Meta<typeof Button> = {
+  title:     'UI/Button',
+  component: Button,
+  parameters: {
+    design: {
+      type: 'figma',
+      url:  'https://www.figma.com/...',  // Figma コンポーネント URL
+    },
+  },
+  argTypes: {
+    variant: { control: 'select', options: ['primary', 'secondary', 'destructive'] },
+    size:    { control: 'select', options: ['sm', 'md', 'lg'] },
+  },
+};
+export default meta;
+
+type Story = StoryObj<typeof Button>;
+
+export const Primary: Story = {
+  args: { label: '確認する', variant: 'primary', size: 'md' },
+};
+
+export const Disabled: Story = {
+  args: { label: '送信', variant: 'primary', disabled: true },
+};
+
+export const Loading: Story = {
+  args: { label: '送信中', variant: 'primary', loading: true },
+};
+```
+
+🔴 **MUST**: Story の `args` は Figma の variant 定義を網羅する  
+🟡 **SHOULD**: `parameters.design.url` に Figma コンポーネントの URL を記載する  
+🟡 **SHOULD**: 異常系（disabled / error / loading）の Story を必ず用意する
+
+---
+
+## 6. テスト実装規約
+
+### Screen Integration Test
+
+```tsx
+// app/__tests__/search.test.tsx
+import { renderRouter } from 'expo-router/testing-library';
+import { server } from '@/mocks/server';
+import { searchHandlers } from '@/mocks/handlers/searchHandlers';
+
+beforeAll(() => server.listen());
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+test('検索結果が表示される', async () => {
+  server.use(...searchHandlers.success);
+
+  const { getByTestId, findByText } = renderRouter(
+    { '(main)/search/index': require('@/app/(main)/search/index').default },
+    { initialUrl: '/search?q=coffee' },
+  );
+
+  expect(await findByText('Coffee Shop A')).toBeTruthy();
+});
+```
+
+🔴 **MUST**: `renderRouter` で Expo Router ごとテストする（`render` 単体では不十分）  
+🔴 **MUST**: MSW は `beforeAll` / `afterAll` で正しく制御する
+
+### Logic Test
+
+```ts
+// lib/__tests__/formatPrice.test.ts
+import { formatPrice } from '@/lib/formatPrice';
+import { createClock } from '@/lib/clock';
+
+test('税込み価格を正しくフォーマットする', () => {
+  expect(formatPrice(1000, 'JPY')).toBe('¥1,000');
+  expect(formatPrice(9.99, 'USD')).toBe('$9.99');
+});
+```
+
+---
+
+## 7. A11y 方針
+
+### 自動チェック（web Storybook + addon-a11y）
+
+- WCAG 2.1 AA の機械的検証をすべての Story に適用
+- `violations` が 0 になるまで PR マージ禁止
+
+### 手動チェック（実機）
+
+<table>
+  <thead>
+    <tr>
+      <th>確認項目</th>
+      <th>iOS</th>
+      <th>Android</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>VoiceOver / TalkBack での全操作</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>Dynamic Type（最大サイズ）でのレイアウト崩れなし</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>フォーカス順序が論理的</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td>タッチターゲット 44×44pt 以上</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+  </tbody>
+</table>
+
+🟡 **SHOULD**: `accessibilityLabel` / `accessibilityRole` を全インタラクティブ要素に付与する
+
+---
+
+## 8. VRT 方針
+
+```
+React Native Web Storybook
+    + Playwright screenshot
+    → 差分検出（ベースライン比較）
+```
+
+> **重要な前提**: これは native pixel 完全一致の保証ではない。
+> RN Web は docs / test / VRT に強い一方、最終的な native 差異は device E2E で拾う前提。
+> これは Storybook の native / web 分離方針からの設計判断である。
+
+🟡 **SHOULD**: VRT ベースラインは `main` ブランチの状態を正とする  
+🟡 **SHOULD**: 意図的なビジュアル変更時は `--update-snapshots` でベースラインを更新する
+
+---
+
+## 9. CI ゲート
+
+<table>
+  <thead>
+    <tr>
+      <th>ゲート</th>
+      <th>失敗条件</th>
+      <th>実行タイミング</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>TypeScript</td>
+      <td>型エラーあり</td>
+      <td>PR 時</td>
+    </tr>
+    <tr>
+      <td>ESLint</td>
+      <td>error レベル違反あり</td>
+      <td>PR 時</td>
+    </tr>
+    <tr>
+      <td>Jest</td>
+      <td>テスト失敗 / カバレッジ閾値未達</td>
+      <td>PR 時</td>
+    </tr>
+    <tr>
+      <td>addon-vitest</td>
+      <td>Story テスト失敗</td>
+      <td>PR 時</td>
+    </tr>
+    <tr>
+      <td>addon-a11y</td>
+      <td>a11y violations あり</td>
+      <td>PR 時</td>
+    </tr>
+    <tr>
+      <td>VRT</td>
+      <td>Playwright screenshot 差分あり（閾値超過）</td>
+      <td>PR 時</td>
+    </tr>
+    <tr>
+      <td>Maestro E2E</td>
+      <td>クリティカルジャーニー失敗</td>
+      <td>EAS Workflows</td>
+    </tr>
+    <tr>
+      <td>pnpm audit</td>
+      <td>HIGH 以上の脆弱性あり</td>
+      <td>定期実行</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 10. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>

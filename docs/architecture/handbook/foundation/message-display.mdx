@@ -1,0 +1,1510 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="Architecture/Handbook/Foundation/Message Display" />
+
+# メッセージ表示ガイド
+
+> **ステータス**: `APPROVED`  
+> **対象**: React Native mobile（Expo）アプリの全メッセージ表示実装
+
+---
+
+## 1. 方針
+
+### 統一の理由
+
+メッセージ表示は「どこに」「何を」「どのトーンで」出すかが機能ごとにバラつきやすい。
+バラつくと以下の問題が生じる。
+
+- 同一操作でも画面によって Toast が出たり Alert が出たりする（ユーザーの混乱）
+- 支援技術への通知が漏れる（アクセシビリティ違反）
+- ライブラリを直接呼び出すと差し替えコストが Feature 全体に波及する
+
+本ガイドはこれを **notify 関数・共通コンポーネント・文言規約の 3 つに集約する**。
+
+### 禁止事項
+
+🔴 **MUST NOT**: ライブラリを Feature / Screen から直接呼び出す
+
+```tsx
+// ❌ 禁止 — ライブラリ直呼び
+import Toast from 'react-native-toast-message';
+Toast.show({ type: 'error', text1: '失敗しました' });
+
+// ❌ 禁止 — Alert 直呼び
+import { Alert } from 'react-native';
+Alert.alert('エラー', '失敗しました');
+
+// ✅ 正解 — notify 経由のみ
+import { notify } from '@/lib/notify';
+notify.error('保存に失敗しました');
+```
+
+🔴 **MUST NOT**: メッセージ文言をコンポーネント内にハードコードする
+
+```tsx
+// ❌ 禁止
+notify.error('注文の送信に失敗しました。もう一度お試しください。');
+
+// ✅ 正解 — i18n キー経由（後述）
+notify.error(t('order.submitError'));
+```
+
+---
+
+## 2. メッセージ種別と選択基準
+
+<table>
+  <thead>
+    <tr>
+      <th>種別</th>
+      <th>コンポーネント / 関数</th>
+      <th>表示位置</th>
+      <th>持続時間</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Toast</strong></td>
+      <td><code>notify.success / error / warning / info</code></td>
+      <td>画面下部 Fixed</td>
+      <td>自動消去（3〜5s）</td>
+      <td>操作結果のフィードバック</td>
+    </tr>
+    <tr>
+      <td><strong>Snackbar</strong></td>
+      <td><code>notify.snackbar</code></td>
+      <td>画面下部 Fixed</td>
+      <td>自動消去 + Action</td>
+      <td>操作結果 + アンドゥ等の補助アクション</td>
+    </tr>
+    <tr>
+      <td><strong>Banner</strong></td>
+      <td><code>&lt;Banner&gt;</code></td>
+      <td>コンテンツ最上部</td>
+      <td>手動消去 or 条件解消まで</td>
+      <td>継続する状態通知（オフライン・メンテナンス）</td>
+    </tr>
+    <tr>
+      <td><strong>Inline</strong></td>
+      <td><code>&lt;FieldError&gt;</code> / <code>&lt;FormError&gt;</code></td>
+      <td>入力フィールド直下</td>
+      <td>フォーム存続中</td>
+      <td>バリデーションエラー</td>
+    </tr>
+    <tr>
+      <td><strong>Dialog</strong></td>
+      <td><code>notify.dialog</code> / <code>&lt;ConfirmDialog&gt;</code></td>
+      <td>画面中央 Modal</td>
+      <td>明示的な操作で消去</td>
+      <td>破壊的操作の確認・重大エラー</td>
+    </tr>
+    <tr>
+      <td><strong>Empty State</strong></td>
+      <td><code>&lt;EmptyState&gt;</code></td>
+      <td>コンテンツ領域全体</td>
+      <td>条件解消まで</td>
+      <td>一覧が 0 件・検索結果なし</td>
+    </tr>
+    <tr>
+      <td><strong>Error State</strong></td>
+      <td><code>&lt;ErrorState&gt;</code></td>
+      <td>コンテンツ領域全体</td>
+      <td>条件解消まで</td>
+      <td>API 失敗・画面単位のエラー</td>
+    </tr>
+    <tr>
+      <td><strong>Skeleton</strong></td>
+      <td><code>&lt;Skeleton&gt;</code></td>
+      <td>コンテンツ領域全体</td>
+      <td>ロード完了まで</td>
+      <td>初回ロード中</td>
+    </tr>
+  </tbody>
+</table>
+
+### 種別の選択フローチャート
+
+```
+操作のフィードバックか？
+  ├─ Yes → 操作を取り消せるか？
+  │           ├─ Yes → Snackbar（アンドゥ付き）
+  │           └─ No  → Toast
+  └─ No → 継続的な状態通知か？
+             ├─ Yes → Banner
+             └─ No → 入力エラーか？
+                         ├─ Yes → Inline（FieldError）
+                         └─ No → 破壊的操作の確認か？
+                                     ├─ Yes → Dialog
+                                     └─ No → 画面単位のエラーか？
+                                                 ├─ Yes → ロード中か？
+                                                 │           ├─ Yes → Skeleton
+                                                 │           └─ No  → Error State
+                                                 └─ No → Empty State
+```
+
+---
+
+## 3. notify 関数
+
+### インタフェース定義
+
+```ts
+// src/lib/notify.ts
+
+type ToastOptions = {
+  duration?:   number;        // ms。指定なし時は種別デフォルト値
+  action?:     {
+    label:     string;
+    onPress:   () => void;
+  };
+};
+
+type DialogOptions = {
+  title:         string;
+  message:       string;
+  confirmLabel?: string;      // デフォルト: '確認'
+  cancelLabel?:  string;      // デフォルト: 'キャンセル'
+  destructive?:  boolean;     // 確認ボタンを破壊的スタイルにする
+  onConfirm:     () => void;
+  onCancel?:     () => void;
+};
+
+export type Notify = {
+  success:  (message: string, options?: ToastOptions)  => void;
+  error:    (message: string, options?: ToastOptions)  => void;
+  warning:  (message: string, options?: ToastOptions)  => void;
+  info:     (message: string, options?: ToastOptions)  => void;
+  snackbar: (message: string, options: Required<Pick<ToastOptions, 'action'>> & ToastOptions) => void;
+  dialog:   (options: DialogOptions) => void;
+  dismiss:  () => void;   // 表示中の Toast / Snackbar を即時消去
+};
+```
+
+### 実装
+
+```ts
+// src/lib/notify.ts
+import { notifyStore } from '@/stores/notifyStore';
+
+export const notify: Notify = {
+  success:  (message, options) =>
+    notifyStore.getState().push({ type: 'success', message, ...options }),
+
+  error:    (message, options) =>
+    notifyStore.getState().push({ type: 'error',   message, ...options }),
+
+  warning:  (message, options) =>
+    notifyStore.getState().push({ type: 'warning', message, ...options }),
+
+  info:     (message, options) =>
+    notifyStore.getState().push({ type: 'info',    message, ...options }),
+
+  snackbar: (message, options) =>
+    notifyStore.getState().push({ type: 'snackbar', message, ...options }),
+
+  dialog:   (options) =>
+    notifyStore.getState().pushDialog(options),
+
+  dismiss:  () =>
+    notifyStore.getState().dismiss(),
+};
+```
+
+> **`notifyStore()` vs `notifyStore.getState()` の使い分け**  
+> - Reactコンポーネント内（再レンダリングをsubscribeしたい）→ `const { queue } = notifyStore()`（React hook）  
+> - コンポーネント外・イベントハンドラ（再レンダリング不要）→ `notifyStore.getState().push(...)` （vanilla store）  
+> 上記 `notify.ts` はコンポーネント外から呼ばれるため `getState()` を使う。
+
+### Zustand Store
+
+```ts
+// src/stores/notifyStore.ts
+import { create } from 'zustand';
+import { nanoid } from 'nanoid/non-secure'; // 軽量 ID 生成。crypto.randomUUID() でも可
+
+type ToastItem = {
+  id:        string;
+  type:      'success' | 'error' | 'warning' | 'info' | 'snackbar';
+  message:   string;
+  duration?: number;
+  action?:   { label: string; onPress: () => void };
+};
+
+type DialogItem = {
+  title:         string;
+  message:       string;
+  confirmLabel:  string;
+  cancelLabel:   string;
+  destructive:   boolean;
+  onConfirm:     () => void;
+  onCancel?:     () => void;
+};
+
+/** キューの上限。超過分は先頭を破棄し最新を優先する */
+const QUEUE_MAX = 3;
+
+type NotifyState = {
+  queue:          ToastItem[];
+  dialog:         DialogItem | null;
+  push:           (item: Omit<ToastItem, 'id'>) => void;
+  pushDialog:     (item: Omit<DialogItem, 'confirmLabel' | 'cancelLabel' | 'destructive'> & Partial<DialogItem>) => void;
+  dismiss:        () => void;
+  dismissById:    (id: string) => void;
+  dismissDialog:  () => void;
+};
+
+export const notifyStore = create<NotifyState>((set) => ({
+  queue:  [],
+  dialog: null,
+
+  push: (item) =>
+    set((state) => {
+      // 同種メッセージの重複防止（直前と同じメッセージは無視）
+      if (state.queue.at(-1)?.message === item.message) return state;
+      const next = [...state.queue, { ...item, id: nanoid() }];
+      // キュー上限を超えた場合は先頭（最古）を破棄
+      return { queue: next.length > QUEUE_MAX ? next.slice(-QUEUE_MAX) : next };
+    }),
+
+  pushDialog: (item) =>
+    set({ dialog: {
+      confirmLabel: '確認',
+      cancelLabel:  'キャンセル',
+      destructive:  false,
+      ...item,
+    }}),
+
+  dismiss:       () => set((state) => ({ queue: state.queue.slice(1) })),
+  dismissById:   (id) => set((state) => ({ queue: state.queue.filter((i) => i.id !== id) })),
+  dismissDialog: () => set({ dialog: null }),
+}));
+```
+
+🔴 **MUST**: `notify` 経由以外でトースト・ダイアログを表示しない  
+🔴 **MUST**: 同一メッセージの連続表示（スパム）を Store 側で防ぐ  
+🟡 **SHOULD**: `notify.dismiss()` をページ遷移フック内で呼び、不要なトーストを消去する（後述 Section 4.1）
+
+---
+
+## 4. NotifyProvider とレンダリング
+
+```tsx
+// src/components/providers/NotifyProvider.tsx
+import { useEffect } from 'react';
+import { notifyStore } from '@/stores/notifyStore';
+import { Toast }         from '@/components/ui/Toast';
+import { Snackbar }      from '@/components/ui/Snackbar';
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+
+/** デフォルト表示時間（ms）。アニメーション定数と合わせて変更すること */
+const DURATION: Record<ToastItem['type'], number> = {
+  success:  3000,
+  info:     3000,
+  warning:  5000,
+  error:    5000,
+  snackbar: 5000,
+};
+
+export function NotifyProvider({ children }: { children: React.ReactNode }) {
+  const { queue, dialog, dismiss, dismissById } = notifyStore();
+  const current = queue[0] ?? null;
+
+  // 自動消去タイマー
+  useEffect(() => {
+    if (!current) return;
+    const ms = current.duration ?? DURATION[current.type];
+    const timer = setTimeout(dismiss, ms);
+    return () => clearTimeout(timer);
+  }, [current?.id]);
+
+  return (
+    <>
+      {children}
+
+      {/* Toast / Snackbar — 画面下部固定 */}
+      {current && current.type !== 'snackbar' && (
+        <Toast
+          item={current}
+          onDismiss={() => dismissById(current.id)}
+        />
+      )}
+      {current?.type === 'snackbar' && (
+        <Snackbar
+          item={current}
+          onDismiss={() => dismissById(current.id)}
+        />
+      )}
+
+      {/* Dialog — 画面中央 Modal */}
+      {dialog && <ConfirmDialog item={dialog} />}
+    </>
+  );
+}
+```
+
+```tsx
+// app/_layout.tsx への組み込み
+export default function RootLayout() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <ThemeProvider>
+          <NotifyProvider>   {/* ← Toast / Dialog はここでレンダリングされる */}
+            <Stack />
+          </NotifyProvider>
+        </ThemeProvider>
+      </GestureHandlerRootView>
+    </QueryClientProvider>
+  );
+}
+```
+
+🔴 **MUST**: `NotifyProvider` は `app/_layout.tsx` の Root に 1 つだけ配置する  
+🔴 **MUST NOT**: Feature / Screen 内に独自の Toast / Dialog レンダリングを書かない
+
+### 4.1 ページ遷移時の自動 dismiss
+
+Expo Router の `usePathname` を使い、ルート変更時に残存トーストを消去する。
+
+```ts
+// src/hooks/useNotifyDismissOnNavigate.ts
+import { useEffect }   from 'react';
+import { usePathname } from 'expo-router';
+import { notify }      from '@/lib/notify';
+
+/**
+ * ルートが変わるたびに表示中のトーストを消去するフック。
+ * RootLayout 内で一度だけ呼び出す。
+ */
+export function useNotifyDismissOnNavigate() {
+  const pathname = usePathname();
+  useEffect(() => {
+    notify.dismiss();
+  }, [pathname]);
+}
+```
+
+```tsx
+// app/_layout.tsx での使用
+export default function RootLayout() {
+  useNotifyDismissOnNavigate();   // ← ここで一度だけ呼ぶ
+  return ( /* ... */ );
+}
+```
+
+---
+
+## 5. 表示位置規約
+
+### Toast / Snackbar
+
+```
+┌─────────────────────────┐
+│         Screen          │
+│                         │
+│    [コンテンツ領域]      │
+│                         │
+│                         │
+│  ┌───────────────────┐  │  ← Safe Area Bottom の 16pt 上
+│  │  🔴 エラーメッセ…  │  │     Tab Bar がある場合は Tab Bar の上
+│  └───────────────────┘  │
+└─────────────────────────┘
+```
+
+- Safe Area（`useSafeAreaInsets`）を考慮した bottom 位置に配置する
+- Tab Bar が表示されている場合は Tab Bar の高さを加算して Tab Bar の上に表示する
+- キーボード表示時は Toast の位置をキーボードの上に移動する
+
+```tsx
+// components/ui/Toast/Toast.tsx
+import { useSafeAreaInsets }  from 'react-native-safe-area-context';
+import { useKeyboard }        from '@react-native-community/hooks';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
+
+export function Toast({ item, onDismiss }: ToastProps) {
+  const insets   = useSafeAreaInsets();
+  const keyboard = useKeyboard();
+
+  // Tab Bar が存在しない画面では 0 が返る
+  let tabBarHeight = 0;
+  try {
+    // Bottom Tab Navigator の外側では例外が throw されるため try で保護する
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    tabBarHeight = useBottomTabBarHeight();
+  } catch {
+    tabBarHeight = 0;
+  }
+
+  const bottomOffset = keyboard.keyboardShown
+    ? keyboard.keyboardHeight + 16
+    : Math.max(insets.bottom, tabBarHeight) + 16;
+
+  return (
+    <Animated.View
+      style={{ bottom: bottomOffset }}
+      className="absolute left-4 right-4"
+      // ── アクセシビリティ ──────────────────────────────
+      accessible={true}
+      accessibilityLiveRegion={
+        item.type === 'error' || item.type === 'warning'
+          ? 'assertive'
+          : 'polite'
+      }
+      accessibilityLabel={item.message}
+      accessibilityRole="alert"
+    >
+      <ToastContent item={item} onDismiss={onDismiss} />
+    </Animated.View>
+  );
+}
+```
+
+### Banner
+
+```
+┌─────────────────────────┐
+│  ┌───────────────────┐  │  ← Safe Area Top 直下
+│  │  ⚠ オフラインです  │  │
+│  └───────────────────┘  │
+│    [コンテンツ領域]      │
+└─────────────────────────┘
+```
+
+- 画面最上部、Safe Area Top 直下に固定表示する
+- スクロールに追従しない（Sticky）
+- 複数の Banner が同時に存在する場合は縦積みにする
+
+🔴 **MUST**: Toast と Banner を同時に画面下部・上部に分けて配置し、重ならないようにする
+
+---
+
+## 6. ビジュアルデザイン規約
+
+### 色・アイコンの対応
+
+<table>
+  <thead>
+    <tr>
+      <th>種別</th>
+      <th>アイコン</th>
+      <th>背景トークン（Light）</th>
+      <th>背景トークン（Dark）</th>
+      <th>テキストトークン</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>success</code></td>
+      <td><code>check-circle</code></td>
+      <td><code>surface-success</code></td>
+      <td><code>surface-success-dark</code></td>
+      <td><code>content-success</code></td>
+      <td>操作成功・完了</td>
+    </tr>
+    <tr>
+      <td><code>error</code></td>
+      <td><code>alert-circle</code></td>
+      <td><code>surface-danger</code></td>
+      <td><code>surface-danger-dark</code></td>
+      <td><code>content-danger</code></td>
+      <td>操作失敗・エラー</td>
+    </tr>
+    <tr>
+      <td><code>warning</code></td>
+      <td><code>alert-triangle</code></td>
+      <td><code>surface-warning</code></td>
+      <td><code>surface-warning-dark</code></td>
+      <td><code>content-warning</code></td>
+      <td>注意・非推奨操作</td>
+    </tr>
+    <tr>
+      <td><code>info</code></td>
+      <td><code>info</code></td>
+      <td><code>surface-info</code></td>
+      <td><code>surface-info-dark</code></td>
+      <td><code>content-info</code></td>
+      <td>補足情報・ヒント</td>
+    </tr>
+  </tbody>
+</table>
+
+> **ダークモード**: 各 `surface-*` トークンはテーマプロバイダーが Light / Dark を自動切替する。  
+> `surface-danger` → Light では赤系薄色、Dark では彩度を下げた暗赤色。  
+> トークン定義は `src/design-tokens/colors.ts` を参照。コンポーネント側での `colorScheme` 判定は禁止。
+
+🔴 **MUST NOT**: アイコン・色のみでメッセージ種別を伝えない。テキストを必ず含める  
+🟡 **SHOULD**: アイコンは `accessible={false}` を設定し、テキストだけが読み上げられるようにする
+
+```tsx
+// ✅ アイコン + テキストの組み合わせ
+<View className="flex-row items-start gap-2">
+  <Icon
+    name="alert-circle"
+    className="text-content-danger mt-0.5"
+    accessible={false}          // アイコンは読み上げ対象外
+  />
+  <Text className="text-content-danger text-body-sm flex-1">
+    {item.message}
+  </Text>
+</View>
+```
+
+### Toast / Snackbar の幅・角丸
+
+```tsx
+// 左右 16pt マージン・角丸 12pt・最大幅 480pt（タブレット考慮）
+<View className="rounded-xl mx-4 max-w-xl self-center w-full shadow-md" />
+```
+
+---
+
+## 7. アニメーション規約
+
+🟡 **SHOULD**: Toast の出現は **下から上へスライドイン + フェードイン** にする  
+🟡 **SHOULD**: 消去は **上から下へスライドアウト + フェードアウト** にする  
+🟡 **SHOULD**: `useReducedMotion` が `true` の場合はスライドを省略し、フェードのみにする
+
+```ts
+// src/constants/animation.ts
+/** アニメーション時間定数。DURATION[ENTER/EXIT] を変更すると全 Toast に反映される */
+export const ANIMATION_DURATION = {
+  ENTER: 200,  // ms
+  EXIT:  150,  // ms
+} as const;
+```
+
+```tsx
+// components/ui/Toast/useToastAnimation.ts
+import {
+  FadeIn,
+  FadeOut,
+  SlideInDown,
+  SlideOutDown,
+} from 'react-native-reanimated';
+import { useReducedMotion }  from '@/hooks/useReducedMotion';
+import { ANIMATION_DURATION } from '@/constants/animation';
+
+export function useToastAnimation() {
+  const reduceMotion = useReducedMotion();
+
+  const entering = reduceMotion
+    ? FadeIn.duration(ANIMATION_DURATION.ENTER)
+    : SlideInDown.duration(ANIMATION_DURATION.ENTER).springify();
+
+  const exiting = reduceMotion
+    ? FadeOut.duration(ANIMATION_DURATION.EXIT)
+    : SlideOutDown.duration(ANIMATION_DURATION.EXIT).springify();
+
+  return { entering, exiting };
+}
+```
+
+---
+
+## 8. Snackbar（アンドゥ）実装パターン
+
+Snackbar はアンドゥ等の補助アクションを提供するユースケース専用。
+アクション実行後に状態を巻き戻す責務は Feature 側が持つ。
+
+```tsx
+// Feature での使用例（アーカイブ操作 + アンドゥ）
+export function useArchiveItem() {
+  const { t }         = useTranslation();
+  const queryClient   = useQueryClient();
+
+  return useMutation({
+    mutationFn: archiveItem,
+
+    onMutate: async (itemId) => {
+      // Optimistic update: リストからアイテムを即時除外
+      await queryClient.cancelQueries({ queryKey: ['items'] });
+      const previous = queryClient.getQueryData<Item[]>(['items']);
+      queryClient.setQueryData<Item[]>(['items'], (old) =>
+        old?.filter((i) => i.id !== itemId) ?? [],
+      );
+      return { previous };
+    },
+
+    onSuccess: (_data, itemId, context) => {
+      notify.snackbar(t('item.archiveSuccess'), {
+        action: {
+          label:   t('common.undo'),
+          onPress: async () => {
+            // アンドゥ: サーバーに復元リクエストを送り、キャッシュをロールバック
+            await unarchiveItem(itemId);
+            queryClient.setQueryData(['items'], context?.previous);
+          },
+        },
+      });
+    },
+
+    onError: (_err, _itemId, context) => {
+      // 失敗時は Optimistic update をロールバック
+      queryClient.setQueryData(['items'], context?.previous);
+      notify.error(t('item.archiveError'));
+    },
+  });
+}
+```
+
+🔴 **MUST**: アンドゥ後のサーバー同期は Feature 側で担保する（Store はUI状態のみ管理）  
+🟡 **SHOULD**: アンドゥ可能な操作は Optimistic update と組み合わせる（即時反映 → 失敗時ロールバック）
+
+---
+
+## 9. メッセージのトーン規約
+
+### 基本原則
+
+<table>
+  <thead>
+    <tr>
+      <th>原則</th>
+      <th>正しい</th>
+      <th>誤り</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>ユーザー視点</strong></td>
+      <td>何が起きたか・何をすべきかを伝える</td>
+      <td>システム都合の技術用語を使う</td>
+    </tr>
+    <tr>
+      <td><strong>簡潔</strong></td>
+      <td>40 文字以内</td>
+      <td>長文説明</td>
+    </tr>
+    <tr>
+      <td><strong>行動可能</strong></td>
+      <td>次に何をすればよいかが分かる</td>
+      <td>「エラーが発生しました」のみ</td>
+    </tr>
+    <tr>
+      <td><strong>丁寧・非断定</strong></td>
+      <td>「〜できませんでした」</td>
+      <td>「〜は不可能です」「〜してください」（命令形）</td>
+    </tr>
+    <tr>
+      <td><strong>冗長語排除</strong></td>
+      <td>「保存しました」</td>
+      <td>「保存に成功しました」「保存が完了しました」</td>
+    </tr>
+  </tbody>
+</table>
+
+### 種別ごとのトーン
+
+#### success — 完了・成功
+
+```
+✅ 「保存しました」
+✅ 「注文を受け付けました」
+✅ 「パスワードを変更しました」
+
+❌ 「保存が正常に完了しました！」（冗長・感嘆符）
+❌ 「Success!」（英語）
+❌ 「保存されました」（受動態は使ってよいが能動態を優先）
+```
+
+#### error — 失敗・エラー
+
+```
+✅ 「保存できませんでした。もう一度お試しください」
+✅ 「接続を確認してください」
+✅ 「この操作は現在利用できません」
+
+❌ 「Error: 500 Internal Server Error」（技術情報の露出）
+❌ 「失敗しました」（原因・次の行動が不明）
+❌ 「申し訳ございませんが、予期しないエラーが発生いたしました」（過度な謝罪）
+```
+
+#### warning — 注意・非推奨
+
+```
+✅ 「変更は保存されていません」
+✅ 「この操作は取り消せません」
+✅ 「セッションの有効期限が近づいています」
+
+❌ 「警告！データが失われます！！」（過剰な強調）
+```
+
+#### info — 補足情報
+
+```
+✅ 「変更は次回起動時に反映されます」
+✅ 「この機能はプレビュー版です」
+
+❌ 「FYI: キャッシュをクリアしました」（FYI 等の略語）
+```
+
+### 禁止ワード
+
+<table>
+  <thead>
+    <tr>
+      <th>禁止語</th>
+      <th>理由</th>
+      <th>代替</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>「エラーが発生しました」単体</td>
+      <td>次のアクションが不明</td>
+      <td>原因 or 対処を 1 文追加</td>
+    </tr>
+    <tr>
+      <td>「しばらくお待ちください」</td>
+      <td>待ち時間が不明</td>
+      <td>推定時間を添える or 別文言</td>
+    </tr>
+    <tr>
+      <td>「処理中です」 単体</td>
+      <td>何の処理か不明</td>
+      <td>「〇〇しています」</td>
+    </tr>
+    <tr>
+      <td>感嘆符（！）の多用</td>
+      <td>威圧感・軽薄に見える</td>
+      <td>原則使わない</td>
+    </tr>
+    <tr>
+      <td>英語混じり（&quot;Error&quot; 等）</td>
+      <td>一貫性がない</td>
+      <td>日本語に統一</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 10. i18n との統合
+
+文言は i18n キーで管理し、コンポーネント内のハードコード禁止。
+
+```ts
+// src/locales/ja/messages.ts
+export const messages = {
+  common: {
+    saveSuccess:   '保存しました',
+    saveError:     '保存できませんでした。もう一度お試しください',
+    networkError:  '接続を確認してください',
+    sessionExpiry: 'セッションの有効期限が近づいています',
+    undo:          '元に戻す',
+    retry:         '再試行',
+    cancel:        'キャンセル',
+  },
+  order: {
+    submitSuccess: '注文を受け付けました',
+    submitError:   '注文を送信できませんでした。もう一度お試しください',
+    cancelConfirm: {
+      title:   '注文をキャンセルしますか？',
+      message: 'この操作は取り消せません',
+      confirm: 'キャンセルする',
+      cancel:  '戻る',
+    },
+    deleteConfirm: {
+      title:   '注文を削除しますか？',
+      message: 'この操作は取り消せません',
+      confirm: '削除する',
+    },
+    archiveSuccess: 'アーカイブしました',
+    archiveError:   'アーカイブできませんでした。もう一度お試しください',
+  },
+} as const;
+```
+
+```tsx
+// Feature での使用
+import { useTranslation } from 'react-i18next';
+
+export function useOrderSubmit() {
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: submitOrder,
+    onSuccess:  () => notify.success(t('order.submitSuccess')),
+    onError:    () => notify.error(t('order.submitError')),
+  });
+}
+```
+
+🔴 **MUST**: notify に渡す文言はすべて i18n キー経由にする  
+🟡 **SHOULD**: キーの命名は `[機能名].[操作名][結果]` の形式に統一する
+
+---
+
+## 11. Dialog / ConfirmDialog 規約
+
+### 使用条件
+
+🔴 **MUST**: 以下のケースでは Dialog を必ず使う
+
+<table>
+  <thead>
+    <tr>
+      <th>ケース</th>
+      <th>理由</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>データ削除</td>
+      <td>取り消し不可の破壊的操作</td>
+    </tr>
+    <tr>
+      <td>注文・決済の最終確認</td>
+      <td>金銭的影響がある操作</td>
+    </tr>
+    <tr>
+      <td>ログアウト確認</td>
+      <td>セッション喪失</td>
+    </tr>
+    <tr>
+      <td>ローカルデータの上書き</td>
+      <td>データ喪失リスク</td>
+    </tr>
+  </tbody>
+</table>
+
+### 実装パターン
+
+```tsx
+// ✅ 破壊的操作の確認 Dialog
+function handleDeleteOrder(orderId: string) {
+  notify.dialog({
+    title:        t('order.deleteConfirm.title'),    // '注文を削除しますか？'
+    message:      t('order.deleteConfirm.message'),  // 'この操作は取り消せません'
+    confirmLabel: t('order.deleteConfirm.confirm'),  // '削除する'
+    cancelLabel:  t('common.cancel'),                // 'キャンセル'
+    destructive:  true,                              // 確認ボタンを danger 色にする
+    onConfirm:    () => deleteOrder(orderId),
+  });
+}
+```
+
+### Dialog のアクセシビリティ
+
+```tsx
+// components/ui/ConfirmDialog/ConfirmDialog.tsx
+export function ConfirmDialog({ item }: { item: DialogItem }) {
+  const confirmRef = useRef<View>(null);
+  const { dismissDialog } = notifyStore();
+
+  useEffect(() => {
+    // Dialog 表示時にタイトルにフォーカスを移動する
+    const node = findNodeHandle(confirmRef.current);
+    if (node) AccessibilityInfo.setAccessibilityFocus(node);
+  }, []);
+
+  return (
+    <Modal
+      visible={true}
+      transparent={true}
+      accessibilityViewIsModal={true}    // 背景をフォーカス対象外にする
+    >
+      <View ref={confirmRef} accessible={true} accessibilityRole="header">
+        <Text className="text-heading-md">{item.title}</Text>
+      </View>
+      <Text>{item.message}</Text>
+
+      <View className="flex-row gap-3 justify-end">
+        <Button
+          label={item.cancelLabel}
+          variant="secondary"
+          onPress={() => {
+            item.onCancel?.();
+            dismissDialog();
+          }}
+          accessibilityRole="button"
+        />
+        <Button
+          label={item.confirmLabel}
+          variant={item.destructive ? 'destructive' : 'primary'}
+          onPress={() => {
+            item.onConfirm();
+            dismissDialog();
+          }}
+          accessibilityRole="button"
+        />
+      </View>
+    </Modal>
+  );
+}
+```
+
+🔴 **MUST**: Dialog 表示時に `accessibilityViewIsModal={true}` を設定する  
+🟡 **SHOULD**: `destructive: true` の確認ボタンはキャンセルより右 / 下に配置する（誤タップ防止）  
+🟡 **SHOULD**: キャンセルアクションが左・確認アクションが右の配置を統一する
+
+---
+
+## 12. Inline エラー（フォームバリデーション）
+
+Inline エラーは `notify` を使わず、Design System の `<FieldError>` を使う。
+
+```tsx
+// components/ui/FieldError/FieldError.tsx
+export function FieldError({ message }: { message?: string }) {
+  if (!message) return null;
+
+  return (
+    <View
+      accessibilityLiveRegion="assertive"   // エラー出現時に即通知
+      accessibilityRole="alert"
+    >
+      <View className="flex-row items-center gap-1 mt-1">
+        <Icon
+          name="alert-circle"
+          size={14}
+          className="text-content-danger"
+          accessible={false}
+        />
+        <Text className="text-body-sm text-content-danger">
+          {message}
+        </Text>
+      </View>
+    </View>
+  );
+}
+```
+
+```tsx
+// フォームでの使用
+<TextInput
+  accessibilityState={{ invalid: !!errors.email }}
+  {...register('email')}
+/>
+<FieldError message={errors.email?.message} />
+```
+
+### フォーム全体エラー（複数フィールドにまたがるエラー）
+
+```tsx
+// components/ui/FormError/FormError.tsx
+export function FormError({ message }: { message?: string }) {
+  if (!message) return null;
+
+  return (
+    <View
+      className="bg-surface-danger rounded-lg p-3 mb-4"
+      accessibilityLiveRegion="assertive"
+      accessibilityRole="alert"
+      accessibilityLabel={message}
+    >
+      <View className="flex-row items-center gap-2">
+        <Icon name="alert-circle" className="text-content-danger" accessible={false} />
+        <Text className="text-body-sm text-content-danger flex-1">{message}</Text>
+      </View>
+    </View>
+  );
+}
+```
+
+🔴 **MUST**: フォームバリデーションエラーは `notify.error` ではなく `<FieldError>` / `<FormError>` を使う  
+🔴 **MUST**: Inline エラーは `accessibilityLiveRegion="assertive"` で即時通知する
+
+---
+
+## 13. Empty State / Error State
+
+画面・セクション全体の状態を占有するコンポーネント。Feature 層で使用する。
+
+### Empty State
+
+```tsx
+// components/ui/EmptyState/EmptyState.tsx
+type EmptyStateProps = {
+  illustration?: React.ReactNode;
+  title:         string;
+  description?:  string;
+  action?:       { label: string; onPress: () => void };
+};
+
+export function EmptyState({ illustration, title, description, action }: EmptyStateProps) {
+  return (
+    <View
+      className="flex-1 items-center justify-center px-8"
+      accessible={true}
+      accessibilityLabel={[title, description].filter(Boolean).join('。')}
+    >
+      {illustration && (
+        <View className="mb-6" accessible={false}>{illustration}</View>
+      )}
+      <Text className="text-heading-md text-content-primary text-center mb-2">
+        {title}
+      </Text>
+      {description && (
+        <Text className="text-body-md text-content-secondary text-center mb-6">
+          {description}
+        </Text>
+      )}
+      {action && (
+        <Button label={action.label} onPress={action.onPress} variant="primary" />
+      )}
+    </View>
+  );
+}
+```
+
+```tsx
+// Feature での使用例
+if (data?.items.length === 0) {
+  return (
+    <EmptyState
+      title={t('search.emptyTitle')}             // '検索結果がありません'
+      description={t('search.emptyDescription')} // '別のキーワードで試してください'
+    />
+  );
+}
+```
+
+### Error State
+
+```tsx
+// components/ui/ErrorState/ErrorState.tsx
+type ErrorStateProps = {
+  message?:  string;
+  onRetry?:  () => void;
+};
+
+export function ErrorState({ message, onRetry }: ErrorStateProps) {
+  // デフォルトメッセージは props で渡す（t() をデフォルト値に使うと hook ルール違反）
+  const { t }          = useTranslation();
+  const displayMessage = message ?? t('common.networkError');
+
+  return (
+    <View
+      className="flex-1 items-center justify-center px-8"
+      accessible={true}
+      accessibilityLabel={displayMessage}
+    >
+      <Icon name="wifi-off" size={48} className="text-content-disabled mb-4" accessible={false} />
+      <Text className="text-body-md text-content-secondary text-center mb-6">
+        {displayMessage}
+      </Text>
+      {onRetry && (
+        <Button
+          label={t('common.retry')}    // '再試行'
+          onPress={onRetry}
+          variant="secondary"
+        />
+      )}
+    </View>
+  );
+}
+```
+
+🟡 **SHOULD**: `ErrorState` には必ず `onRetry` を渡す  
+🔴 **MUST NOT**: エラー状態で `notify.error` を単独使用する。`ErrorState` と組み合わせるか、どちらか一方のみにする（重複禁止）
+
+---
+
+## 14. Skeleton
+
+初回ロード中はコンテンツ領域全体を `<Skeleton>` で置換する。`notify` は使わない。
+
+```tsx
+// components/ui/Skeleton/Skeleton.tsx
+import { useEffect } from 'react';
+import Animated, {
+  useSharedValue,
+  withRepeat,
+  withTiming,
+  useAnimatedStyle,
+  Easing,
+} from 'react-native-reanimated';
+import { useReducedMotion } from '@/hooks/useReducedMotion';
+
+type SkeletonProps = {
+  width?:  number | `${number}%`;
+  height?: number;
+  radius?: number;
+  className?: string;
+};
+
+export function Skeleton({ width = '100%', height = 16, radius = 8, className }: SkeletonProps) {
+  const opacity      = useSharedValue(1);
+  const reduceMotion = useReducedMotion();
+
+  useEffect(() => {
+    if (reduceMotion) return;
+    opacity.value = withRepeat(
+      withTiming(0.4, { duration: 800, easing: Easing.inOut(Easing.ease) }),
+      -1,  // 無限ループ
+      true, // reverse
+    );
+  }, [reduceMotion]);
+
+  const animStyle = useAnimatedStyle(() => ({ opacity: opacity.value }));
+
+  return (
+    <Animated.View
+      style={[{ width, height, borderRadius: radius }, animStyle]}
+      className={`bg-surface-skeleton ${className ?? ''}`}
+      accessible={false}  // スクリーンリーダーにはコンテンツロード中を aria で伝える
+    />
+  );
+}
+```
+
+```tsx
+// Feature での使用例
+export function OrderListScreen() {
+  const { data, isLoading } = useOrderList();
+
+  if (isLoading) {
+    return (
+      <View
+        className="flex-1 px-4 pt-4 gap-3"
+        accessibilityLabel="読み込み中"
+        accessibilityLiveRegion="polite"
+      >
+        {Array.from({ length: 5 }).map((_, i) => (
+          <Skeleton key={i} height={72} radius={12} />
+        ))}
+      </View>
+    );
+  }
+
+  return <OrderList items={data.items} />;
+}
+```
+
+🔴 **MUST NOT**: ロード中に `notify.info('読み込み中')` を使う。`Skeleton` で代替する  
+🟡 **SHOULD**: Skeleton のラッパー View に `accessibilityLabel="読み込み中"` を設定する  
+🟡 **SHOULD**: `useReducedMotion` が `true` のときはアニメーションを停止し、静的な低輝度色のみ表示する
+
+---
+
+## 15. Banner
+
+継続的な状態（オフライン・メンテナンス・強制アップデート）を画面最上部に表示する。
+
+```tsx
+// components/ui/Banner/Banner.tsx
+type BannerProps = {
+  type:       'info' | 'warning' | 'error';
+  message:    string;
+  action?:    { label: string; onPress: () => void };
+  onDismiss?: () => void;   // 手動消去可能な場合のみ
+};
+
+export function Banner({ type, message, action, onDismiss }: BannerProps) {
+  const bgClass = {
+    info:    'bg-surface-info',
+    warning: 'bg-surface-warning',
+    error:   'bg-surface-danger',
+  }[type];
+
+  return (
+    <View
+      className={`${bgClass} px-4 py-3`}
+      accessibilityLiveRegion="polite"
+      accessibilityRole="status"
+      accessibilityLabel={message}
+    >
+      <View className="flex-row items-center gap-2">
+        <Text className="text-body-sm flex-1">{message}</Text>
+        {action && (
+          <Pressable
+            onPress={action.onPress}
+            accessibilityRole="button"
+            accessibilityLabel={action.label}
+          >
+            <Text className="text-body-sm font-semibold underline">{action.label}</Text>
+          </Pressable>
+        )}
+        {onDismiss && (
+          <Pressable
+            onPress={onDismiss}
+            accessibilityRole="button"
+            accessibilityLabel="閉じる"
+            className="ml-2"
+          >
+            <Icon name="x" size={16} accessible={false} />
+          </Pressable>
+        )}
+      </View>
+    </View>
+  );
+}
+```
+
+### Banner の配置例（app/_layout.tsx）
+
+```tsx
+export default function MainLayout() {
+  const isOnline     = useNetworkStatus();
+  const updateNeeded = useForceUpdate();
+
+  return (
+    <View className="flex-1">
+      {/* Banner は最上部・コンテンツより前に描画 */}
+      {!isOnline && (
+        <Banner type="warning" message={t('common.offline')} />
+      )}
+      {updateNeeded && (
+        <Banner
+          type="error"
+          message={t('common.updateRequired')}
+          action={{ label: t('common.update'), onPress: openStore }}
+        />
+      )}
+      <Stack />
+    </View>
+  );
+}
+```
+
+---
+
+## 16. 実装境界まとめ
+
+<table>
+  <thead>
+    <tr>
+      <th>状況</th>
+      <th>使うもの</th>
+      <th>使わないもの</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Mutation 成功</td>
+      <td><code>notify.success</code></td>
+      <td><code>Alert.alert</code> / ライブラリ直呼び</td>
+    </tr>
+    <tr>
+      <td>Mutation 失敗（汎用）</td>
+      <td><code>notify.error</code></td>
+      <td><code>Alert.alert</code> / console.log のみ</td>
+    </tr>
+    <tr>
+      <td>Mutation 失敗（フィールド）</td>
+      <td><code>&lt;FieldError&gt;</code></td>
+      <td><code>notify.error</code></td>
+    </tr>
+    <tr>
+      <td>画面単位の API 失敗</td>
+      <td><code>&lt;ErrorState onRetry=&#123;refetch&#125;&gt;</code></td>
+      <td><code>notify.error</code> のみ</td>
+    </tr>
+    <tr>
+      <td>画面単位の API 失敗 + グローバル通知</td>
+      <td><code>&lt;ErrorState&gt;</code> + <code>notify.error</code></td>
+      <td>どちらか単体での重複</td>
+    </tr>
+    <tr>
+      <td>一覧 0 件</td>
+      <td><code>&lt;EmptyState&gt;</code></td>
+      <td><code>notify.info</code></td>
+    </tr>
+    <tr>
+      <td>初回ロード中</td>
+      <td><code>&lt;Skeleton&gt;</code></td>
+      <td><code>notify.info('読み込み中')</code></td>
+    </tr>
+    <tr>
+      <td>破壊的操作の確認</td>
+      <td><code>notify.dialog</code></td>
+      <td><code>Alert.alert</code></td>
+    </tr>
+    <tr>
+      <td>継続的な状態（オフライン等）</td>
+      <td><code>&lt;Banner&gt;</code></td>
+      <td><code>notify.warning</code> の繰り返し</td>
+    </tr>
+    <tr>
+      <td>操作取り消し可能</td>
+      <td><code>notify.snackbar</code></td>
+      <td><code>notify.info</code></td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 17. テスト実装規約
+
+### notify のモック
+
+```ts
+// src/test/utils/notifyMock.ts
+jest.mock('@/lib/notify', () => ({
+  notify: {
+    success:  jest.fn(),
+    error:    jest.fn(),
+    warning:  jest.fn(),
+    info:     jest.fn(),
+    snackbar: jest.fn(),
+    dialog:   jest.fn(),
+    dismiss:  jest.fn(),
+  },
+}));
+```
+
+### Toast / Mutation のテスト
+
+```tsx
+import { notify } from '@/lib/notify';
+
+test('注文送信成功時に success トーストを表示する', async () => {
+  server.use(...orderHandlers.success);
+
+  const { getByRole } = render(<OrderSubmitFeature />);
+  fireEvent.press(getByRole('button', { name: '注文を確定する' }));
+
+  await waitFor(() => {
+    expect(notify.success).toHaveBeenCalledWith(
+      expect.stringContaining('受け付けました'),
+    );
+  });
+});
+
+test('注文送信失敗時に error トーストを表示する', async () => {
+  server.use(...orderHandlers.serverError);
+
+  const { getByRole } = render(<OrderSubmitFeature />);
+  fireEvent.press(getByRole('button', { name: '注文を確定する' }));
+
+  await waitFor(() => {
+    expect(notify.error).toHaveBeenCalled();
+  });
+});
+```
+
+### Dialog のテスト
+
+```tsx
+test('削除ボタン押下で Dialog が表示される', () => {
+  const { getByRole } = render(<OrderDetailFeature orderId="1" />);
+  fireEvent.press(getByRole('button', { name: '注文を削除する' }));
+
+  expect(notify.dialog).toHaveBeenCalledWith(
+    expect.objectContaining({
+      destructive:  true,
+      onConfirm:    expect.any(Function),
+    }),
+  );
+});
+```
+
+### Banner のテスト
+
+```tsx
+test('オフライン時に warning Banner が表示される', () => {
+  mockUseNetworkStatus.mockReturnValue(false);
+
+  const { getByRole } = render(<MainLayout />);
+
+  const banner = getByRole('status');
+  expect(banner).toBeTruthy();
+  expect(banner.props.accessibilityLabel).toContain('オフライン');
+});
+
+test('Banner の accessibilityLiveRegion が polite に設定されている', () => {
+  mockUseNetworkStatus.mockReturnValue(false);
+
+  const { getByRole } = render(<MainLayout />);
+  const banner = getByRole('status');
+
+  expect(banner.props.accessibilityLiveRegion).toBe('polite');
+});
+```
+
+### FieldError のテスト
+
+```tsx
+test('バリデーションエラー時に FieldError が即時通知される', () => {
+  const { getByRole } = render(
+    <FieldError message="メールアドレスの形式が正しくありません" />,
+  );
+  const alert = getByRole('alert');
+
+  expect(alert).toBeTruthy();
+  expect(alert.props.accessibilityLiveRegion).toBe('assertive');
+});
+
+test('message が undefined のとき FieldError は何も描画しない', () => {
+  const { queryByRole } = render(<FieldError message={undefined} />);
+  expect(queryByRole('alert')).toBeNull();
+});
+```
+
+### EmptyState / ErrorState のテスト
+
+```tsx
+test('一覧 0 件時に EmptyState が表示される', () => {
+  const { getByText } = render(
+    <EmptyState title="検索結果がありません" description="別のキーワードで試してください" />,
+  );
+  expect(getByText('検索結果がありません')).toBeTruthy();
+});
+
+test('API 失敗時に ErrorState が表示され、再試行ボタンが存在する', async () => {
+  server.use(...orderHandlers.serverError);
+
+  const { findByRole } = render(<OrderListScreen />);
+  const retryButton    = await findByRole('button', { name: '再試行' });
+
+  expect(retryButton).toBeTruthy();
+});
+
+test('ErrorState の accessibilityLabel にエラーメッセージが設定されている', () => {
+  const { getByLabelText } = render(
+    <ErrorState message="接続を確認してください" />,
+  );
+  expect(getByLabelText('接続を確認してください')).toBeTruthy();
+});
+```
+
+### アクセシビリティの検証
+
+```tsx
+test('error Toast に accessibilityRole="alert" が設定されている', () => {
+  const { getByRole } = render(
+    <Toast item={{ id: '1', type: 'error', message: 'エラーです' }} onDismiss={jest.fn()} />,
+  );
+  expect(getByRole('alert')).toBeTruthy();
+});
+
+test('error Toast の accessibilityLiveRegion が assertive に設定されている', () => {
+  const { getByRole } = render(
+    <Toast item={{ id: '1', type: 'error', message: 'エラーです' }} onDismiss={jest.fn()} />,
+  );
+  expect(getByRole('alert').props.accessibilityLiveRegion).toBe('assertive');
+});
+
+test('info Toast の accessibilityLiveRegion が polite に設定されている', () => {
+  const { getByRole } = render(
+    <Toast item={{ id: '1', type: 'info', message: 'お知らせです' }} onDismiss={jest.fn()} />,
+  );
+  expect(getByRole('alert').props.accessibilityLiveRegion).toBe('polite');
+});
+```
+
+---
+
+## 18. 変更履歴
+
+<table>
+  <thead>
+    <tr>
+      <th>日付</th>
+      <th>変更内容</th>
+      <th>担当（GitHub ID）</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-03</td>
+      <td>初版作成</td>
+      <td>@username</td>
+    </tr>
+  </tbody>
+</table>
