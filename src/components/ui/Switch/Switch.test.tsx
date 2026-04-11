@@ -25,4 +25,20 @@ describe('Switch', () => {
 
     expect(onChange).not.toHaveBeenCalled();
   });
+
+  test('長い文言でも本文とトグルをグリッドで保持する', () => {
+    const { getByRole } = render(
+      <Switch
+        value={true}
+        label="匿名の利用分析と障害レポートを送信する"
+        description="同意済みです。必要であればここから撤回できます。"
+        onChange={() => undefined}
+      />,
+    );
+
+    expect(getByRole('switch', { name: '匿名の利用分析と障害レポートを送信する' })).toHaveStyle({
+      display: 'grid',
+      gridTemplateColumns: 'minmax(0, 1fr) auto',
+    });
+  });
 });

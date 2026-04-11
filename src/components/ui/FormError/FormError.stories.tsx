@@ -9,7 +9,7 @@ const meta: Meta<typeof FormError> = {
     layout: 'centered',
   },
   render: (args) => (
-    <div style={{ width: 360 }}>
+    <div style={{ width: '100%', maxWidth: 360 }}>
       <FormError {...args} />
     </div>
   ),

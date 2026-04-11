@@ -75,8 +75,9 @@ export function Toast({ item, onDismiss, testID, style, className }: ToastProps)
         style={{
           width: '100%',
           maxWidth: 480,
-          display: 'flex',
-          alignItems: 'flex-start',
+          display: 'grid',
+          gridTemplateColumns: 'auto minmax(0, 1fr)',
+          alignItems: 'start',
           gap: tokens.space2,
           paddingInline: tokens.space4,
           paddingBlock: tokens.space3,
@@ -89,17 +90,25 @@ export function Toast({ item, onDismiss, testID, style, className }: ToastProps)
         }}
       >
         <Icon name={tone.icon} size={18} color={tone.color} accessible={false} />
-        <Text as="p" variant="bodySm" style={{ flex: 1, color: tone.color }}>
+        <Text as="p" variant="bodySm" style={{ minWidth: 0, color: tone.color, overflowWrap: 'anywhere' }}>
           {item.message}
         </Text>
-        <IconButton
-          icon={<Icon name="x" size={14} color={tone.color} accessible={false} />}
-          label="閉じる"
-          size="sm"
-          variant="ghost"
-          onPress={onDismiss}
-          style={{ marginTop: -6, marginRight: -6 }}
-        />
+        <div
+          style={{
+            gridColumn: '1 / -1',
+            display: 'flex',
+            justifyContent: 'flex-end',
+          }}
+        >
+          <IconButton
+            icon={<Icon name="x" size={14} color={tone.color} accessible={false} />}
+            label="閉じる"
+            size="sm"
+            variant="ghost"
+            onPress={onDismiss}
+            style={{ marginTop: -6, marginRight: -6 }}
+          />
+        </div>
       </div>
     </div>
   );

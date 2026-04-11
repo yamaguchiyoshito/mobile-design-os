@@ -45,3 +45,19 @@ export const Cancelled: Story = {
     onSecondaryAction: () => undefined,
   },
 };
+
+export const Mobile320LongError: Story = {
+  globals: {
+    previewWidth: 'mobile320',
+  },
+  args: {
+    status: 'error',
+    transactionId: 'txn-2026-04-11-checkout-timeout-001',
+    orderId: 'order-1001',
+    amountLabel: '¥12,800',
+    errorMessage:
+      '3D セキュア認証の結果通知がタイムアウトしました。通信状態を確認し、カード会社アプリで保留中の認証を完了してから再試行してください。',
+    onPrimaryAction: () => undefined,
+    onSecondaryAction: () => undefined,
+  },
+};

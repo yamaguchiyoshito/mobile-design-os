@@ -9,7 +9,7 @@ const meta: Meta<typeof Banner> = {
     layout: 'padded',
   },
   render: (args) => (
-    <div style={{ width: 420 }}>
+    <div style={{ width: '100%', maxWidth: 420 }}>
       <Banner {...args} />
     </div>
   ),
@@ -39,6 +39,22 @@ export const Error: Story = {
     message: '強制アップデートが必要です',
     action: {
       label: '更新する',
+      onPress: () => undefined,
+    },
+    onDismiss: () => undefined,
+  },
+};
+
+export const Mobile320LongMessage: Story = {
+  globals: {
+    previewWidth: 'mobile320',
+  },
+  args: {
+    type: 'warning',
+    message:
+      '配送先住所の確認が完了していないため、出荷処理を保留しています。注文詳細から修正依頼の履歴を確認してください。',
+    action: {
+      label: '注文詳細を開く',
       onPress: () => undefined,
     },
     onDismiss: () => undefined,

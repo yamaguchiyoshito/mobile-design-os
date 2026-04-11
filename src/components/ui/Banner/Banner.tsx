@@ -54,6 +54,7 @@ export function Banner({
   className,
 }: BannerProps) {
   const colors = typeMap[type];
+  const hasControls = Boolean(action || onDismiss);
 
   return (
     <section
@@ -74,45 +75,58 @@ export function Banner({
     >
       <div
         style={{
-          display: 'flex',
-          alignItems: 'center',
+          display: 'grid',
+          gridTemplateColumns: 'auto minmax(0, 1fr)',
+          alignItems: 'start',
           gap: tokens.space2,
         }}
       >
         <Icon name={colors.icon} size={16} color={colors.color} accessible={false} />
-        <Text as="p" variant="bodySm" style={{ flex: 1, color: colors.color }}>
+        <Text as="p" variant="bodySm" style={{ minWidth: 0, color: colors.color, overflowWrap: 'anywhere' }}>
           {message}
         </Text>
-        {action ? (
-          <button
-            type="button"
-            aria-label={action.label}
-            onClick={action.onPress}
+        {hasControls ? (
+          <div
             style={{
-              appearance: 'none',
-              border: 'none',
-              background: 'transparent',
-              color: colors.color,
-              cursor: 'pointer',
-              padding: 0,
-              textDecoration: 'underline',
-              fontSize: 14,
-              fontWeight: 600,
-              lineHeight: '18px',
+              gridColumn: '1 / -1',
+              display: 'flex',
+              justifyContent: 'flex-end',
+              flexWrap: 'wrap',
+              gap: tokens.space2,
             }}
           >
-            {action.label}
-          </button>
-        ) : null}
-        {onDismiss ? (
-          <IconButton
-            icon={<Icon name="x" size={14} color={colors.color} accessible={false} />}
-            label="閉じる"
-            size="sm"
-            variant="ghost"
-            onPress={onDismiss}
-            style={{ marginRight: -6 }}
-          />
+            {action ? (
+              <button
+                type="button"
+                aria-label={action.label}
+                onClick={action.onPress}
+                style={{
+                  appearance: 'none',
+                  border: 'none',
+                  background: 'transparent',
+                  color: colors.color,
+                  cursor: 'pointer',
+                  padding: 0,
+                  textDecoration: 'underline',
+                  fontSize: 14,
+                  fontWeight: 600,
+                  lineHeight: '18px',
+                }}
+              >
+                {action.label}
+              </button>
+            ) : null}
+            {onDismiss ? (
+              <IconButton
+                icon={<Icon name="x" size={14} color={colors.color} accessible={false} />}
+                label="閉じる"
+                size="sm"
+                variant="ghost"
+                onPress={onDismiss}
+                style={{ marginRight: -6 }}
+              />
+            ) : null}
+          </div>
         ) : null}
       </div>
     </section>

@@ -9,7 +9,7 @@ const meta: Meta<typeof PermissionDeniedPrompt> = {
     layout: 'centered',
   },
   render: (args) => (
-    <div style={{ width: 420 }}>
+    <div style={{ width: '100%', maxWidth: 420 }}>
       <PermissionDeniedPrompt {...args} />
     </div>
   ),

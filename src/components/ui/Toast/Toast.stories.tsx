@@ -47,3 +47,17 @@ export const Error: Story = {
     },
   },
 };
+
+export const Mobile320LongMessage: Story = {
+  globals: {
+    previewWidth: 'mobile320',
+  },
+  args: {
+    item: {
+      id: 'toast-3',
+      type: 'warning',
+      message:
+        '購入手続きは完了していません。カード会社アプリで認証待ちの決済を確認し、処理後に再度この画面を開いてください。',
+    },
+  },
+};

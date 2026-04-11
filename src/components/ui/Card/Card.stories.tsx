@@ -11,7 +11,7 @@ const meta: Meta<typeof Card> = {
     layout: 'centered',
   },
   render: (args) => (
-    <div style={{ width: 360 }}>
+    <div style={{ width: '100%', maxWidth: 360 }}>
       <Card {...args} />
     </div>
   ),

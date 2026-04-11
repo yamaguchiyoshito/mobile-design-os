@@ -50,17 +50,18 @@ export function Switch({
         borderRadius: tokens.radiusLg,
         border: `1px solid ${value ? tokens.colorSurfaceBrand : palette.borderDefault}`,
         backgroundColor: disabled ? palette.surfaceSecondary : palette.surfacePrimary,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        gap: tokens.space3,
+        display: 'grid',
+        gridTemplateColumns: 'minmax(0, 1fr) auto',
+        alignItems: 'start',
+        columnGap: tokens.space3,
+        rowGap: tokens.space2,
         cursor: disabled ? 'not-allowed' : 'pointer',
         textAlign: 'left',
         transition: 'border-color 160ms ease, background-color 160ms ease',
         ...style,
       }}
     >
-      <span style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 4 }}>
         <Text as="span" variant="labelMd" tone={disabled ? 'disabled' : 'primary'}>
           {label}
         </Text>

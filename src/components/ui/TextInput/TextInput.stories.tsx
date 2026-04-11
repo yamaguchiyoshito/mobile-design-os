@@ -21,7 +21,7 @@ const meta: Meta<typeof TextInput> = {
     const [value, setValue] = useState(args.value);
 
     return (
-      <div style={{ width: 360 }}>
+      <div style={{ width: '100%', maxWidth: 360 }}>
         <TextInput {...args} value={value} onChangeText={setValue} />
       </div>
     );

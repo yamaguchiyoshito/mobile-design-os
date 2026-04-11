@@ -25,7 +25,7 @@ const meta: Meta<typeof Select> = {
     const [value, setValue] = useState(args.value);
 
     return (
-      <div style={{ width: 360 }}>
+      <div style={{ width: '100%', maxWidth: 360 }}>
         <Select {...args} value={value} onChange={setValue} />
       </div>
     );

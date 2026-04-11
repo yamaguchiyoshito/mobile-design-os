@@ -37,3 +37,21 @@ export const Undo: Story = {
     },
   },
 };
+
+export const Mobile320LongMessage: Story = {
+  globals: {
+    previewWidth: 'mobile320',
+  },
+  args: {
+    item: {
+      id: 'snackbar-2',
+      type: 'snackbar',
+      message:
+        'アーカイブ済みの注文ログを元に戻しました。監査記録と表示順が再計算されるまで数秒かかる場合があります。',
+      action: {
+        label: '変更履歴を見る',
+        onPress: () => undefined,
+      },
+    },
+  },
+};

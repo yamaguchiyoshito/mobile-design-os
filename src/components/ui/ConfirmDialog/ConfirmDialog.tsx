@@ -61,8 +61,8 @@ export function ConfirmDialog({ item }: ConfirmDialogProps) {
         </div>
         <div
           style={{
-            display: 'flex',
-            justifyContent: 'flex-end',
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
             gap: tokens.space3,
           }}
         >

@@ -29,3 +29,9 @@ export default meta;
 type Story = StoryObj<typeof AppPreferencesScreen>;
 
 export const Default: Story = {};
+
+export const Mobile390: Story = {
+  globals: {
+    previewWidth: 'mobile390',
+  },
+};

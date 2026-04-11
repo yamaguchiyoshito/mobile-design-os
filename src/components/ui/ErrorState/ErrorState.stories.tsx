@@ -9,7 +9,7 @@ const meta: Meta<typeof ErrorState> = {
     layout: 'centered',
   },
   render: (args) => (
-    <div style={{ width: 420, minHeight: 360 }}>
+    <div style={{ width: '100%', maxWidth: 420, minHeight: 360 }}>
       <ErrorState {...args} />
     </div>
   ),

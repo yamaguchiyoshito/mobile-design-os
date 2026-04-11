@@ -32,4 +32,18 @@ describe('Button', () => {
     expect(onPress).not.toHaveBeenCalled();
     expect(getByRole('button', { name: '送信する' })).toHaveAttribute('aria-busy', 'true');
   });
+
+  test('長いラベルでも親幅を超えないように折り返せる', () => {
+    const { getByRole, getByText } = render(
+      <Button label="表示とプライバシー設定を開く" onPress={() => undefined} />,
+    );
+
+    expect(getByRole('button', { name: '表示とプライバシー設定を開く' })).toHaveStyle({
+      maxWidth: '100%',
+    });
+    expect(getByText('表示とプライバシー設定を開く')).toHaveStyle({
+      whiteSpace: 'normal',
+      overflowWrap: 'anywhere',
+    });
+  });
 });

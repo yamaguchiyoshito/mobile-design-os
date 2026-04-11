@@ -51,10 +51,11 @@ export function Section({
           display: 'flex',
           alignItems: 'flex-start',
           justifyContent: 'space-between',
+          flexWrap: 'wrap',
           gap: tokens.space3,
         }}
       >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', flex: '1 1 240px', minWidth: 0, gap: 4 }}>
           <Text as="h2" id={titleId} variant="headingSm">
             {title}
           </Text>
@@ -64,7 +65,7 @@ export function Section({
             </Text>
           ) : null}
         </div>
-        {aside ? <div>{aside}</div> : null}
+        {aside ? <div style={{ flex: '0 1 auto', minWidth: 0 }}>{aside}</div> : null}
       </header>
       <div>{children}</div>
     </section>

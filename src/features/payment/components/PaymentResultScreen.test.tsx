@@ -24,6 +24,10 @@ describe('PaymentResultScreen', () => {
     expect(getByText('お支払いが完了しました')).toBeInTheDocument();
     expect(getByText('txn-001')).toBeInTheDocument();
     expect(getByText('¥12,800')).toBeInTheDocument();
+    expect(getByText('txn-001').parentElement).toHaveStyle({
+      display: 'grid',
+      gridTemplateColumns: 'minmax(0, 88px) minmax(0, 1fr)',
+    });
   });
 
   test('error 時の action を呼ぶ', () => {

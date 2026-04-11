@@ -9,7 +9,7 @@ const meta: Meta<typeof LoadingSkeleton> = {
     layout: 'centered',
   },
   render: (args) => (
-    <div style={{ width: 520 }}>
+    <div style={{ width: '100%', maxWidth: 520 }}>
       <LoadingSkeleton {...args} />
     </div>
   ),

@@ -24,7 +24,7 @@ const meta: Meta<typeof TabBar> = {
     const [activeKey, setActiveKey] = useState(args.activeKey);
 
     return (
-      <div style={{ width: 420 }}>
+      <div style={{ width: '100%', maxWidth: 420 }}>
         <TabBar {...args} activeKey={activeKey} onChange={setActiveKey} />
       </div>
     );

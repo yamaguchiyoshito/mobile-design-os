@@ -100,6 +100,7 @@ export function Button({
   const buttonStyle: CSSProperties = {
     appearance: 'none',
     width: fullWidth ? '100%' : undefined,
+    maxWidth: '100%',
     minHeight: sizing.minHeight,
     borderRadius: tokens.radiusMd,
     border: `1px solid ${blocked ? palette.borderDefault : colors.borderColor}`,
@@ -120,7 +121,9 @@ export function Button({
   const labelStyle: CSSProperties = {
     ...sizing.textStyle,
     color: blocked ? palette.contentDisabled : colors.color,
-    whiteSpace: 'nowrap',
+    whiteSpace: 'normal',
+    overflowWrap: 'anywhere',
+    textAlign: 'center',
   };
 
   const spinnerStyle: CSSProperties = {

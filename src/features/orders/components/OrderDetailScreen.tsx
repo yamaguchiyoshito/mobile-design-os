@@ -29,16 +29,16 @@ function renderRow(label: string, value: string) {
   return (
     <div
       style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
+        display: 'grid',
+        gridTemplateColumns: 'minmax(0, 104px) minmax(0, 1fr)',
+        alignItems: 'start',
         gap: 12,
       }}
     >
       <Text as="span" variant="bodySm" tone="secondary">
         {label}
       </Text>
-      <Text as="span" variant="labelMd">
+      <Text as="span" variant="labelMd" align="right" style={{ overflowWrap: 'anywhere' }}>
         {value}
       </Text>
     </div>

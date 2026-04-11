@@ -37,8 +37,7 @@ export function Snackbar({ item, onDismiss, testID, style, className }: Snackbar
         style={{
           width: '100%',
           maxWidth: 480,
-          display: 'flex',
-          alignItems: 'center',
+          display: 'grid',
           gap: tokens.space2,
           paddingInline: tokens.space4,
           paddingBlock: tokens.space3,
@@ -49,31 +48,40 @@ export function Snackbar({ item, onDismiss, testID, style, className }: Snackbar
           pointerEvents: 'auto',
         }}
       >
-        <Text as="p" variant="bodySm" style={{ flex: 1 }}>
+        <Text as="p" variant="bodySm" style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
           {item.message}
         </Text>
-        {item.action ? (
-          <button
-            type="button"
-            aria-label={item.action.label}
-            onClick={item.action.onPress}
-            style={{
-              appearance: 'none',
-              border: 'none',
-              background: 'transparent',
-              color: tokens.colorContentBrand,
-              cursor: 'pointer',
-              padding: 0,
-              textDecoration: 'underline',
-              fontSize: 14,
-              fontWeight: 600,
-              lineHeight: '18px',
-            }}
-          >
-            {item.action.label}
-          </button>
-        ) : null}
-        <IconButton label="閉じる" icon="x" size="sm" variant="ghost" onPress={onDismiss} />
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'flex-end',
+            flexWrap: 'wrap',
+            gap: tokens.space2,
+          }}
+        >
+          {item.action ? (
+            <button
+              type="button"
+              aria-label={item.action.label}
+              onClick={item.action.onPress}
+              style={{
+                appearance: 'none',
+                border: 'none',
+                background: 'transparent',
+                color: tokens.colorContentBrand,
+                cursor: 'pointer',
+                padding: 0,
+                textDecoration: 'underline',
+                fontSize: 14,
+                fontWeight: 600,
+                lineHeight: '18px',
+              }}
+            >
+              {item.action.label}
+            </button>
+          ) : null}
+          <IconButton label="閉じる" icon="x" size="sm" variant="ghost" onPress={onDismiss} />
+        </div>
       </div>
     </div>
   );

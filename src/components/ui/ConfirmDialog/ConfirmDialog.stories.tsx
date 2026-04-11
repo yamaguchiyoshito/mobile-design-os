@@ -26,3 +26,20 @@ export const Destructive: Story = {
     },
   },
 };
+
+export const Mobile320LongCopy: Story = {
+  globals: {
+    previewWidth: 'mobile320',
+  },
+  args: {
+    item: {
+      title: '返金処理を完了として記録しますか？',
+      message:
+        '返品商品の検品結果が反映され、カード会社への返金依頼も送信済みになります。顧客向け通知と監査ログに同時に反映されるため、処理内容を再確認してください。',
+      confirmLabel: '返金完了として記録する',
+      cancelLabel: '内容を見直す',
+      destructive: false,
+      onConfirm: () => undefined,
+    },
+  },
+};

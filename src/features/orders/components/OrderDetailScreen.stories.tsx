@@ -38,3 +38,15 @@ export const PaymentPending: Story = {
     onResumePayment: () => undefined,
   },
 };
+
+export const Mobile390: Story = {
+  globals: {
+    previewWidth: 'mobile390',
+  },
+  args: {
+    orderId: 'order-1001',
+    transactionId: 'txn-100',
+    amountLabel: '¥12,800',
+    onBackToOrders: () => undefined,
+  },
+};

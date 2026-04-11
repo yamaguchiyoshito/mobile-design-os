@@ -12,7 +12,7 @@ const meta: Meta<typeof Section> = {
     layout: 'centered',
   },
   render: (args) => (
-    <div style={{ width: 480 }}>
+    <div style={{ width: '100%', maxWidth: 480 }}>
       <Section {...args} />
     </div>
   ),
@@ -46,6 +46,23 @@ export const WithAside: Story = {
       <div style={{ display: 'grid', gap: 8 }}>
         <Text as="p">表示名: Yamaguchi</Text>
         <Text as="p">メール: sample@example.com</Text>
+      </div>
+    ),
+  },
+};
+
+export const Mobile320WithLongAside: Story = {
+  globals: {
+    previewWidth: 'mobile320',
+  },
+  args: {
+    title: '表示テーマ',
+    description: 'ユーザー設定がシステム設定より優先されます。',
+    aside: <Text as="span" variant="bodySm" tone="secondary">現在はライト表示です。</Text>,
+    children: (
+      <div style={{ display: 'grid', gap: 8 }}>
+        <Text as="p">テーマ設定を変更すると、画面全体の配色に即時反映します。</Text>
+        <Button label="設定を保存する" onPress={() => undefined} fullWidth />
       </div>
     ),
   },

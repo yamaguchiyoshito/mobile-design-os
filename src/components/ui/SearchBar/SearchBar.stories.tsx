@@ -13,7 +13,7 @@ const meta: Meta<typeof SearchBar> = {
     const [value, setValue] = useState(args.value);
 
     return (
-      <div style={{ width: 420 }}>
+      <div style={{ width: '100%', maxWidth: 420 }}>
         <SearchBar {...args} value={value} onChangeText={setValue} />
       </div>
     );

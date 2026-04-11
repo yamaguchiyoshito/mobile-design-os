@@ -9,7 +9,7 @@ const meta: Meta<typeof LogoutButton> = {
     layout: 'centered',
   },
   render: (args) => (
-    <div style={{ width: 320 }}>
+    <div style={{ width: '100%', maxWidth: 320 }}>
       <LogoutButton {...args} />
     </div>
   ),

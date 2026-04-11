@@ -10,7 +10,7 @@ const meta: Meta<typeof EmptyState> = {
     layout: 'centered',
   },
   render: (args) => (
-    <div style={{ width: 420, minHeight: 360 }}>
+    <div style={{ width: '100%', maxWidth: 420, minHeight: 360 }}>
       <EmptyState {...args} />
     </div>
   ),

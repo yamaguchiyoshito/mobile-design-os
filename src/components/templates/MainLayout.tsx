@@ -34,11 +34,16 @@ export function MainLayout({
         ...style,
       }}
     >
-      <header style={{ paddingInline: tokens.space4, paddingBlock: tokens.space3 }}>{header}</header>
-      <main style={{ paddingInline: tokens.space4, paddingBottom: tokens.space4 }}>{body}</main>
+      <header style={{ minWidth: 0, paddingInline: tokens.space4, paddingBlock: tokens.space3 }}>
+        {header}
+      </header>
+      <main style={{ minWidth: 0, paddingInline: tokens.space4, paddingBottom: tokens.space4 }}>
+        {body}
+      </main>
       {footer ? (
         <footer
           style={{
+            minWidth: 0,
             borderTop: `1px solid ${palette.borderDefault}`,
             paddingInline: tokens.space4,
             paddingBlock: tokens.space3,

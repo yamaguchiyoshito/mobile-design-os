@@ -40,6 +40,10 @@ describe('OrderDetailScreen', () => {
     expect(getByText('actor: payment-gateway / source: payments-api')).toBeInTheDocument();
     expect(getAllByText('correlationId: seed-order-1001')).toHaveLength(3);
     expect(getByRole('button', { name: 'メモを記録する' })).toBeDisabled();
+    expect(getByText('W/"order-1001-v1"').parentElement).toHaveStyle({
+      display: 'grid',
+      gridTemplateColumns: 'minmax(0, 104px) minmax(0, 1fr)',
+    });
   });
 
   test('一覧へ戻る操作を呼ぶ', () => {
